@@ -20,9 +20,6 @@ const requiredPaths = [
   "workers.workshop.name",
   "workers.context.name",
   "workers.customGatekeeper.name",
-  "access.issuer",
-  "access.audience",
-  "access.admins",
   "aiGateway.enabled",
   "errorReporting.enabled",
   "context.sharingDomain",
@@ -59,8 +56,10 @@ function valueAt(object, path) {
 }
 
 export function validateConfig(config) {
+  const privateWorkshop = config.workers.workshop.route == null;
   const activePaths = [
     ...requiredPaths,
+    ...(!privateWorkshop ? ["access.issuer", "access.audience", "access.admins"] : []),
     ...(config.aiGateway?.enabled ? aiGatewayPaths : []),
     ...(config.errorReporting?.enabled ? errorReportingPaths : []),
   ];
@@ -86,6 +85,9 @@ export function validateConfig(config) {
         workersAi: { mode: "direct" },
       } }
       : config;
+  if (privateWorkshop) {
+    activeConfig = { ...activeConfig, access: undefined };
+  }
   if (!config.errorReporting.enabled) {
     activeConfig = {
       ...activeConfig,
@@ -128,32 +130,36 @@ export function validateConfig(config) {
   }
 
   const route = config.workers.workshop.route;
-  if (!route || Boolean(route.workersDev) === Boolean(route.customDomain)) {
-    throw new Error("Set exactly one Workshop route: workersDev or customDomain.");
-  }
-  if (route.workersDev !== undefined && route.workersDev !== true) {
-    throw new Error("Workshop workersDev must be boolean true when selected.");
-  }
-  if (route.customDomain !== undefined && typeof route.customDomain !== "string") {
-    throw new Error("Workshop customDomain must be a string.");
-  }
-  const hostnamePattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-  if (route.customDomain && !hostnamePattern.test(route.customDomain)) {
-    throw new Error("Workshop customDomain must be a lowercase hostname.");
+  if (!privateWorkshop) {
+    if (Boolean(route.workersDev) === Boolean(route.customDomain)) {
+      throw new Error("Set exactly one Workshop route: workersDev or customDomain.");
+    }
+    if (route.workersDev !== undefined && route.workersDev !== true) {
+      throw new Error("Workshop workersDev must be boolean true when selected.");
+    }
+    if (route.customDomain !== undefined && typeof route.customDomain !== "string") {
+      throw new Error("Workshop customDomain must be a string.");
+    }
+    const hostnamePattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+    if (route.customDomain && !hostnamePattern.test(route.customDomain)) {
+      throw new Error("Workshop customDomain must be a lowercase hostname.");
+    }
   }
 
-  const issuer = new URL(config.access.issuer);
-  if (issuer.protocol !== "https:" ||
-      issuer.origin !== config.access.issuer.replace(/\/$/, "")) {
-    throw new Error("Cloudflare Access issuer must be an HTTPS origin only.");
-  }
-  if (!config.access.audience.trim() || config.access.audience !== config.access.audience.trim()) {
-    throw new Error("Cloudflare Access audience must not be blank or padded with whitespace.");
-  }
-  if (!Array.isArray(config.access.admins) ||
-      !config.access.admins.every((email) =>
-        typeof email === "string" && /^[^@\s]+@[^@\s]+$/.test(email))) {
-    throw new Error("Every Access administrator must be an email address.");
+  if (!privateWorkshop) {
+    const issuer = new URL(config.access.issuer);
+    if (issuer.protocol !== "https:" ||
+        issuer.origin !== config.access.issuer.replace(/\/$/, "")) {
+      throw new Error("Cloudflare Access issuer must be an HTTPS origin only.");
+    }
+    if (!config.access.audience.trim() || config.access.audience !== config.access.audience.trim()) {
+      throw new Error("Cloudflare Access audience must not be blank or padded with whitespace.");
+    }
+    if (!Array.isArray(config.access.admins) ||
+        !config.access.admins.every((email) =>
+          typeof email === "string" && /^[^@\s]+@[^@\s]+$/.test(email))) {
+      throw new Error("Every Access administrator must be an email address.");
+    }
   }
 
   if (typeof config.aiGateway.enabled !== "boolean") {
@@ -208,12 +214,12 @@ function routeConfig(route) {
     : { workers_dev: false, routes: [{ pattern: route.customDomain, custom_domain: true }] };
 }
 
-function setCommon(config, deployment, name, route = { workersDev: false }) {
+function setCommon(config, deployment, name, route = null) {
   config.account_id = deployment.accountId;
   config.name = name;
-  config.workers_dev = route.workersDev;
+  config.workers_dev = route?.workersDev ?? false;
   delete config.routes;
-  if (route.customDomain) Object.assign(config, routeConfig(route));
+  if (route?.customDomain) Object.assign(config, routeConfig(route));
   config.observability = {
     ...config.observability,
     enabled: deployment.observability.enabled,
@@ -232,6 +238,7 @@ function setCommon(config, deployment, name, route = { workersDev: false }) {
 
 export function generateConfigs(config, bases) {
   validateConfig(config);
+  const privateWorkshop = config.workers.workshop.route == null;
   const workshop = structuredClone(bases.workshop);
   const context = structuredClone(bases.context);
   const customGatekeeper = structuredClone(bases.customGatekeeper);
@@ -241,9 +248,12 @@ export function generateConfigs(config, bases) {
 
   setCommon(workshop, config, config.workers.workshop.name, config.workers.workshop.route);
   workshop.vars = {
-    ADMINS: config.access.admins,
-    CF_ACCESS_ISS: config.access.issuer.replace(/\/$/, ""),
-    CF_ACCESS_AUD: config.access.audience,
+    ADMINS: config.access?.admins ?? [],
+    CYBERNEST_PRIVATE_MANAGER_RUNTIME: privateWorkshop ? "true" : "false",
+    ...(privateWorkshop ? {} : {
+      CF_ACCESS_ISS: config.access.issuer.replace(/\/$/, ""),
+      CF_ACCESS_AUD: config.access.audience,
+    }),
   };
   if (config.aiGateway.enabled) {
     Object.assign(workshop.vars, {
@@ -366,7 +376,7 @@ function build(config) {
   }
   run(["--dir", "cloudflare-os", "--filter", "@gadgets/workshop-frontend", "build"], root, {
     ...process.env,
-    VITE_CF_ACCESS_MODE: "true",
+    VITE_CF_ACCESS_MODE: config.workers.workshop.route == null ? "false" : "true",
   });
   run(["--dir", "cloudflare-os", "--filter", "@gadgets/workshop-backend", "build"]);
 }

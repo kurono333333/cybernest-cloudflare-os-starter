@@ -163,6 +163,19 @@ test("generates Access-mode Workshop, Context, and custom Gatekeeper configs", a
   assert.equal(generated.workshop.ratelimits, undefined);
 });
 
+test("generates a private Workshop without a public route or Access entry vars", async () => {
+  const config = structuredClone(validConfig);
+  config.workers.workshop.route = null;
+
+  const generated = generateConfigs(config, await baseConfigs());
+
+  assert.equal(generated.workshop.workers_dev, false);
+  assert.equal(generated.workshop.routes, undefined);
+  assert.equal(generated.workshop.vars.CYBERNEST_PRIVATE_MANAGER_RUNTIME, "true");
+  assert.equal(generated.workshop.vars.CF_ACCESS_ISS, undefined);
+  assert.equal(generated.workshop.vars.CF_ACCESS_AUD, undefined);
+});
+
 test("omits disabled backend error reporting", async () => {
   const config = structuredClone(validConfig);
   config.errorReporting = {

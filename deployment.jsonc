@@ -9,10 +9,9 @@
     "workshop": {
       "name": "<WORKSHOP_WORKER_NAME>",
 
-      // Production: use a hostname in an active Cloudflare zone. Wrangler creates DNS and TLS.
-      // Evaluation: replace this with "route": { "workersDev": true }.
-      // https://developers.cloudflare.com/workers/configuration/routing/custom-domains/
-      "route": { "customDomain": "os.example.com" }
+      // Cybernest reaches Workshop only through Core's private Service Binding.
+      // null deliberately creates no public route or workers.dev endpoint.
+      "route": null
     },
     "context": { "name": "<CONTEXT_WORKER_NAME>" },
     "customGatekeeper": { "name": "<CUSTOM_GATEKEEPER_WORKER_NAME>" },
