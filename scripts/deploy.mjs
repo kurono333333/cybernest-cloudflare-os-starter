@@ -10,6 +10,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const generatedName = "wrangler.prod.jsonc";
 const generatedPaths = {
   workshop: join(root, "cloudflare-os/packages/workshop-backend", generatedName),
+  workspaceUi: join(root, "packages/workspace-ui", generatedName),
   context: join(root, "cloudflare-os/packages/gatekeeper-context", generatedName),
   customGatekeeper: join(root, "packages/custom-gatekeeper", generatedName),
   errorReporter: join(root, "packages/error-reporter", generatedName),
@@ -18,6 +19,7 @@ const generatedPaths = {
 const requiredPaths = [
   "accountId",
   "workers.workshop.name",
+  "workers.workspaceUi.name",
   "workers.context.name",
   "workers.customGatekeeper.name",
   "aiGateway.enabled",
@@ -55,11 +57,26 @@ function valueAt(object, path) {
   return path.split(".").reduce((value, key) => value?.[key], object);
 }
 
+function validateWorkspaceUiRoutes(config) {
+  const routes = config.workers.workspaceUi?.routes;
+  const expected = [
+    { pattern: "dev.dennoba.net/workspace", zoneName: "dennoba.net" },
+    { pattern: "dev.dennoba.net/workspace/*", zoneName: "dennoba.net" },
+  ];
+  if (!Array.isArray(routes) || routes.length !== expected.length ||
+      routes.some((route, index) => route?.pattern !== expected[index].pattern ||
+        route?.zoneName !== expected[index].zoneName)) {
+    throw new Error("Workspace UI routes must be the exact and wildcard dev.dennoba.net/workspace routes in zone dennoba.net.");
+  }
+}
+
 export function validateConfig(config) {
-  const privateWorkshop = config.workers.workshop.route == null;
+  validateWorkspaceUiRoutes(config);
+  if (config.workers.workshop.route !== null) {
+    throw new Error("Workshop route must remain null for Cybernest.");
+  }
   const activePaths = [
     ...requiredPaths,
-    ...(!privateWorkshop ? ["access.issuer", "access.audience", "access.admins"] : []),
     ...(config.aiGateway?.enabled ? aiGatewayPaths : []),
     ...(config.errorReporting?.enabled ? errorReportingPaths : []),
   ];
@@ -85,9 +102,6 @@ export function validateConfig(config) {
         workersAi: { mode: "direct" },
       } }
       : config;
-  if (privateWorkshop) {
-    activeConfig = { ...activeConfig, access: undefined };
-  }
   if (!config.errorReporting.enabled) {
     activeConfig = {
       ...activeConfig,
@@ -99,7 +113,6 @@ export function validateConfig(config) {
   if (placeholder) throw new Error(`Replace deployment placeholder ${placeholder}.`);
 
   const stringPaths = activePaths.filter((path) => ![
-    "access.admins",
     "aiGateway.enabled",
     "aiGateway.providers",
     "errorReporting.enabled",
@@ -123,43 +136,10 @@ export function validateConfig(config) {
     .filter(([key]) => key !== "errorReporter" || config.errorReporting.enabled)
     .map(([, worker]) => worker.name);
   if (new Set(workerNames).size !== workerNames.length) {
-    throw new Error("Workshop, Context, and custom Gatekeeper Worker names must be unique.");
+    throw new Error("Worker names must be unique.");
   }
   if (!workerNames.every((name) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name))) {
     throw new Error("Worker names must use lowercase letters, numbers, and hyphens.");
-  }
-
-  const route = config.workers.workshop.route;
-  if (!privateWorkshop) {
-    if (Boolean(route.workersDev) === Boolean(route.customDomain)) {
-      throw new Error("Set exactly one Workshop route: workersDev or customDomain.");
-    }
-    if (route.workersDev !== undefined && route.workersDev !== true) {
-      throw new Error("Workshop workersDev must be boolean true when selected.");
-    }
-    if (route.customDomain !== undefined && typeof route.customDomain !== "string") {
-      throw new Error("Workshop customDomain must be a string.");
-    }
-    const hostnamePattern = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-    if (route.customDomain && !hostnamePattern.test(route.customDomain)) {
-      throw new Error("Workshop customDomain must be a lowercase hostname.");
-    }
-  }
-
-  if (!privateWorkshop) {
-    const issuer = new URL(config.access.issuer);
-    if (issuer.protocol !== "https:" ||
-        issuer.origin !== config.access.issuer.replace(/\/$/, "")) {
-      throw new Error("Cloudflare Access issuer must be an HTTPS origin only.");
-    }
-    if (!config.access.audience.trim() || config.access.audience !== config.access.audience.trim()) {
-      throw new Error("Cloudflare Access audience must not be blank or padded with whitespace.");
-    }
-    if (!Array.isArray(config.access.admins) ||
-        !config.access.admins.every((email) =>
-          typeof email === "string" && /^[^@\s]+@[^@\s]+$/.test(email))) {
-      throw new Error("Every Access administrator must be an email address.");
-    }
   }
 
   if (typeof config.aiGateway.enabled !== "boolean") {
@@ -208,18 +188,11 @@ export function validateConfig(config) {
   return config;
 }
 
-function routeConfig(route) {
-  return route.workersDev
-    ? { workers_dev: true, routes: undefined }
-    : { workers_dev: false, routes: [{ pattern: route.customDomain, custom_domain: true }] };
-}
-
-function setCommon(config, deployment, name, route = null) {
+function setCommon(config, deployment, name) {
   config.account_id = deployment.accountId;
   config.name = name;
-  config.workers_dev = route?.workersDev ?? false;
+  config.workers_dev = false;
   delete config.routes;
-  if (route?.customDomain) Object.assign(config, routeConfig(route));
   config.observability = {
     ...config.observability,
     enabled: deployment.observability.enabled,
@@ -238,23 +211,22 @@ function setCommon(config, deployment, name, route = null) {
 
 export function generateConfigs(config, bases) {
   validateConfig(config);
-  const privateWorkshop = config.workers.workshop.route == null;
   const workshop = structuredClone(bases.workshop);
+  const workspaceUi = structuredClone(bases.workspaceUi);
   const context = structuredClone(bases.context);
   const customGatekeeper = structuredClone(bases.customGatekeeper);
   const errorReporter = config.errorReporting.enabled
     ? structuredClone(bases.errorReporter)
     : undefined;
 
-  setCommon(workshop, config, config.workers.workshop.name, config.workers.workshop.route);
+  setCommon(workshop, config, config.workers.workshop.name);
   workshop.vars = {
-    ADMINS: config.access?.admins ?? [],
-    CYBERNEST_PRIVATE_MANAGER_RUNTIME: privateWorkshop ? "true" : "false",
-    ...(privateWorkshop ? {} : {
-      CF_ACCESS_ISS: config.access.issuer.replace(/\/$/, ""),
-      CF_ACCESS_AUD: config.access.audience,
-    }),
+    ...workshop.vars,
+    CYBERNEST_PRIVATE_MANAGER_RUNTIME: "true",
   };
+  delete workshop.vars.ADMINS;
+  delete workshop.vars.CF_ACCESS_ISS;
+  delete workshop.vars.CF_ACCESS_AUD;
   if (config.aiGateway.enabled) {
     Object.assign(workshop.vars, {
       CF_AI_GATEWAY: config.aiGateway.name,
@@ -308,11 +280,26 @@ export function generateConfigs(config, bases) {
     { binding: "BLUEPRINT_CONTENT", ...(config.resources.blueprintContentBucket
       ? { bucket_name: config.resources.blueprintContentBucket } : {}) },
   ];
-  workshop.assets = {
-    directory: "../workshop-frontend/dist",
+  delete workshop.assets;
+
+  setCommon(workspaceUi, config, config.workers.workspaceUi.name);
+  workspaceUi.routes = config.workers.workspaceUi.routes.map(({ pattern, zoneName }) => ({
+    pattern,
+    zone_name: zoneName,
+  }));
+  workspaceUi.assets = {
+    directory: "../../cloudflare-os/packages/workshop-frontend/dist",
+    binding: "ASSETS",
     not_found_handling: "single-page-application",
-    run_worker_first: ["/api", "/api/*", "/blueprint-screenshot/*"],
+    run_worker_first: true,
   };
+  delete workspaceUi.services;
+  delete workspaceUi.kv_namespaces;
+  delete workspaceUi.r2_buckets;
+  delete workspaceUi.durable_objects;
+  delete workspaceUi.migrations;
+  delete workspaceUi.vars;
+  delete workspaceUi.secrets;
 
   setCommon(context, config, config.workers.context.name);
   context.kv_namespaces = [
@@ -330,7 +317,7 @@ export function generateConfigs(config, bases) {
     setCommon(errorReporter, config, config.workers.errorReporter.name);
   }
 
-  return { workshop, context, customGatekeeper, ...(errorReporter && { errorReporter }) };
+  return { workshop, workspaceUi, context, customGatekeeper, ...(errorReporter && { errorReporter }) };
 }
 
 async function readJsonc(path) {
@@ -362,6 +349,28 @@ function run(args, cwd = root, env = process.env) {
   }
 }
 
+function gitRevision(cwd) {
+  const status = spawnSync("git", ["status", "--porcelain"], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (status.error) throw status.error;
+  if (status.status !== 0 || status.stdout.trim() !== "") {
+    throw new Error(`Cloudflare OS checkout must be clean before release: ${cwd}.`);
+  }
+  const result = spawnSync("git", ["rev-parse", "HEAD"], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`Could not read the Cloudflare OS revision in ${cwd}.`);
+  }
+  return result.stdout.trim();
+}
+
 function requireSubmodule() {
   if (!existsSync(join(root, "cloudflare-os/package.json"))) {
     throw new Error("CloudflareOS submodule is not initialized. Run git submodule update --init.");
@@ -369,6 +378,7 @@ function requireSubmodule() {
 }
 
 function build(config) {
+  const osRevision = gitRevision(join(root, "cloudflare-os"));
   run(["--dir", "cloudflare-os", "--filter", "@gadgets/gatekeeper-context", "build"]);
   run(["--dir", "packages/custom-gatekeeper", "run", "build"]);
   if (config.errorReporting.enabled) {
@@ -376,9 +386,16 @@ function build(config) {
   }
   run(["--dir", "cloudflare-os", "--filter", "@gadgets/workshop-frontend", "build"], root, {
     ...process.env,
-    VITE_CF_ACCESS_MODE: config.workers.workshop.route == null ? "false" : "true",
+    VITE_CYBERNEST_MODE: "true",
+    VITE_SITE_NAME: "dennoba",
+    VITE_FRONTEND_ERROR_REPORTING: "false",
+    VITE_CF_ACCESS_MODE: "false",
   });
   run(["--dir", "cloudflare-os", "--filter", "@gadgets/workshop-backend", "build"]);
+  if (gitRevision(join(root, "cloudflare-os")) !== osRevision) {
+    throw new Error("Cloudflare OS revision changed during the release build.");
+  }
+  return osRevision;
 }
 
 async function main() {
@@ -386,6 +403,7 @@ async function main() {
   const config = await readDeployment(join(root, "deployment.jsonc"));
   const generated = generateConfigs(config, {
     workshop: await readJsonc(join(root, "cloudflare-os/packages/workshop-backend/wrangler.jsonc")),
+    workspaceUi: await readJsonc(join(root, "packages/workspace-ui/wrangler.jsonc")),
     context: await readJsonc(join(root, "cloudflare-os/packages/gatekeeper-context/wrangler.jsonc")),
     customGatekeeper: await readJsonc(join(root, "packages/custom-gatekeeper/wrangler.jsonc")),
     errorReporter: await readJsonc(join(root, "packages/error-reporter/wrangler.jsonc")),
@@ -397,7 +415,8 @@ async function main() {
     }
     const check = process.argv.includes("--check");
     if (check) run(["test"]);
-    build(config);
+    const osRevision = build(config);
+    console.log(`Cloudflare OS release: ${osRevision}`);
     const deployArgs = check ? ["--dry-run"] : [];
     if (config.errorReporting.enabled) {
       run(["exec", "wrangler", "deploy", "--config", generatedName, ...deployArgs],
@@ -409,6 +428,8 @@ async function main() {
       join(root, "packages/custom-gatekeeper"));
     run(["exec", "wrangler", "deploy", "--config", generatedName, ...deployArgs],
       join(root, "cloudflare-os/packages/workshop-backend"));
+    run(["exec", "wrangler", "deploy", "--config", generatedName, ...deployArgs],
+      join(root, "packages/workspace-ui"));
   } finally {
     await Promise.all(Object.values(generatedPaths).map((path) => rm(path, { force: true })));
   }

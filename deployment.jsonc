@@ -1,31 +1,28 @@
 {
   // Cloudflare account that owns every Worker and provisioned resource.
   // Find it: https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/
-  "accountId": "<CLOUDFLARE_ACCOUNT_ID>",
+  "accountId": "d6726a38b563a01c6339a20854852086",
 
   // Worker names are permanent service identities. Keep them unique within the account.
   // Reference: docs/customization.md#workers-and-routing
   "workers": {
     "workshop": {
-      "name": "<WORKSHOP_WORKER_NAME>",
+      "name": "dev-dennoba-os",
 
       // Cybernest reaches Workshop only through Core's private Service Binding.
       // null deliberately creates no public route or workers.dev endpoint.
       "route": null
     },
-    "context": { "name": "<CONTEXT_WORKER_NAME>" },
-    "customGatekeeper": { "name": "<CUSTOM_GATEKEEPER_WORKER_NAME>" },
-    "errorReporter": { "name": "<ERROR_REPORTER_WORKER_NAME>" }
-  },
-
-  // This Cybernest deployment keeps Workshop private; Core reaches it only through Service Binding.
-  // For a public Workshop deployment, configure Cloudflare Access or another supported sign-in
-  // method as described in the reference below. "admins" gates /admin in every sign-in method.
-  // Reference: docs/customization.md#sign-in-methods
-  "access": {
-    "issuer": "https://<TEAM_NAME>.cloudflareaccess.com",
-    "audience": "<ACCESS_AUDIENCE>",
-    "admins": ["<ADMIN_EMAIL>"]
+    "workspaceUi": {
+      "name": "dev-dennoba-workspace-ui",
+      "routes": [
+        { "pattern": "dev.dennoba.net/workspace", "zoneName": "dennoba.net" },
+        { "pattern": "dev.dennoba.net/workspace/*", "zoneName": "dennoba.net" }
+      ]
+    },
+    "context": { "name": "dev-dennoba-context" },
+    "customGatekeeper": { "name": "dev-dennoba-custom-gatekeeper" },
+    "errorReporter": { "name": "dev-dennoba-error-reporter" }
   },
 
   // Optional platform-funded model catalog. Leave disabled to deploy without AI setup.
@@ -47,14 +44,14 @@
 
     // null: Wrangler provisions and remembers a KV namespace on first deploy.
     // string: bind an existing namespace by ID.
-    "kvNamespaceId": null
+    "kvNamespaceId": "569dbfde72de46deaa3cf590e0956a19"
   },
 
   // Displayed to agents when the example custom integration is enabled in /admin.
   // Reference: docs/customization.md#custom-gatekeepers
   "customGatekeeper": {
-    "name": "<ORGANIZATION_DISPLAY_NAME>",
-    "message": "<ORGANIZATION_GUIDANCE>"
+    "name": "Cybernest",
+    "message": "Cybernest Manager context"
   },
 
   // Explicit backend issue reports go to a private Worker that emits structured console errors.
@@ -69,9 +66,9 @@
   // null values use Wrangler automatic provisioning. Set IDs/names to reuse owned resources.
   // https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning
   "resources": {
-    "blueprintsKvNamespaceId": null,
-    "avatarsKvNamespaceId": null,
-    "blueprintContentBucket": null
+    "blueprintsKvNamespaceId": "630728db6242410f896ba9bc768dcbfe",
+    "avatarsKvNamespaceId": "96787d4ed2bc4383a307ba06172a699c",
+    "blueprintContentBucket": "dev-dennoba-os-blueprint-content"
   },
 
   // Structured custom logs stay enabled. Invocation logs and traces are separate volume controls.

@@ -5,7 +5,7 @@
 <h1 align="center">Customized for your Company</h1>
 
 <p align="center">
-  Deploy a pinned Cloudflare OS release with branding, sign-in, integrations, routes, and upgrades under your control.
+  Run a pinned Cloudflare OS release behind Cybernest Core, with its standard UI and runtime upgraded as one unit.
 </p>
 
 <p align="center">
@@ -21,21 +21,21 @@
 ## Four steps
 
 1. Install the dependencies and run `pnpm exec wrangler login`.
-2. Fill in `deployment.jsonc`: account ID, Worker names, hostname, Access audience, admin emails.
+2. Fill in the active values in `deployment.jsonc`: account ID, Worker names, and organization settings.
 3. Run `pnpm check`, then `pnpm deploy`.
-4. Open `/admin` and set the site name, logo, and accent color; branding needs no redeploy.
+4. Sign in through Cybernest and open `/workspace`; no second Cloudflare OS login should appear.
 
 [Deploy](#deploy) and [Customization](#customization) expand each step. Everything else on this page is optional reading.
 
 ## Overview
 
-This repository adds deployment controls around a pinned [Cloudflare OS](https://github.com/cloudflare/cloudflare-os) release without modifying the upstream source.
+This repository adds deployment controls and a thin Cybernest frontend adapter around a pinned [Cloudflare OS](https://github.com/cloudflare/cloudflare-os) fork.
 
 | Control | What you own |
 | --- | --- |
-| Branding | Site name, logo, and accent color, changed in [`/admin`](docs/customization.md#branding) without a deploy |
-| Identity | The sign-in method and administrator allowlist; this starter deploys [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/) mode |
-| Routing | A production [Custom Domain](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/) or a `workers.dev` evaluation route |
+| Branding | The Cybernest build supplies the site name; independent OS branding remains an upstream standalone feature |
+| Identity | Cybernest Core/Auth0 owns the browser entry; the Workshop runtime stays private behind its Service Binding |
+| Routing | Private Workshop runtime plus same-zone `/workspace` Workspace UI Worker routes |
 | Data | Existing KV/R2 resources or [automatic provisioning](https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning) |
 | Integrations | Wrapper-owned Gatekeepers and service bindings without patching upstream |
 | AI | No platform model by default; opt into [Workers AI](https://developers.cloudflare.com/workers-ai/) and [AI Gateway](https://developers.cloudflare.com/ai-gateway/) when needed |
@@ -45,7 +45,7 @@ This repository adds deployment controls around a pinned [Cloudflare OS](https:/
 
 <img src="docs/assets/architecture.svg" alt="Cloudflare OS deployment architecture: users sign in and reach the pinned Cloudflare OS release, holding the Workshop kernel, Gadgets, Blueprints, and the default Gatekeepers. Service bindings connect it to the Workers this repository owns: optional AI, custom Gatekeepers, the Error Reporter, and KV and R2 storage.">
 
-The deploy command derives temporary Wrangler files from upstream base configs, builds the frontend in Cloudflare Access mode, deploys the private Error Reporter and Gatekeepers before the Workshop, and removes generated files even on failure. Secrets never enter tracked configuration.
+The deploy command derives temporary Wrangler files from upstream base configs, builds the pinned frontend in Cybernest mode, deploys the private Workshop runtime before the stateless `/workspace` UI Worker, and removes generated files even on failure. Secrets never enter tracked configuration.
 
 ### If you only want branding
 
@@ -70,16 +70,11 @@ pnpm exec wrangler login
 
 Your account needs [Workers](https://developers.cloudflare.com/workers/), [KV](https://developers.cloudflare.com/kv/), [R2](https://developers.cloudflare.com/r2/), [Browser Rendering](https://developers.cloudflare.com/browser-rendering/), and [Dynamic Worker Loaders](https://developers.cloudflare.com/workers/runtime-apis/bindings/worker-loader/). AI products are optional.
 
-### 2. Configure sign-in
+### 2. Configure the private Cybernest deployment
 
-Cloudflare OS supports several sign-in methods. This starter deploys [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/) mode, which verifies identity before a request reaches the Worker. See [Sign-in methods](docs/customization.md#sign-in-methods) for the alternatives and what switching involves.
+Open [`deployment.jsonc`](deployment.jsonc) and replace the active placeholders. Keep `workers.workshop.route` as `null`: Cybernest Core/Auth0 owns sign-in and reaches the Workshop only through its private Service Binding. The Workspace UI routes stay on `dev.dennoba.net/workspace` and `dev.dennoba.net/workspace/*` for this development deployment.
 
-1. Choose a Workshop hostname in an [active Cloudflare zone](https://developers.cloudflare.com/dns/zone-setups/), such as `os.example.com`.
-2. Create a [self-hosted Access application](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/) for that hostname.
-3. Copy its [application audience tag](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/#get-your-aud-tag).
-4. Open [`deployment.jsonc`](deployment.jsonc) and replace the active placeholders. Every control is annotated in place.
-
-Wrangler creates DNS and TLS for the custom domain at deploy time. For an evaluation without a zone, switch the annotated route to `{ "workersDev": true }`.
+The validator rejects a public Workshop route because this release always builds the Cybernest frontend. Do not create a second Cloudflare Access login for this path. A standalone public Cloudflare OS deployment is a separate release mode; follow the upstream project instead.
 
 ### 3. Validate and deploy
 
@@ -96,9 +91,8 @@ Backend error reporting is enabled without a vendor account. Explicit upstream i
 
 ### 4. Verify the deployment
 
-- Open the Workshop hostname and confirm Access signs in with the expected identity.
-- Open `/admin`, confirm the email is an administrator, and set Context and Custom Gatekeepers to disabled, optional, or enabled.
-- Enable the Custom Gatekeeper, ask for deployment information, and confirm its read appears as an observation.
+- Open `/workspace` on the configured zone and confirm the Core gateway reaches the pinned Workshop runtime without a second OS login.
+- Confirm an unauthenticated or unregistered browser returns to the Cybernest identity surface instead of an OS login or signup page.
 - Open the Error Reporter Worker's [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/) and verify its structured `error_report` query surface.
 - Review logs for the Workshop, Context, custom Gatekeeper, and Error Reporter Workers.
 
@@ -106,8 +100,9 @@ Backend error reporting is enabled without a vendor account. Explicit upstream i
 
 | Customize | Best place | Deploy required |
 | --- | --- | --- |
-| Site name, logo, color, announcements, instructions, connectors | `/admin` | No |
-| Sign-in, routes, AI, storage, observability, Worker identities | [`deployment.jsonc`](deployment.jsonc) | Yes |
+| Cybernest site name | `VITE_SITE_NAME` in the wrapper-owned build | Yes |
+| Standalone OS branding and runtime policy | Upstream `/admin` surface | Depends on a separate standalone deployment |
+| AI, storage, observability, Worker identities | [`deployment.jsonc`](deployment.jsonc) | Yes |
 | Logs, traces, error destinations, browser reporting | [Observability guide](docs/observability.md) | Sometimes |
 | Organization APIs and capabilities | [`packages/custom-gatekeeper`](packages/custom-gatekeeper/README.md) | Yes |
 | Product behavior unavailable through Worker boundaries | Pinned upstream fork/commit | Yes |
@@ -120,4 +115,5 @@ The complete control reference and recipes live in [Customization](docs/customiz
 - Triage explicit failures and choose export destinations with the [observability guide](docs/observability.md).
 - Roll a Worker back from its dashboard deployment history or with [`wrangler rollback`](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/).
 - Follow the [upgrade checklist](docs/customization.md#upgrade) before changing the pinned submodule.
+- Update the Workspace UI Worker and private Workshop runtime from the same Cloudflare OS full SHA; do not update the UI alone.
 - Review the upstream Cloudflare OS documentation and release history before adopting behavior changes.
