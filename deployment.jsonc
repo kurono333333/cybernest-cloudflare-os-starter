@@ -18,10 +18,9 @@
     "errorReporter": { "name": "<ERROR_REPORTER_WORKER_NAME>" }
   },
 
-  // This starter deploys Cloudflare Access mode. Cloudflare OS also supports built-in password
-  // accounts and auth Gatekeeper sign-in; see the reference below before switching. The audience
-  // comes from the self-hosted Access application protecting the Workshop hostname.
-  // "admins" gates /admin in every sign-in method.
+  // This Cybernest deployment keeps Workshop private; Core reaches it only through Service Binding.
+  // For a public Workshop deployment, configure Cloudflare Access or another supported sign-in
+  // method as described in the reference below. "admins" gates /admin in every sign-in method.
   // Reference: docs/customization.md#sign-in-methods
   "access": {
     "issuer": "https://<TEAM_NAME>.cloudflareaccess.com",
