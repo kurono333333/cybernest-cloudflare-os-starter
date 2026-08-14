@@ -42,6 +42,16 @@ type KnowledgeError = {
   revisionId?: string;
 };
 
+const KNOWLEDGE_ERROR_CODES = new Set([
+  "access_denied",
+  "target_missing",
+  "invalid_input",
+  "revision_conflict",
+  "capacity_exceeded",
+  "temporarily_unavailable",
+  "integrity_failure",
+]);
+
 type KnowledgeReference = {
   revisionId: string;
   documentKey: string;
@@ -75,7 +85,7 @@ type KnowledgeProposal = {
 
 type KnowledgeProposalInput = Omit<KnowledgeProposal, "revisionId">;
 
-type ManagerKnowledgeAccessV1 = {
+interface ManagerKnowledgeAccessV1 {
   assertBoundTo(managerId: string): Promise<void>;
   list(options?: KnowledgePageOptions): Promise<KnowledgeResult<KnowledgePage>>;
   search(
@@ -85,7 +95,7 @@ type ManagerKnowledgeAccessV1 = {
   read(revisionId: string): Promise<KnowledgeResult<KnowledgeSource>>;
   applyProposal(input: KnowledgeProposal): Promise<KnowledgeResult<KnowledgeReference>>;
   cancelProposal(revisionId: string): Promise<KnowledgeResult<null>>;
-};
+}
 
 export type KnowledgeAccountProps = {
   access: ManagerKnowledgeAccessV1;
@@ -104,7 +114,6 @@ type ProposalQueue = Pick<ApprovalQueue, "authorizeObservation" | "submitAction"
   Partial<{ [Symbol.dispose](): void }>;
 
 type PendingKnowledgeAction = {
-  version: 1;
   state: "pending";
   revisionId: string;
   documentKey: string;
@@ -114,7 +123,6 @@ type PendingKnowledgeAction = {
 };
 
 type KnowledgeActionTombstone = {
-  version: 1;
   state: "applied" | "rejected";
 };
 
@@ -128,6 +136,14 @@ const MAX_BODY_BYTES = 1_048_576;
 const MAX_DOCUMENT_KEY_BYTES = 255;
 const MAX_REVISION_ID_LENGTH = 36;
 const MAX_SAFE_ACTION_ID = Number.MAX_SAFE_INTEGER;
+const PENDING_ACTION_KEYS = [
+  "state",
+  "revisionId",
+  "documentKey",
+  "baseSourceRevisionId",
+  "contentHash",
+  "body",
+] as const;
 
 const actionKey = (actionId: number) => ACTION_KEY_PREFIX + actionId;
 
@@ -199,12 +215,6 @@ const bytesToHash = async (bytes: Uint8Array): Promise<string> => {
     .join("");
 };
 
-const bodyBytes = (body: unknown): Uint8Array | null => {
-  if (body instanceof ArrayBuffer) return new Uint8Array(body);
-  if (body instanceof Uint8Array) return body;
-  return null;
-};
-
 const preview = (content: string): string => Array.from(content).slice(0, 2_000).join("");
 
 const literalBlock = (value: string): string =>
@@ -234,6 +244,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  // Validate the serialized data shape. Cap'n Web stubs may carry non-enumerable or symbol
+  // bookkeeping properties that are not part of the RPC value and must not become contract data.
+  const actual = Object.keys(value);
+  return (
+    actual.length === keys.length &&
+    keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
+  );
+}
+
 function assertManagerId(managerId: string): void {
   if (!MANAGER_UUID.test(managerId)) {
     throw new TypeError("Manager ID must be a UUID.");
@@ -259,50 +279,140 @@ function validateKnowledgeAccountProps(value: unknown): KnowledgeAccountProps {
   };
 }
 
-function isKnowledgeReference(value: unknown): value is KnowledgeReference {
-  return (
-    isRecord(value) &&
-    typeof value.revisionId === "string" &&
-    typeof value.documentKey === "string" &&
-    typeof value.contentHash === "string"
-  );
+export function parseKnowledgeActionRecord(value: unknown): KnowledgeActionRecord {
+  if (!isRecord(value) || typeof value.state !== "string") {
+    throw gatekeeperError("integrity_failure");
+  }
+
+  if (value.state === "applied" || value.state === "rejected") {
+    if (!hasExactKeys(value, ["state"])) {
+      throw gatekeeperError("integrity_failure");
+    }
+    return { state: value.state };
+  }
+
+  if (
+    value.state !== "pending" ||
+    !hasExactKeys(value, PENDING_ACTION_KEYS) ||
+    typeof value.revisionId !== "string" ||
+    !CANONICAL_UUID.test(value.revisionId) ||
+    typeof value.documentKey !== "string" ||
+    !isValidDocumentKey(value.documentKey) ||
+    typeof value.contentHash !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(value.contentHash) ||
+    (value.baseSourceRevisionId !== null &&
+      (typeof value.baseSourceRevisionId !== "string" ||
+        !CANONICAL_UUID.test(value.baseSourceRevisionId))) ||
+    !(value.body instanceof ArrayBuffer) ||
+    value.body.byteLength > MAX_BODY_BYTES
+  ) {
+    throw gatekeeperError("integrity_failure");
+  }
+
+  return {
+    state: "pending",
+    revisionId: value.revisionId,
+    documentKey: value.documentKey,
+    baseSourceRevisionId: value.baseSourceRevisionId,
+    contentHash: value.contentHash,
+    body: value.body,
+  };
 }
 
-function isKnowledgePage(value: unknown): value is KnowledgePage {
-  return (
-    isRecord(value) &&
-    Array.isArray(value.items) &&
-    value.items.every(isKnowledgeReference) &&
-    (typeof value.nextCursor === "string" || value.nextCursor === null)
-  );
+function parseKnowledgeReference(value: unknown): KnowledgeReference | undefined {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["revisionId", "documentKey", "contentHash"]) ||
+    typeof value.revisionId !== "string" ||
+    !CANONICAL_UUID.test(value.revisionId) ||
+    typeof value.documentKey !== "string" ||
+    !isValidDocumentKey(value.documentKey) ||
+    typeof value.contentHash !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(value.contentHash)
+  ) {
+    return undefined;
+  }
+
+  return {
+    revisionId: value.revisionId,
+    documentKey: value.documentKey,
+    contentHash: value.contentHash,
+  };
 }
 
-function isKnowledgeSource(value: unknown): value is KnowledgeSource {
-  return (
-    isRecord(value) &&
-    typeof value.revisionId === "string" &&
-    typeof value.documentKey === "string" &&
-    typeof value.contentHash === "string" &&
-    typeof value.content === "string"
-  );
+function parseKnowledgePage(value: unknown): KnowledgePage | undefined {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["items", "nextCursor"]) ||
+    !Array.isArray(value.items) ||
+    value.items.length > 50 ||
+    (value.nextCursor !== null &&
+      (typeof value.nextCursor !== "string" || !isValidDocumentKey(value.nextCursor)))
+  ) {
+    return undefined;
+  }
+
+  const items: KnowledgeReference[] = [];
+  for (const item of value.items) {
+    const reference = parseKnowledgeReference(item);
+    if (reference === undefined) return undefined;
+    items.push(reference);
+  }
+
+  return { items, nextCursor: value.nextCursor };
+}
+
+function parseKnowledgeSource(value: unknown): KnowledgeSource | undefined {
+  if (
+    !isRecord(value) ||
+    !hasExactKeys(value, ["revisionId", "documentKey", "contentHash", "content"]) ||
+    typeof value.content !== "string" ||
+    hasUnpairedSurrogate(value.content) ||
+    new TextEncoder().encode(value.content).byteLength > MAX_BODY_BYTES
+  ) {
+    return undefined;
+  }
+
+  const reference = parseKnowledgeReference({
+    revisionId: value.revisionId,
+    documentKey: value.documentKey,
+    contentHash: value.contentHash,
+  });
+  if (reference === undefined) return undefined;
+
+  return { ...reference, content: value.content };
 }
 
 function unwrapKnowledgeResult<T>(
   result: unknown,
-  isValue: (value: unknown) => value is T,
+  parseValue: (value: unknown) => T | undefined,
 ): T {
   if (!isRecord(result) || typeof result.ok !== "boolean") {
     throw new Error("Knowledge Base integrity_failure: malformed result.");
   }
 
   if (result.ok) {
-    if (!isValue(result.value)) {
+    if (!hasExactKeys(result, ["ok", "value"])) {
+      throw new Error("Knowledge Base integrity_failure: malformed result.");
+    }
+    const value = parseValue(result.value);
+    if (value === undefined) {
       throw new Error("Knowledge Base integrity_failure: malformed value.");
     }
-    return result.value;
+    return value;
   }
 
-  if (!isRecord(result.error) || typeof result.error.code !== "string") {
+  if (
+    !hasExactKeys(result, ["ok", "error"]) ||
+    !isRecord(result.error) ||
+    (!hasExactKeys(result.error, ["code"]) &&
+      !hasExactKeys(result.error, ["code", "revisionId"])) ||
+    typeof result.error.code !== "string" ||
+    !KNOWLEDGE_ERROR_CODES.has(result.error.code) ||
+    (Object.prototype.hasOwnProperty.call(result.error, "revisionId") &&
+      (typeof result.error.revisionId !== "string" ||
+        !CANONICAL_UUID.test(result.error.revisionId)))
+  ) {
     throw new Error("Knowledge Base integrity_failure: malformed error.");
   }
 
@@ -358,7 +468,7 @@ export class KnowledgeSession extends RpcTarget implements KnowledgeBase {
   async list(options?: KnowledgePageOptions): Promise<KnowledgePage> {
     const page = unwrapKnowledgeResult(
       await this.#access.list(options),
-      isKnowledgePage,
+      parseKnowledgePage,
     );
     await this.#approvalQueue.authorizeObservation({
       title: "Knowledge Base list",
@@ -370,7 +480,7 @@ export class KnowledgeSession extends RpcTarget implements KnowledgeBase {
   async search(query: string, options?: KnowledgePageOptions): Promise<KnowledgePage> {
     const page = unwrapKnowledgeResult(
       await this.#access.search(query, options),
-      isKnowledgePage,
+      parseKnowledgePage,
     );
     await this.#approvalQueue.authorizeObservation({
       title: "Knowledge Base search",
@@ -387,7 +497,7 @@ export class KnowledgeSession extends RpcTarget implements KnowledgeBase {
   async read(revisionId: string): Promise<KnowledgeSource> {
     const source = unwrapKnowledgeResult(
       await this.#access.read(revisionId),
-      isKnowledgeSource,
+      parseKnowledgeSource,
     );
     await this.#approvalQueue.authorizeObservation({
       title: "Knowledge Base read",
@@ -425,33 +535,7 @@ export class CustomGatekeeper
   }
 
   #readActionRecord(actionId: number): KnowledgeActionRecord {
-    const value = this.ctx.storage.kv.get<unknown>(actionKey(actionId));
-    if (!isRecord(value) || value.version !== 1 || typeof value.state !== "string") {
-      throw gatekeeperError("integrity_failure");
-    }
-
-    if (value.state === "applied" || value.state === "rejected") {
-      if (Object.keys(value).length !== 2) throw gatekeeperError("integrity_failure");
-      return value as KnowledgeActionTombstone;
-    }
-
-    if (
-      value.state !== "pending" ||
-      typeof value.revisionId !== "string" ||
-      !CANONICAL_UUID.test(value.revisionId) ||
-      typeof value.documentKey !== "string" ||
-      !isValidDocumentKey(value.documentKey) ||
-      typeof value.contentHash !== "string" ||
-      !/^[0-9a-f]{64}$/u.test(value.contentHash) ||
-      (value.baseSourceRevisionId !== null &&
-        (typeof value.baseSourceRevisionId !== "string" ||
-          !CANONICAL_UUID.test(value.baseSourceRevisionId))) ||
-      bodyBytes(value.body) === null
-    ) {
-      throw gatekeeperError("integrity_failure");
-    }
-
-    return value as unknown as PendingKnowledgeAction;
+    return parseKnowledgeActionRecord(this.ctx.storage.kv.get<unknown>(actionKey(actionId)));
   }
 
   #stageAction(
@@ -484,7 +568,6 @@ export class CustomGatekeeper
       }
 
       this.ctx.storage.kv.put<PendingKnowledgeAction>(actionKey(nextActionId), {
-        version: 1,
         state: "pending",
         revisionId: proposal.revisionId,
         documentKey: proposal.documentKey,
@@ -544,8 +627,8 @@ export class CustomGatekeeper
     if (record.state === "rejected") throw gatekeeperError("integrity_failure");
     if (record.state !== "pending") throw gatekeeperError("integrity_failure");
 
-    const body = bodyBytes(record.body);
-    if (body === null || body.byteLength > MAX_BODY_BYTES) {
+    const body = new Uint8Array(record.body);
+    if (body.byteLength > MAX_BODY_BYTES) {
       throw gatekeeperError("integrity_failure");
     }
     const contentHash = await bytesToHash(body);
@@ -567,7 +650,7 @@ export class CustomGatekeeper
         baseSourceRevisionId: record.baseSourceRevisionId,
         content,
       }),
-      isKnowledgeReference,
+      parseKnowledgeReference,
     );
     if (
       reference.revisionId !== record.revisionId ||
@@ -578,7 +661,6 @@ export class CustomGatekeeper
     }
 
     this.ctx.storage.kv.put<KnowledgeActionTombstone>(actionKey(actionId), {
-      version: 1,
       state: "applied",
     });
   }
@@ -591,10 +673,9 @@ export class CustomGatekeeper
 
     unwrapKnowledgeResult(
       await this.#access().cancelProposal(record.revisionId),
-      (value): value is null => value === null,
+      (value) => (value === null ? null : undefined),
     );
     this.ctx.storage.kv.put<KnowledgeActionTombstone>(actionKey(actionId), {
-      version: 1,
       state: "rejected",
     });
   }
@@ -694,8 +775,12 @@ export class CustomAccount
   }
 
   async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<KnowledgeBase>>> {
-    const props = validateKnowledgeAccountProps(this.ctx.props as unknown);
-    return this.ctx.exports.CustomGatekeeper({ props });
+    const rawProps = this.ctx.props as unknown;
+    validateKnowledgeAccountProps(rawProps);
+    // Preserve the native ServiceStub; the validation wrapper is not persistable through ctx.exports.
+    return this.ctx.exports.CustomGatekeeper({
+      props: rawProps as KnowledgeGatekeeperProps,
+    });
   }
 
   async getSupportedResources(): Promise<SupportedResource[]> {
