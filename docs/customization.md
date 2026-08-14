@@ -1,8 +1,10 @@
 # Customizing Cloudflare OS
 
-This wrapper exposes controls at three depths. Start in the Admin UI, move to deployment configuration when the trust or infrastructure boundary changes, and write code only for capabilities that neither layer can express.
+This guide separates the supported private Cybernest wrapper controls from the Admin UI and sign-in controls owned by standalone upstream Cloudflare OS.
 
-## Admin UI
+> **Cybernest mode:** the deployment in this repository uses Core/Auth0 for sign-in, keeps Workshop private, and builds the standard UI with `VITE_SITE_NAME=dennoba`. The `/admin` branding and OS-native sign-in sections below describe standalone upstream Cloudflare OS; they are not the active 06A browser path.
+
+## Standalone upstream Admin UI
 
 Use `/admin` for runtime policy that should not require a deployment:
 
@@ -27,8 +29,8 @@ The custom logo appears in the app chrome, sign-in screens, and browser tab on e
 | --- | --- | --- |
 | `accountId` | Resource ownership | A 32-character [Cloudflare account ID](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/) |
 | `workers.*.name` | Stable Worker service identities | Unique lowercase names; changing one creates a differently named Worker |
-| `workers.workshop.route` | Public Workshop address | `customDomain` for production or `workersDev: true` for evaluation |
-| `access` | Cloudflare Access trust and administrator list | Access team issuer, application audience, and verified email list |
+| `workers.workshop.route` | Workshop exposure | `null` for the supported private Cybernest runtime |
+| `workers.workspaceUi.routes` | Standard UI address | Exact and wildcard `dev.dennoba.net/workspace` routes in the `dennoba.net` zone |
 | `aiGateway` | Deployment-funded model catalog | Disabled, Workers AI direct, or provider traffic through AI Gateway |
 | `context` | Context sharing boundary and snapshot KV | A stable domain label; automatic or existing KV |
 | `customGatekeeper` | Example integration identity and guidance | Organization-specific display text |
@@ -40,45 +42,25 @@ Secrets are never valid values in this file. Install them interactively with Wra
 
 ### Workers and routing
 
-Keep the four Worker names unique. Service bindings use these names, so update and deploy them together.
+Keep the five Worker names unique. The Workshop runtime remains private; the stateless Workspace UI Worker owns only `/workspace` and `/workspace/*`. Service bindings use the runtime Worker names, so update and deploy the pinned Workshop runtime and Workspace UI together.
 
-For production, set a [Custom Domain](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/):
+The Workspace UI Worker has one native `ASSETS` binding and no authentication, database, Durable Object, KV, R2, or Workshop service binding. It strips the `/workspace` prefix before serving the pinned `workshop-frontend` artifact. Core remains the only browser gateway to `/manager/os`.
 
-```jsonc
-"route": { "customDomain": "os.example.com" }
-```
-
-The hostname must belong to an active Cloudflare zone and cannot conflict with an existing CNAME. Wrangler creates the DNS record and certificate. For evaluation, use the account's [`workers.dev`](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/) subdomain instead:
-
-```jsonc
-"route": { "workersDev": true }
-```
+Keep `workers.workshop.route` as `null` for Cybernest. Publishing Workshop on a Custom Domain or `workers.dev` creates a different browser and identity boundary and is not enabled by changing this value alone.
 
 ### Sign-in methods
 
-Cloudflare OS supports three ways to sign users in. This starter deploys Cloudflare Access.
+Upstream Cloudflare OS supports three native sign-in methods. This Cybernest deployment does not expose any of them: Core/Auth0 owns the browser entry and passes only an ownership-approved Manager to the private Workshop runtime.
 
-| Method | How it works | In this starter |
+| Method | How it works | In this Cybernest release |
 | --- | --- | --- |
-| Cloudflare Access | Access verifies identity before the request reaches the Worker, and the Workshop trusts the signed Access JWT. The password login and signup pages are disabled. | Deployed by default |
-| Built-in password accounts | Cloudflare OS serves its own username and password login plus signup. This is the upstream default. | Requires deploy script changes |
-| Auth Gatekeepers | Gatekeepers that advertise `providesAuth` add "Continue with ..." buttons, alongside or instead of password login. | Requires deploy script changes |
+| Cloudflare Access | Access verifies identity before the request reaches the Worker, and the Workshop trusts the signed Access JWT. The password login and signup pages are disabled. | Not supported; standalone upstream mode only |
+| Built-in password accounts | Cloudflare OS serves its own username and password login plus signup. This is the upstream default. | Not supported; standalone upstream mode only |
+| Auth Gatekeepers | Gatekeepers that advertise `providesAuth` add "Continue with ..." buttons, alongside or instead of password login. | Not supported; standalone upstream mode only |
 
-Access mode is the default here because unauthenticated requests never reach application code. `scripts/deploy.mjs` implements it by setting `CF_ACCESS_ISS` and `CF_ACCESS_AUD` on the Workshop and building the frontend with `VITE_CF_ACCESS_MODE=true`.
+The private Workshop runtime is reached by Cybernest Core through a Service Binding. `scripts/deploy.mjs` builds the frontend with `VITE_CYBERNEST_MODE=true`, `VITE_SITE_NAME=dennoba`, and `VITE_FRONTEND_ERROR_REPORTING=false`, then deploys the Workspace UI Worker separately. It does not render OS login or signup pages.
 
-To run another method, drop those two variables and the build flag, then set upstream's `AUTH_GATEKEEPERS` allowlist for provider sign-in. `DISABLE_PASSWORD_AUTH=true` makes a deployment provider-only. Upstream ignores it unless at least one auth Gatekeeper is allowlisted, so a deployment cannot lock everyone out. The wrapper's validation assumes Access mode, so review the upstream Workshop backend and frontend documentation before changing it.
-
-The `admins` list gates `/admin` in every method.
-
-#### Cloudflare Access
-
-Create a [self-hosted Access application](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/) covering the Workshop hostname. Then configure:
-
-- `issuer`: the team origin, such as `https://acme.cloudflareaccess.com`, with no path.
-- `audience`: the application's [AUD tag](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/#get-your-aud-tag).
-- `admins`: Access-verified email addresses allowed into `/admin`.
-
-Access policies decide who can sign in. The `admins` list decides which signed-in identities can change runtime policy. Keep both narrow.
+To use an OS-native sign-in method, treat it as a separate standalone release mode and follow the upstream Workshop backend and frontend documentation. Removing build variables or publishing the private Worker route alone does not produce a supported deployment.
 
 ### Storage
 
@@ -157,7 +139,7 @@ Prefer wrapper-owned Workers and [service bindings](https://developers.cloudflar
 2. Update the submodule to the intended upstream commit.
 3. Review Workshop and Context Wrangler base-config changes and Gatekeeper contracts.
 4. Run `pnpm install`, `pnpm --dir cloudflare-os install`, and `pnpm check`.
-5. Deploy and verify Access, administrator access, storage, configured AI, Context, custom observations, and the Error Reporter query surface.
-6. If needed, restore the previous gitlink and redeploy, or use [Workers rollback](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/) when bindings remain compatible.
+5. Build and deploy the Workspace UI Worker and private Workshop runtime from the same full OS SHA, then verify `/workspace`, Core ownership, storage, configured AI, Context, custom observations, and the Error Reporter query surface.
+6. If needed, restore the previous gitlink and redeploy both OS Workers together, or use [Workers rollback](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/) when bindings remain compatible.
 
 Do not update the submodule blindly. The deployment script derives from upstream configs so incompatible base changes remain visible during review and checks.

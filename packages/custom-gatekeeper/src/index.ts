@@ -1,4 +1,13 @@
-export * from "./custom.js";
+export {
+  CustomAccount,
+  CustomGatekeeper,
+  CustomVerifier,
+  GatekeeperVendor,
+  KnowledgeSession,
+  describeCustomAccount,
+  describeCustomVendor,
+} from "./custom.js";
+export type { KnowledgeAccountProps } from "./custom.js";
 
 export default {
   async fetch(): Promise<Response> {
