@@ -15,15 +15,18 @@ interface KnowledgeSource extends KnowledgeReference {
 }
 
 interface KnowledgeUpdate {
+  /** 1–255 UTF-8 bytes, without control characters or surrounding whitespace. */
   documentKey: string;
+  /** null when creating; otherwise the current revision ID returned by list() or search(). */
   baseSourceRevisionId: string | null;
+  /** Exact Markdown content, at most 1 MiB. */
   content: string;
 }
 
 interface KnowledgeBase {
-  /** List current Knowledge Base sources in stable document-key order. */
+  /** List current sources in stable document-key order; limit is an integer from 1 to 50; defaults to 20. */
   list(options?: { cursor?: string; limit?: number }): Promise<KnowledgePage>;
-  /** Search current Knowledge Base sources by normalized substring query. */
+  /** Search by a normalized non-empty query of at most 256 UTF-8 bytes; limit is 1–50 and defaults to 20. */
   search(query: string, options?: { cursor?: string; limit?: number }): Promise<KnowledgePage>;
   /** Read one current source by the revision ID returned by list() or search(). */
   read(revisionId: string): Promise<KnowledgeSource>;

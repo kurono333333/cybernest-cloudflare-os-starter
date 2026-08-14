@@ -219,7 +219,7 @@ const preview = (content: string): string => Array.from(content).slice(0, 2_000)
 
 const literalBlock = (value: string): string =>
   value
-    .split("\n")
+    .split(/\r\n|[\r\n]/u)
     .map((line) => "    " + line)
     .join("\n");
 
@@ -317,6 +317,31 @@ export function parseKnowledgeActionRecord(value: unknown): KnowledgeActionRecor
     contentHash: value.contentHash,
     body: value.body,
   };
+}
+
+export function nextKnowledgeActionId(value: unknown): number {
+  const nextActionId = value === undefined ? 1 : value;
+  if (
+    typeof nextActionId !== "number" ||
+    !Number.isSafeInteger(nextActionId) ||
+    nextActionId <= 0
+  ) {
+    throw gatekeeperError("integrity_failure");
+  }
+  if (nextActionId >= MAX_SAFE_ACTION_ID) {
+    throw gatekeeperError("capacity_exceeded");
+  }
+  return nextActionId;
+}
+
+export function assertKnowledgeActionId(actionId: number): void {
+  if (
+    !Number.isSafeInteger(actionId) ||
+    actionId <= 0 ||
+    actionId >= MAX_SAFE_ACTION_ID
+  ) {
+    throw gatekeeperError("integrity_failure");
+  }
 }
 
 function parseKnowledgeReference(value: unknown): KnowledgeReference | undefined {
@@ -550,22 +575,7 @@ export class CustomGatekeeper
 
     return this.ctx.storage.transactionSync(() => {
       const storedNext = this.ctx.storage.kv.get<unknown>(ACTION_COUNTER_KEY);
-      let nextActionId: number;
-      if (storedNext === undefined) {
-        nextActionId = 1;
-      } else if (
-        typeof storedNext !== "number" ||
-        !Number.isSafeInteger(storedNext) ||
-        storedNext <= 0
-      ) {
-        throw gatekeeperError("integrity_failure");
-      } else {
-        nextActionId = storedNext;
-      }
-
-      if (nextActionId >= MAX_SAFE_ACTION_ID) {
-        throw gatekeeperError("capacity_exceeded");
-      }
+      const nextActionId = nextKnowledgeActionId(storedNext);
 
       this.ctx.storage.kv.put<PendingKnowledgeAction>(actionKey(nextActionId), {
         state: "pending",
@@ -638,7 +648,7 @@ export class CustomGatekeeper
 
     let content: string;
     try {
-      content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(body);
+      content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(body);
     } catch {
       throw gatekeeperError("integrity_failure");
     }
@@ -739,16 +749,12 @@ export class CustomGatekeeper
   async removeObserver(_id: string): Promise<void> {}
 
   async applyAction(action: number): Promise<void> {
-    if (!Number.isSafeInteger(action) || action <= 0) {
-      throw gatekeeperError("integrity_failure");
-    }
+    assertKnowledgeActionId(action);
     return this.#serializeAction(action, () => this.#applyActionNow(action));
   }
 
   async rejectAction(action: number): Promise<void> {
-    if (!Number.isSafeInteger(action) || action <= 0) {
-      throw gatekeeperError("integrity_failure");
-    }
+    assertKnowledgeActionId(action);
     return this.#serializeAction(action, () => this.#rejectActionNow(action));
   }
 

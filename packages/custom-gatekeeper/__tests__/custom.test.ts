@@ -2,21 +2,51 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import {
   KnowledgeSession,
+  assertKnowledgeActionId,
   describeCustomAccount,
   describeCustomVendor,
+  nextKnowledgeActionId,
   parseKnowledgeActionRecord,
 } from "../src/custom.js";
 import TYPES_CODE from "../src/types-code.js";
 
 const VALID_REVISION_ID = "44444444-4444-4444-8444-444444444444";
 const VALID_CONTENT_HASH = "a".repeat(64);
+const PENDING_ACTION_KEYS = [
+  "baseSourceRevisionId",
+  "body",
+  "contentHash",
+  "documentKey",
+  "revisionId",
+  "state",
+];
+const APPLIED_TOMBSTONE = {
+  state: "applied",
+  keys: ["state"],
+  bodyByteLength: null,
+};
+const REJECTED_TOMBSTONE = {
+  state: "rejected",
+  keys: ["state"],
+  bodyByteLength: null,
+};
 
 type TestWorkerExports = {
   TEST_FACTORY: DurableObjectNamespace<{
-    runProposal(managerId: string): Promise<{
+    runProposal(managerId: string, content?: string): Promise<{
       submission: { action: number; description: Record<string, unknown> };
       proposalCallCount: number;
+      proposalContent: string;
     }>;
+    runCatalog(managerId: string, limit: number): Promise<{
+      catalog: {entries: Array<{id: string; title: string; description: string}>; truncated?: boolean};
+      observations: unknown[];
+    }>;
+    runAccountScenario(managerId: string): Promise<Record<string, unknown>>;
+    runActionScenario(
+      managerId: string,
+      scenario: string,
+    ): Promise<Record<string, unknown>>;
   }>;
 };
 
@@ -33,14 +63,65 @@ describe("custom-gatekeeper", () => {
     });
   });
 
-  it("publishes only the read methods in the KnowledgeBase agent surface", () => {
-    expect(TYPES_CODE).toContain("interface KnowledgeBase")
-    expect(TYPES_CODE).toMatch(/list\(options\?:/u)
-    expect(TYPES_CODE).toMatch(/search\(query: string,/u)
-    expect(TYPES_CODE).toMatch(/read\(revisionId: string\)/u)
-    expect(TYPES_CODE).toContain("proposeUpdate")
-    expect(TYPES_CODE).not.toContain("managerId")
-    expect(TYPES_CODE).not.toContain("userId")
+  it("accepts only the exact Manager-bound Account props and the legacy no-props shape", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+    const factory = workerEnv.TEST_FACTORY.getByName("m05-02-account-props");
+    const result = await factory.runAccountScenario(crypto.randomUUID());
+
+    expect(result).toMatchObject({
+      bound: "bound",
+      legacyUndefined: "legacy",
+      legacyEmpty: "legacy",
+      displayName: "Knowledge Base",
+      singletonType: "KnowledgeBase",
+      missingError: expect.stringMatching(/only access/u),
+      extraError: expect.stringMatching(/only access/u),
+      malformedError: expect.stringMatching(/RPC stub/u),
+      mismatchError: expect.stringMatching(/wrong manager/u),
+      rpcError: expect.stringMatching(/test capability unavailable/u),
+      connectError: expect.stringMatching(/no connect flow/u),
+      supportedResources: [],
+    });
+  });
+
+  it("publishes only the four bounded KnowledgeBase methods", () => {
+    const knowledgeBase = TYPES_CODE.match(/interface KnowledgeBase \{(?<body>[\s\S]*?)\n\}/u);
+    expect(knowledgeBase?.groups?.body).toBeDefined();
+    const methods = [...(knowledgeBase?.groups?.body ?? "").matchAll(
+      /^\s{2}(\w+)\(/gmu,
+    )].map((match) => match[1]);
+    expect(methods).toEqual(["list", "search", "read", "proposeUpdate"]);
+    expect(TYPES_CODE).toContain("integer from 1 to 50; defaults to 20");
+    expect(TYPES_CODE).toContain("at most 256 UTF-8 bytes");
+    expect(TYPES_CODE).toContain("1–255 UTF-8 bytes");
+    expect(TYPES_CODE).toContain("at most 1 MiB");
+    expect(TYPES_CODE).not.toContain("managerId");
+    expect(TYPES_CODE).not.toContain("userId");
+  });
+
+  it("bounds the native Agent catalog and authorizes only its count", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+    const factory = workerEnv.TEST_FACTORY.getByName("m05-02-catalog");
+
+    const hidden = await factory.runCatalog(crypto.randomUUID(), 0);
+    expect(hidden.catalog).toEqual({entries: [], truncated: true});
+    expect(hidden.observations).toEqual([
+      expect.objectContaining({
+        title: "Knowledge Base catalog",
+        description: "Listed 0 Knowledge Base catalog entries.",
+      }),
+    ]);
+
+    const visible = await factory.runCatalog(crypto.randomUUID(), 1);
+    expect(visible.catalog).toEqual({
+      entries: [{
+        id: "knowledge-base",
+        title: "Knowledge Base",
+        description: "Available. Use list, search, and read when you need current knowledge.",
+      }],
+      truncated: false,
+    });
+    expect(JSON.stringify(visible.observations)).not.toContain("content");
   });
 
   it("passes a bounded proposal to the gatekeeper action boundary", async () => {
@@ -184,7 +265,7 @@ describe("custom-gatekeeper", () => {
     ).toThrow(/integrity_failure/u);
   });
 
-  it("stages a proposal, submits a manual action, and applies it idempotently", async () => {
+  it("applies the exact staged UTF-8 content, including a leading BOM, idempotently", async () => {
     const workerEnv = env as unknown as TestWorkerExports;
     const factory = workerEnv.TEST_FACTORY.getByName("m05-03");
     const result = await factory.runProposal(crypto.randomUUID());
@@ -194,10 +275,239 @@ describe("custom-gatekeeper", () => {
       autoApprovable: false,
       implementsRevert: false,
     });
+    expect(result.submission.description).not.toHaveProperty("actionKind");
     expect(result.submission.description.description).toContain(
       "Content hash (SHA-256):",
     );
     expect(result.proposalCallCount).toBe(1);
+    expect(result.proposalContent).toBe("\uFEFF# Approved principles");
+  });
+
+  it("keeps every approval preview line literal across CR, LF, and CRLF", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-card");
+    const content = "# title\r# injected\n[link](https://example.test)\r\n```";
+
+    const result = await factory.runProposal(crypto.randomUUID(), content);
+    const description = String(result.submission.description.description);
+
+    expect(result.proposalContent).toBe(content);
+    expect(description).toContain(
+      "Preview (first 2,000 Unicode code points):\n" +
+        "    # title\n" +
+        "    # injected\n" +
+        "    [link](https://example.test)\n" +
+        "    ```",
+    );
+    expect(description).not.toContain("\r");
+  });
+
+  it("round-trips an exact 1 MiB non-BMP action and leaves only an applied tombstone", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-one-mib");
+    const result = await factory.runActionScenario(
+      crypto.randomUUID(),
+      "one-mib-non-bmp",
+    );
+    expect(result.appliedContentByteLength).toBe(1_048_576);
+    expect(result.appliedContentHash).toBe(result.expectedHash);
+    expect(result.applyCalls).toBe(1);
+    expect(result.record).toMatchObject(APPLIED_TOMBSTONE);
+  });
+
+  it("keeps capacity and mismatched apply failures pending for the same correlated retry", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-apply-failures");
+
+    const capacity = await factory.runActionScenario(
+      crypto.randomUUID(),
+      "capacity-retry",
+    );
+    expect(capacity.firstError).toMatch(/capacity_exceeded/u);
+    expect(capacity.pendingAfterFailure).toMatchObject({
+      state: "pending",
+      keys: PENDING_ACTION_KEYS,
+      bodyByteLength: expect.any(Number),
+    });
+    expect(capacity.terminalRecord).toMatchObject(APPLIED_TOMBSTONE);
+    const correlations = capacity.correlations as Array<{
+      revisionId: string;
+      documentKey: string;
+    }>;
+    expect(correlations).toHaveLength(2);
+    expect(correlations[1]).toEqual(correlations[0]);
+
+    const mismatch = await factory.runActionScenario(
+      crypto.randomUUID(),
+      "mismatch-retry",
+    );
+    expect(mismatch.errors).toEqual([
+      expect.stringMatching(/integrity_failure/u),
+      expect.stringMatching(/integrity_failure/u),
+      expect.stringMatching(/integrity_failure/u),
+    ]);
+    expect(mismatch.applyCalls).toBe(4);
+    expect(mismatch.terminalRecord).toMatchObject(APPLIED_TOMBSTONE);
+    const mismatchCorrelations = mismatch.correlations as Array<{
+      revisionId: string;
+      documentKey: string;
+    }>;
+    expect(mismatchCorrelations).toHaveLength(4);
+    expect(new Set(mismatchCorrelations.map(({revisionId}) => revisionId)).size).toBe(1);
+    expect(new Set(mismatchCorrelations.map(({documentKey}) => documentKey)).size).toBe(1);
+  });
+
+  it("keeps reject terminal and cancellation-conflict semantics one-way", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-reject");
+
+    const rejected = await factory.runActionScenario(
+      crypto.randomUUID(),
+      "reject-terminal",
+    );
+    expect(rejected.applyAfterReject).toMatch(/integrity_failure/u);
+    expect(rejected.applyCalls).toBe(0);
+    expect(rejected.cancelCalls).toBe(1);
+    expect(rejected.terminalRecord).toMatchObject(REJECTED_TOMBSTONE);
+
+    const conflict = await factory.runActionScenario(
+      crypto.randomUUID(),
+      "cancel-conflict",
+    );
+    expect(conflict.firstError).toMatch(/revision_conflict/u);
+    expect(conflict.pendingAfterConflict).toMatchObject({
+      state: "pending",
+      keys: PENDING_ACTION_KEYS,
+    });
+    expect(conflict.applyAfterReject).toMatch(/integrity_failure/u);
+    expect(conflict.applyCalls).toBe(0);
+    const cancelInputs = conflict.cancelInputs as string[];
+    expect(cancelInputs).toHaveLength(2);
+    expect(cancelInputs[1]).toBe(cancelInputs[0]);
+    expect(conflict.terminalRecord).toMatchObject(REJECTED_TOMBSTONE);
+  });
+
+  it("fails closed on submission loss and never reuses its action ID", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-storage-guards");
+
+    const submission = await factory.runActionScenario(
+      crypto.randomUUID(),
+      "submission-loss",
+    );
+    expect(submission.firstError).toMatch(/response lost/u);
+    expect(submission).toMatchObject({
+      firstAction: 1,
+      lostRecord: null,
+      lostCallbackError: expect.stringMatching(/integrity_failure/u),
+      applyCallsAfterLoss: 0,
+      secondAction: 2,
+      applyCalls: 1,
+      secondRecord: APPLIED_TOMBSTONE,
+    });
+
+    const unpaired = await factory.runActionScenario(
+      crypto.randomUUID(),
+      "unpaired-content",
+    );
+    expect(unpaired).toMatchObject({
+      error: expect.stringMatching(/invalid_input/u),
+      submissions: 0,
+    });
+  });
+
+  it("fails closed on callback, counter, staged-write, and stored-record corruption", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+
+    const callback = await workerEnv.TEST_FACTORY
+      .getByName("m05-03-invalid-callback")
+      .runActionScenario(crypto.randomUUID(), "invalid-callback");
+    expect(callback).toMatchObject({
+      error: expect.stringMatching(/integrity_failure/u),
+      before: [],
+      after: [],
+      applyCalls: 0,
+      cancelCalls: 0,
+    });
+
+    const counters = await workerEnv.TEST_FACTORY
+      .getByName("m05-03-counter-guards")
+      .runActionScenario(crypto.randomUUID(), "counter-guards");
+    expect(counters).toMatchObject({
+      malformedError: expect.stringMatching(/integrity_failure/u),
+      exhaustedError: expect.stringMatching(/capacity_exceeded/u),
+      submissions: 0,
+      actionKeys: [],
+      applyCalls: 0,
+    });
+
+    const writeFailure = await workerEnv.TEST_FACTORY
+      .getByName("m05-03-write-failure")
+      .runActionScenario(crypto.randomUUID(), "staged-write-failure");
+    expect(writeFailure).toMatchObject({
+      error: expect.stringMatching(/injected staged write failure/u),
+      submissions: 0,
+      knowledgeKeys: [],
+      applyCalls: 0,
+    });
+
+    const corruption = await workerEnv.TEST_FACTORY
+      .getByName("m05-03-stored-corruption")
+      .runActionScenario(crypto.randomUUID(), "stored-corruption");
+    const results = corruption.results as Array<{
+      error: string;
+      coreCalls: number;
+      record: {state: string; keys: string[]};
+    }>;
+    expect(results).toHaveLength(4);
+    for (const result of results) {
+      expect(result.error).toMatch(/integrity_failure/u);
+      expect(result.coreCalls).toBe(0);
+      expect(result.record).toMatchObject({state: "pending"});
+    }
+  });
+
+  it("rejects malformed counters and callback IDs before deriving action state", () => {
+    expect(nextKnowledgeActionId(undefined)).toBe(1);
+    expect(nextKnowledgeActionId(1)).toBe(1);
+    expect(nextKnowledgeActionId(Number.MAX_SAFE_INTEGER - 1)).toBe(
+      Number.MAX_SAFE_INTEGER - 1,
+    );
+    for (const value of [null, "1", 0, -1, 1.5, Number.NaN]) {
+      expect(() => nextKnowledgeActionId(value)).toThrow(/integrity_failure/u);
+    }
+    expect(() => nextKnowledgeActionId(Number.MAX_SAFE_INTEGER)).toThrow(
+      /capacity_exceeded/u,
+    );
+
+    expect(() => assertKnowledgeActionId(1)).not.toThrow();
+    expect(() => assertKnowledgeActionId(Number.MAX_SAFE_INTEGER - 1)).not.toThrow();
+    for (const value of [0, -1, 1.5, Number.MAX_SAFE_INTEGER]) {
+      expect(() => assertKnowledgeActionId(value)).toThrow(/integrity_failure/u);
+    }
+  });
+
+  it("serializes concurrent apply and reject callbacks without coalescing them", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-concurrency");
+    const result = await factory.runActionScenario(
+      crypto.randomUUID(),
+      "concurrent-apply-reject",
+    );
+
+    expect([result.applyStatus, result.rejectStatus].toSorted()).toEqual([
+      "fulfilled",
+      "rejected",
+    ]);
+    expect(Number(result.applyCalls) + Number(result.cancelCalls)).toBe(1);
+    expect(`${result.applyError ?? ""}${result.rejectError ?? ""}`).toMatch(
+      /integrity_failure/u,
+    );
+    expect(result.terminalRecord).toMatchObject({
+      state: expect.stringMatching(/^(applied|rejected)$/u),
+      keys: ["state"],
+      bodyByteLength: null,
+    });
   });
 
   it("authorizes Knowledge reads before returning data and disposes its queue", async () => {
@@ -253,15 +563,58 @@ describe("custom-gatekeeper", () => {
     await expect(session.list()).resolves.toMatchObject({
       items: [{ documentKey: "manager-principles" }],
     });
+    await expect(session.search("  ＭＡＮＡＧＥＲ  ")).resolves.toEqual({
+      items: [],
+      nextCursor: null,
+    });
     await expect(session.read(VALID_REVISION_ID)).resolves.toMatchObject({
       documentKey: "manager-principles",
       content: "# Principles",
     });
-    expect(observations).toHaveLength(2);
+    expect(observations).toHaveLength(3);
     expect(observations[0]).toMatchObject({ title: "Knowledge Base list" });
-    expect(observations[1]).toMatchObject({ title: "Knowledge Base read" });
+    expect(observations[1]).toMatchObject({
+      title: "Knowledge Base search",
+      description: "Searched the Knowledge Base for manager. Returned 0 current source(s).",
+    });
+    expect(observations[2]).toMatchObject({ title: "Knowledge Base read" });
+    expect(JSON.stringify(observations)).not.toContain("# Principles");
 
     session[Symbol.dispose]();
     expect(disposed).toBe(true);
+  });
+
+  it("returns no Knowledge data when observation authorization fails", async () => {
+    let readCount = 0;
+    const session = new KnowledgeSession(
+      {
+        authorizeObservation: async () => {
+          throw new Error("observation denied");
+        },
+        submitAction: async () => {},
+      },
+      {
+        list: async () => ({ok: true as const, value: {items: [], nextCursor: null}}),
+        search: async () => ({ok: true as const, value: {items: [], nextCursor: null}}),
+        read: async () => {
+          readCount += 1;
+          return {
+            ok: true as const,
+            value: {
+              revisionId: VALID_REVISION_ID,
+              documentKey: "manager-principles",
+              contentHash: VALID_CONTENT_HASH,
+              content: "# Must not escape",
+            },
+          };
+        },
+        assertBoundTo: async () => {},
+        applyProposal: async () => ({ok: false as const, error: {code: "not_used"}}),
+        cancelProposal: async () => ({ok: true as const, value: null}),
+      },
+    );
+
+    await expect(session.read(VALID_REVISION_ID)).rejects.toThrow("observation denied");
+    expect(readCount).toBe(1);
   });
 });
