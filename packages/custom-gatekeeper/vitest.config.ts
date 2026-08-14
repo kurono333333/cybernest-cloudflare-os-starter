@@ -10,6 +10,10 @@ export default defineConfig({
       miniflare: {
         compatibilityDate: "2026-08-04",
         compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_compat"],
+        durableObjects: {
+          CUSTOM_GATEKEEPER: { className: "CustomGatekeeper", useSQLite: true },
+          TEST_FACTORY: { className: "TestGatekeeperFactory", useSQLite: true },
+        },
       },
     }),
   ],
