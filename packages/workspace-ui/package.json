@@ -1,8 +1,0 @@
-{
-  "name": "workspace-ui",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "test": "node --test src/*.test.mjs"
-  }
-}

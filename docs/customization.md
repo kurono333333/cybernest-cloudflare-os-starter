@@ -2,7 +2,7 @@
 
 This guide separates the supported private Cybernest wrapper controls from the Admin UI and sign-in controls owned by standalone upstream Cloudflare OS.
 
-> **Cybernest mode:** the deployment in this repository uses Core/Auth0 for sign-in, keeps Workshop private, and builds the standard UI with `VITE_SITE_NAME=dennoba`. The `/admin` branding and OS-native sign-in sections below describe standalone upstream Cloudflare OS; they are not the active 06A browser path.
+> **Cybernest mode:** the deployment in this repository uses Core/Auth0 for sign-in, keeps Workshop private, and serves the Japanese Console at `/workspace`. The `/admin` branding and OS-native sign-in sections below describe standalone upstream Cloudflare OS; they are not the active Cybernest browser path.
 
 ## Standalone upstream Admin UI
 
@@ -30,7 +30,6 @@ The custom logo appears in the app chrome, sign-in screens, and browser tab on e
 | `accountId` | Resource ownership | A 32-character [Cloudflare account ID](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/) |
 | `workers.*.name` | Stable Worker service identities | Unique lowercase names; changing one creates a differently named Worker |
 | `workers.workshop.route` | Workshop exposure | `null` for the supported private Cybernest runtime |
-| `workers.workspaceUi.routes` | Standard UI address | Exact and wildcard `dev.dennoba.net/workspace` routes in the `dennoba.net` zone |
 | `aiGateway` | Deployment-funded model catalog | Disabled, Workers AI direct, or provider traffic through AI Gateway |
 | `context` | Context sharing boundary and snapshot KV | A stable domain label; automatic or existing KV |
 | `customGatekeeper` | Example integration identity and guidance | Organization-specific display text |
@@ -42,9 +41,9 @@ Secrets are never valid values in this file. Install them interactively with Wra
 
 ### Workers and routing
 
-Keep the five Worker names unique. The Workshop runtime remains private; the stateless Workspace UI Worker owns only `/workspace` and `/workspace/*`. Service bindings use the runtime Worker names, so update and deploy the pinned Workshop runtime and Workspace UI together.
+Keep the active Worker names unique. The Workshop runtime remains private; the existing Console owns `/workspace` and its nested SPA routes as same-origin static assets. Service bindings use the runtime Worker names, so update the pinned Workshop runtime and Console separately.
 
-The Workspace UI Worker has one native `ASSETS` binding and no authentication, database, Durable Object, KV, R2, or Workshop service binding. It strips the `/workspace` prefix before serving the pinned `workshop-frontend` artifact. Core remains the only browser gateway to `/manager/os`.
+The Console has no direct native OS binding. It calls the Core gateway, which remains the only browser entry to `/manager/os` and the only place that can authorize the restricted Workspace API projection.
 
 Keep `workers.workshop.route` as `null` for Cybernest. Publishing Workshop on a Custom Domain or `workers.dev` creates a different browser and identity boundary and is not enabled by changing this value alone.
 
@@ -58,7 +57,7 @@ Upstream Cloudflare OS supports three native sign-in methods. This Cybernest dep
 | Built-in password accounts | Cloudflare OS serves its own username and password login plus signup. This is the upstream default. | Not supported; standalone upstream mode only |
 | Auth Gatekeepers | Gatekeepers that advertise `providesAuth` add "Continue with ..." buttons, alongside or instead of password login. | Not supported; standalone upstream mode only |
 
-The private Workshop runtime is reached by Cybernest Core through a Service Binding. `scripts/deploy.mjs` builds the frontend with `VITE_CYBERNEST_MODE=true`, `VITE_SITE_NAME=dennoba`, and `VITE_FRONTEND_ERROR_REPORTING=false`, then deploys the Workspace UI Worker separately. It does not render OS login or signup pages.
+The private Workshop runtime is reached by Cybernest Core through a Service Binding. The Console is built and deployed separately from the pinned OS runtime and does not render OS login or signup pages.
 
 To use an OS-native sign-in method, treat it as a separate standalone release mode and follow the upstream Workshop backend and frontend documentation. Removing build variables or publishing the private Worker route alone does not produce a supported deployment.
 
@@ -139,7 +138,7 @@ Prefer wrapper-owned Workers and [service bindings](https://developers.cloudflar
 2. Update the submodule to the intended upstream commit.
 3. Review Workshop and Context Wrangler base-config changes and Gatekeeper contracts.
 4. Run `pnpm install`, `pnpm --dir cloudflare-os install`, and `pnpm check`.
-5. Build and deploy the Workspace UI Worker and private Workshop runtime from the same full OS SHA, then verify `/workspace`, Core ownership, storage, configured AI, Context, custom observations, and the Error Reporter query surface.
+5. Build and deploy the private Workshop runtime, then deploy the Console static assets separately; verify `/workspace`, Core ownership, storage, configured AI, Context, custom observations, and the Error Reporter query surface.
 6. If needed, restore the previous gitlink and redeploy both OS Workers together, or use [Workers rollback](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/) when bindings remain compatible.
 
 Do not update the submodule blindly. The deployment script derives from upstream configs so incompatible base changes remain visible during review and checks.

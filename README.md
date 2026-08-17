@@ -5,7 +5,7 @@
 <h1 align="center">Customized for your Company</h1>
 
 <p align="center">
-  Run a pinned Cloudflare OS release behind Cybernest Core, with its standard UI and runtime upgraded as one unit.
+  Run a pinned Cloudflare OS runtime behind Cybernest Core, with the Japanese Console as the browser UI.
 </p>
 
 <p align="center">
@@ -29,13 +29,13 @@
 
 ## Overview
 
-This repository adds deployment controls and a thin Cybernest frontend adapter around a pinned [Cloudflare OS](https://github.com/cloudflare/cloudflare-os) fork.
+This repository adds deployment controls and a restricted Cybernest runtime adapter around a pinned [Cloudflare OS](https://github.com/cloudflare/cloudflare-os) fork.
 
 | Control | What you own |
 | --- | --- |
-| Branding | The Cybernest build supplies the site name; independent OS branding remains an upstream standalone feature |
+| Branding | The Console owns Cybernest presentation; independent OS branding remains an upstream standalone feature |
 | Identity | Cybernest Core/Auth0 owns the browser entry; the Workshop runtime stays private behind its Service Binding |
-| Routing | Private Workshop runtime plus same-zone `/workspace` Workspace UI Worker routes |
+| Routing | Private Workshop runtime plus same-origin Console static assets |
 | Data | Existing KV/R2 resources or [automatic provisioning](https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning) |
 | Integrations | Wrapper-owned Gatekeepers and service bindings without patching upstream |
 | AI | No platform model by default; opt into [Workers AI](https://developers.cloudflare.com/workers-ai/) and [AI Gateway](https://developers.cloudflare.com/ai-gateway/) when needed |
@@ -45,7 +45,7 @@ This repository adds deployment controls and a thin Cybernest frontend adapter a
 
 <img src="docs/assets/architecture.svg" alt="Cloudflare OS deployment architecture: users sign in and reach the pinned Cloudflare OS release, holding the Workshop kernel, Gadgets, Blueprints, and the default Gatekeepers. Service bindings connect it to the Workers this repository owns: optional AI, custom Gatekeepers, the Error Reporter, and KV and R2 storage.">
 
-The deploy command derives temporary Wrangler files from upstream base configs, builds the pinned frontend in Cybernest mode, deploys the private Workshop runtime before the stateless `/workspace` UI Worker, and removes generated files even on failure. Secrets never enter tracked configuration.
+The deploy command derives temporary Wrangler files from upstream base configs, builds the private Workshop runtime, and removes generated files even on failure. The Console is a separate static asset owner and is not packaged into the Cloudflare OS release. Secrets never enter tracked configuration.
 
 ### If you only want branding
 
@@ -72,9 +72,9 @@ Your account needs [Workers](https://developers.cloudflare.com/workers/), [KV](h
 
 ### 2. Configure the private Cybernest deployment
 
-Open [`deployment.jsonc`](deployment.jsonc) and replace the active placeholders. Keep `workers.workshop.route` as `null`: Cybernest Core/Auth0 owns sign-in and reaches the Workshop only through its private Service Binding. The Workspace UI routes stay on `dev.dennoba.net/workspace` and `dev.dennoba.net/workspace/*` for this development deployment.
+Open [`deployment.jsonc`](deployment.jsonc) and replace the active placeholders. Keep `workers.workshop.route` as `null`: Cybernest Core/Auth0 owns sign-in and reaches the Workshop only through its private Service Binding. Deploy the existing Console separately; it owns `/workspace` and its nested SPA routes on the same origin.
 
-The validator rejects a public Workshop route because this release always builds the Cybernest frontend. Do not create a second Cloudflare Access login for this path. A standalone public Cloudflare OS deployment is a separate release mode; follow the upstream project instead.
+The validator rejects a public Workshop route because this release is a private Cybernest runtime. Do not create a second Cloudflare Access login for `/workspace`. A standalone public Cloudflare OS deployment is a separate release mode; follow the upstream project instead.
 
 ### 3. Validate and deploy
 
@@ -91,7 +91,7 @@ Backend error reporting is enabled without a vendor account. Explicit upstream i
 
 ### 4. Verify the deployment
 
-- Open `/workspace` on the configured zone and confirm the Core gateway reaches the pinned Workshop runtime without a second OS login.
+- Open `/workspace` on the Console domain and confirm the Console reaches the pinned Workshop runtime through the Core gateway without a second OS login.
 - Confirm an unauthenticated or unregistered browser returns to the Cybernest identity surface instead of an OS login or signup page.
 - Open the Error Reporter Worker's [Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/) and verify its structured `error_report` query surface.
 - Review logs for the Workshop, Context, custom Gatekeeper, and Error Reporter Workers.
@@ -100,7 +100,7 @@ Backend error reporting is enabled without a vendor account. Explicit upstream i
 
 | Customize | Best place | Deploy required |
 | --- | --- | --- |
-| Cybernest site name | `VITE_SITE_NAME` in the wrapper-owned build | Yes |
+| Cybernest UI | Existing Console source and static asset deployment | Yes |
 | Standalone OS branding and runtime policy | Upstream `/admin` surface | Depends on a separate standalone deployment |
 | AI, storage, observability, Worker identities | [`deployment.jsonc`](deployment.jsonc) | Yes |
 | Logs, traces, error destinations, browser reporting | [Observability guide](docs/observability.md) | Sometimes |
@@ -115,5 +115,5 @@ The complete control reference and recipes live in [Customization](docs/customiz
 - Triage explicit failures and choose export destinations with the [observability guide](docs/observability.md).
 - Roll a Worker back from its dashboard deployment history or with [`wrangler rollback`](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/).
 - Follow the [upgrade checklist](docs/customization.md#upgrade) before changing the pinned submodule.
-- Update the Workspace UI Worker and private Workshop runtime from the same Cloudflare OS full SHA; do not update the UI alone.
+- Update the private Workshop runtime against a reviewed Cloudflare OS full SHA. Update the Console asset separately after its own build and verification.
 - Review the upstream Cloudflare OS documentation and release history before adopting behavior changes.

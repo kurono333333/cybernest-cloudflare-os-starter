@@ -8,10 +8,6 @@ const validConfig = {
   accountId: "0123456789abcdef0123456789abcdef",
   workers: {
     workshop: { name: "acme-cloudflare-os", route: null },
-    workspaceUi: { name: "acme-cloudflare-os-workspace-ui", routes: [
-      { pattern: "dev.dennoba.net/workspace", zoneName: "dennoba.net" },
-      { pattern: "dev.dennoba.net/workspace/*", zoneName: "dennoba.net" },
-    ] },
     context: { name: "acme-cloudflare-os-context" },
     customGatekeeper: { name: "acme-cloudflare-os-custom" },
     errorReporter: { name: "acme-cloudflare-os-errors" },
@@ -42,7 +38,6 @@ const validConfig = {
 async function baseConfigs() {
   return {
     workshop: await baseConfig("../cloudflare-os/packages/workshop-backend/wrangler.jsonc"),
-    workspaceUi: await baseConfig("../packages/workspace-ui/wrangler.jsonc"),
     context: await baseConfig("../cloudflare-os/packages/gatekeeper-context/wrangler.jsonc"),
     customGatekeeper: await baseConfig("../packages/custom-gatekeeper/wrangler.jsonc"),
     errorReporter: {
@@ -149,39 +144,11 @@ test("rejects a public Workshop route in Cybernest mode", () => {
   );
 });
 
-test("generates a static Workspace UI Worker and keeps Workshop private", async () => {
+test("does not generate the retired Workspace UI Worker", async () => {
   const generated = generateConfigs(validConfig, await baseConfigs());
 
-  assert.equal(generated.workspaceUi.name, "acme-cloudflare-os-workspace-ui");
-  assert.equal(generated.workspaceUi.account_id, validConfig.accountId);
-  assert.equal(generated.workspaceUi.main, "src/index.mjs");
-  assert.equal(generated.workspaceUi.compatibility_date, "2026-08-06");
-  assert.equal(generated.workspaceUi.workers_dev, false);
-  assert.deepEqual(generated.workspaceUi.routes, [
-    { pattern: "dev.dennoba.net/workspace", zone_name: "dennoba.net" },
-    { pattern: "dev.dennoba.net/workspace/*", zone_name: "dennoba.net" },
-  ]);
-  assert.deepEqual(generated.workspaceUi.assets, {
-    directory: "../../cloudflare-os/packages/workshop-frontend/dist",
-    binding: "ASSETS",
-    not_found_handling: "single-page-application",
-    run_worker_first: true,
-  });
-  assert.equal(generated.workspaceUi.services, undefined);
-  assert.equal(generated.workspaceUi.kv_namespaces, undefined);
-  assert.equal(generated.workspaceUi.r2_buckets, undefined);
-  assert.equal(generated.workspaceUi.durable_objects, undefined);
-  assert.equal(generated.workspaceUi.vars, undefined);
+  assert.equal(generated.workspaceUi, undefined);
   assert.equal(generated.workshop.assets, undefined);
-});
-
-test("rejects Workspace UI routes outside the approved dev prefix", () => {
-  const invalid = structuredClone(validConfig);
-  invalid.workers.workspaceUi.routes = [
-    { pattern: "dev.dennoba.net/workspace/*", zoneName: "other.example.com" },
-  ];
-
-  assert.throws(() => validateConfig(invalid), /Workspace UI route/i);
 });
 
 test("omits disabled backend error reporting", async () => {

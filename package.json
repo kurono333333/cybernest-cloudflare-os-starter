@@ -4,7 +4,7 @@
   "type": "module",
   "packageManager": "pnpm@11.9.0",
   "scripts": {
-    "test": "node --test scripts/*.test.mjs && pnpm --filter workspace-ui test && pnpm --filter custom-gatekeeper test && pnpm --filter error-reporter test",
+    "test": "node --test scripts/*.test.mjs && pnpm --filter custom-gatekeeper test && pnpm --filter error-reporter test",
     "check": "node scripts/deploy.mjs --check",
     "deploy": "node scripts/deploy.mjs"
   },
