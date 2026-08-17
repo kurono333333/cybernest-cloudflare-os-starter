@@ -10,7 +10,6 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const generatedName = "wrangler.prod.jsonc";
 const generatedPaths = {
   workshop: join(root, "cloudflare-os/packages/workshop-backend", generatedName),
-  workspaceUi: join(root, "packages/workspace-ui", generatedName),
   context: join(root, "cloudflare-os/packages/gatekeeper-context", generatedName),
   customGatekeeper: join(root, "packages/custom-gatekeeper", generatedName),
   errorReporter: join(root, "packages/error-reporter", generatedName),
@@ -19,7 +18,6 @@ const generatedPaths = {
 const requiredPaths = [
   "accountId",
   "workers.workshop.name",
-  "workers.workspaceUi.name",
   "workers.context.name",
   "workers.customGatekeeper.name",
   "aiGateway.enabled",
@@ -57,21 +55,7 @@ function valueAt(object, path) {
   return path.split(".").reduce((value, key) => value?.[key], object);
 }
 
-function validateWorkspaceUiRoutes(config) {
-  const routes = config.workers.workspaceUi?.routes;
-  const expected = [
-    { pattern: "dev.dennoba.net/workspace", zoneName: "dennoba.net" },
-    { pattern: "dev.dennoba.net/workspace/*", zoneName: "dennoba.net" },
-  ];
-  if (!Array.isArray(routes) || routes.length !== expected.length ||
-      routes.some((route, index) => route?.pattern !== expected[index].pattern ||
-        route?.zoneName !== expected[index].zoneName)) {
-    throw new Error("Workspace UI routes must be the exact and wildcard dev.dennoba.net/workspace routes in zone dennoba.net.");
-  }
-}
-
 export function validateConfig(config) {
-  validateWorkspaceUiRoutes(config);
   if (config.workers.workshop.route !== null) {
     throw new Error("Workshop route must remain null for Cybernest.");
   }
@@ -212,7 +196,6 @@ function setCommon(config, deployment, name) {
 export function generateConfigs(config, bases) {
   validateConfig(config);
   const workshop = structuredClone(bases.workshop);
-  const workspaceUi = structuredClone(bases.workspaceUi);
   const context = structuredClone(bases.context);
   const customGatekeeper = structuredClone(bases.customGatekeeper);
   const errorReporter = config.errorReporting.enabled
@@ -282,25 +265,6 @@ export function generateConfigs(config, bases) {
   ];
   delete workshop.assets;
 
-  setCommon(workspaceUi, config, config.workers.workspaceUi.name);
-  workspaceUi.routes = config.workers.workspaceUi.routes.map(({ pattern, zoneName }) => ({
-    pattern,
-    zone_name: zoneName,
-  }));
-  workspaceUi.assets = {
-    directory: "../../cloudflare-os/packages/workshop-frontend/dist",
-    binding: "ASSETS",
-    not_found_handling: "single-page-application",
-    run_worker_first: true,
-  };
-  delete workspaceUi.services;
-  delete workspaceUi.kv_namespaces;
-  delete workspaceUi.r2_buckets;
-  delete workspaceUi.durable_objects;
-  delete workspaceUi.migrations;
-  delete workspaceUi.vars;
-  delete workspaceUi.secrets;
-
   setCommon(context, config, config.workers.context.name);
   context.kv_namespaces = [
     { binding: "CONTEXT_COLLECTIONS", ...(config.context.kvNamespaceId
@@ -317,7 +281,7 @@ export function generateConfigs(config, bases) {
     setCommon(errorReporter, config, config.workers.errorReporter.name);
   }
 
-  return { workshop, workspaceUi, context, customGatekeeper, ...(errorReporter && { errorReporter }) };
+  return { workshop, context, customGatekeeper, ...(errorReporter && { errorReporter }) };
 }
 
 async function readJsonc(path) {
@@ -384,13 +348,6 @@ function build(config) {
   if (config.errorReporting.enabled) {
     run(["--dir", "packages/error-reporter", "run", "build"]);
   }
-  run(["--dir", "cloudflare-os", "--filter", "@gadgets/workshop-frontend", "build"], root, {
-    ...process.env,
-    VITE_CYBERNEST_MODE: "true",
-    VITE_SITE_NAME: "dennoba",
-    VITE_FRONTEND_ERROR_REPORTING: "false",
-    VITE_CF_ACCESS_MODE: "false",
-  });
   run(["--dir", "cloudflare-os", "--filter", "@gadgets/workshop-backend", "build"]);
   if (gitRevision(join(root, "cloudflare-os")) !== osRevision) {
     throw new Error("Cloudflare OS revision changed during the release build.");
@@ -403,7 +360,6 @@ async function main() {
   const config = await readDeployment(join(root, "deployment.jsonc"));
   const generated = generateConfigs(config, {
     workshop: await readJsonc(join(root, "cloudflare-os/packages/workshop-backend/wrangler.jsonc")),
-    workspaceUi: await readJsonc(join(root, "packages/workspace-ui/wrangler.jsonc")),
     context: await readJsonc(join(root, "cloudflare-os/packages/gatekeeper-context/wrangler.jsonc")),
     customGatekeeper: await readJsonc(join(root, "packages/custom-gatekeeper/wrangler.jsonc")),
     errorReporter: await readJsonc(join(root, "packages/error-reporter/wrangler.jsonc")),
@@ -428,8 +384,6 @@ async function main() {
       join(root, "packages/custom-gatekeeper"));
     run(["exec", "wrangler", "deploy", "--config", generatedName, ...deployArgs],
       join(root, "cloudflare-os/packages/workshop-backend"));
-    run(["exec", "wrangler", "deploy", "--config", generatedName, ...deployArgs],
-      join(root, "packages/workspace-ui"));
   } finally {
     await Promise.all(Object.values(generatedPaths).map((path) => rm(path, { force: true })));
   }
