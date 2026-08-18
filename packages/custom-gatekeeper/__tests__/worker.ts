@@ -12,7 +12,15 @@ export * from "../src/index.js";
 export { CustomAccount, GatekeeperVendor } from "../src/custom.js";
 export { CustomGatekeeper };
 
-type TestProps = { managerId: string; failAssert?: boolean };
+type ConversationMode = "valid" | "extra" | "malformed" | "missing";
+
+type TestProps = {
+  managerId: string;
+  failAssert?: boolean;
+  conversationMode?: ConversationMode;
+};
+
+type ConversationMethod = "save" | "current" | "historical";
 
 const proposalCalls: unknown[] = [];
 
@@ -148,6 +156,67 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<Cloudflare.Env, TestPr
     return { ok: true, value: null };
   }
 
+  async saveConversationContext(input: {
+    revisionId: string;
+    baseSourceRevisionId: string | null;
+    contentHash: string;
+    content: string;
+  }): Promise<unknown> {
+    if (this.ctx.props.conversationMode === "malformed") {
+      return { ok: false, error: { code: "unknown_internal_code" } };
+    }
+    const value = {
+      revisionId: input.revisionId,
+      documentKey: "conversation-context",
+      contentHash: input.contentHash,
+    };
+    return {
+      ok: true,
+      value: this.ctx.props.conversationMode === "extra"
+        ? {...value, managerId: "hidden"}
+        : value,
+    };
+  }
+
+  async readCurrentConversationContext(): Promise<unknown> {
+    if (this.ctx.props.conversationMode === "missing") {
+      return { ok: true, value: null };
+    }
+    if (this.ctx.props.conversationMode === "malformed") {
+      return { ok: false, error: { code: "unknown_internal_code" } };
+    }
+    const value = {
+      revisionId: "44444444-4444-4444-8444-444444444444",
+      documentKey: "conversation-context",
+      contentHash: "a".repeat(64),
+      content: "# Conversation\n",
+    };
+    return {
+      ok: true,
+      value: this.ctx.props.conversationMode === "extra"
+        ? {...value, managerId: "hidden"}
+        : value,
+    };
+  }
+
+  async readConversationContextRevision(revisionId: string): Promise<unknown> {
+    if (this.ctx.props.conversationMode === "malformed") {
+      return { ok: false, error: { code: "unknown_internal_code" } };
+    }
+    const value = {
+      revisionId,
+      documentKey: "conversation-context",
+      contentHash: "a".repeat(64),
+      content: "# Conversation\n",
+    };
+    return {
+      ok: true,
+      value: this.ctx.props.conversationMode === "extra"
+        ? {...value, managerId: "hidden"}
+        : value,
+    };
+  }
+
   readProposalCalls(): unknown[] {
     return [...proposalCalls];
   }
@@ -180,6 +249,14 @@ type InspectableGatekeeper = {
     actionId: number,
     mode: "extra" | "hash" | "invalid-utf8" | "oversized",
   ): Promise<void>;
+  saveConversationContext(input: {
+    revisionId: string;
+    baseSourceRevisionId: string | null;
+    contentHash: string;
+    content: string;
+  }): Promise<unknown>;
+  readCurrentConversationContext(): Promise<unknown>;
+  readConversationContextRevision(revisionId: string): Promise<unknown>;
 };
 
 type InspectableAccount = {
@@ -310,6 +387,23 @@ export class InspectableCustomGatekeeper extends DurableObject {
       body: new ArrayBuffer(1_048_577),
     });
   }
+
+  saveConversationContext(input: {
+    revisionId: string;
+    baseSourceRevisionId: string | null;
+    contentHash: string;
+    content: string;
+  }): Promise<unknown> {
+    return this.#gatekeeper.saveConversationContext(input);
+  }
+
+  readCurrentConversationContext(): Promise<unknown> {
+    return this.#gatekeeper.readCurrentConversationContext();
+  }
+
+  readConversationContextRevision(revisionId: string): Promise<unknown> {
+    return this.#gatekeeper.readConversationContextRevision(revisionId);
+  }
 }
 
 export class TestGatekeeperFactory extends DurableObject {
@@ -323,6 +417,25 @@ export class TestGatekeeperFactory extends DurableObject {
     const access = workerExports.TestKnowledgeAccess({ props: { managerId } });
     const gatekeeperClass = workerExports.InspectableCustomGatekeeper({props: {access}});
     const facetName = "inspectable-knowledge-" + crypto.randomUUID();
+    return this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as InspectableGatekeeper;
+  }
+
+  #conversationGatekeeper(
+    managerId: string,
+    mode: ConversationMode,
+  ): InspectableGatekeeper {
+    const workerExports = this.ctx.exports as unknown as {
+      TestKnowledgeAccess(options: { props: TestProps }): unknown;
+      CustomGatekeeper(options: { props: { access: unknown } }): DurableObjectClass;
+    };
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId, conversationMode: mode },
+    });
+    const gatekeeperClass = workerExports.CustomGatekeeper({ props: { access } });
+    const facetName = "conversation-bridge-" + crypto.randomUUID();
     return this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
       id: facetName,
@@ -407,6 +520,45 @@ export class TestGatekeeperFactory extends DurableObject {
     } finally {
       authorizer[Symbol.dispose]();
     }
+  }
+
+  async runConversationBridge(
+    managerId: string,
+    mode: ConversationMode = "valid",
+  ): Promise<Record<string, unknown>> {
+    const gatekeeper = this.#conversationGatekeeper(managerId, mode);
+
+    const input = {
+      revisionId: "44444444-4444-4444-8444-444444444444",
+      baseSourceRevisionId: null,
+      contentHash: "a".repeat(64),
+      content: "# Conversation\n",
+    };
+    return {
+      save: await gatekeeper.saveConversationContext(input),
+      current: await gatekeeper.readCurrentConversationContext(),
+      historical: await gatekeeper.readConversationContextRevision(input.revisionId),
+    };
+  }
+
+  async runConversationMethod(
+    managerId: string,
+    method: ConversationMethod,
+    mode: ConversationMode = "valid",
+  ): Promise<string | null> {
+    const gatekeeper = this.#conversationGatekeeper(managerId, mode);
+    const input = {
+      revisionId: "44444444-4444-4444-8444-444444444444",
+      baseSourceRevisionId: null,
+      contentHash: "a".repeat(64),
+      content: "# Conversation\n",
+    };
+    const operation = method === "save"
+      ? gatekeeper.saveConversationContext(input)
+      : method === "current"
+        ? gatekeeper.readCurrentConversationContext()
+        : gatekeeper.readConversationContextRevision(input.revisionId);
+    return messageOf(operation);
   }
 
   async runAccountScenario(managerId: string): Promise<Record<string, unknown>> {

@@ -85,6 +85,13 @@ type KnowledgeProposal = {
 
 type KnowledgeProposalInput = Omit<KnowledgeProposal, "revisionId">;
 
+type ConversationContextSaveInput = {
+  revisionId: string;
+  baseSourceRevisionId: string | null;
+  contentHash: string;
+  content: string;
+};
+
 interface ManagerKnowledgeAccessV1 {
   assertBoundTo(managerId: string): Promise<void>;
   list(options?: KnowledgePageOptions): Promise<KnowledgeResult<KnowledgePage>>;
@@ -97,8 +104,21 @@ interface ManagerKnowledgeAccessV1 {
   cancelProposal(revisionId: string): Promise<KnowledgeResult<null>>;
 }
 
+interface ManagerKnowledgeConversationAccessV1 {
+  saveConversationContext(
+    input: ConversationContextSaveInput,
+  ): Promise<KnowledgeResult<KnowledgeReference>>;
+  readCurrentConversationContext(): Promise<KnowledgeResult<KnowledgeSource | null>>;
+  readConversationContextRevision(
+    revisionId: string,
+  ): Promise<KnowledgeResult<KnowledgeSource>>;
+}
+
+type ManagerKnowledgePrivateAccessV1 = ManagerKnowledgeAccessV1 &
+  ManagerKnowledgeConversationAccessV1;
+
 export type KnowledgeAccountProps = {
-  access: ManagerKnowledgeAccessV1;
+  access: ManagerKnowledgePrivateAccessV1;
 };
 
 type KnowledgeGatekeeperProps = KnowledgeAccountProps;
@@ -275,7 +295,7 @@ function validateKnowledgeAccountProps(value: unknown): KnowledgeAccountProps {
   }
 
   return {
-    access: validateStub<ManagerKnowledgeAccessV1>(access as object),
+    access: validateStub<ManagerKnowledgePrivateAccessV1>(access as object),
   };
 }
 
@@ -408,10 +428,16 @@ function parseKnowledgeSource(value: unknown): KnowledgeSource | undefined {
   return { ...reference, content: value.content };
 }
 
-function unwrapKnowledgeResult<T>(
+function parseNullableKnowledgeSource(
+  value: unknown,
+): KnowledgeSource | null | undefined {
+  return value === null ? null : parseKnowledgeSource(value);
+}
+
+function validateKnowledgeResult<T>(
   result: unknown,
   parseValue: (value: unknown) => T | undefined,
-): T {
+): KnowledgeResult<T> {
   if (!isRecord(result) || typeof result.ok !== "boolean") {
     throw new Error("Knowledge Base integrity_failure: malformed result.");
   }
@@ -424,7 +450,7 @@ function unwrapKnowledgeResult<T>(
     if (value === undefined) {
       throw new Error("Knowledge Base integrity_failure: malformed value.");
     }
-    return value;
+    return { ok: true, value };
   }
 
   if (
@@ -441,11 +467,28 @@ function unwrapKnowledgeResult<T>(
     throw new Error("Knowledge Base integrity_failure: malformed error.");
   }
 
-  const revisionId =
-    typeof result.error.revisionId === "string"
-      ? " (" + result.error.revisionId + ")"
-      : "";
-  throw new Error("Knowledge Base " + result.error.code + revisionId + ".");
+  return {
+    ok: false,
+    error: {
+      code: result.error.code,
+      ...(typeof result.error.revisionId === "string"
+        ? { revisionId: result.error.revisionId }
+        : {}),
+    },
+  };
+}
+
+function unwrapKnowledgeResult<T>(
+  result: unknown,
+  parseValue: (value: unknown) => T | undefined,
+): T {
+  const validated = validateKnowledgeResult(result, parseValue);
+  if (validated.ok) return validated.value;
+
+  const revisionId = validated.error.revisionId
+    ? " (" + validated.error.revisionId + ")"
+    : "";
+  throw new Error("Knowledge Base " + validated.error.code + revisionId + ".");
 }
 
 function normalizedQuery(query: string): string {
@@ -555,8 +598,35 @@ export class CustomGatekeeper
 {
   readonly #actionTails = new Map<number, Promise<void>>();
 
-  #access(): ManagerKnowledgeAccessV1 {
+  #access(): ManagerKnowledgePrivateAccessV1 {
     return validateKnowledgeAccountProps(this.ctx.props as unknown).access;
+  }
+
+  async saveConversationContext(
+    input: ConversationContextSaveInput,
+  ): Promise<KnowledgeResult<KnowledgeReference>> {
+    return validateKnowledgeResult(
+      await this.#access().saveConversationContext(input),
+      parseKnowledgeReference,
+    );
+  }
+
+  async readCurrentConversationContext(): Promise<
+    KnowledgeResult<KnowledgeSource | null>
+  > {
+    return validateKnowledgeResult(
+      await this.#access().readCurrentConversationContext(),
+      parseNullableKnowledgeSource,
+    );
+  }
+
+  async readConversationContextRevision(
+    revisionId: string,
+  ): Promise<KnowledgeResult<KnowledgeSource>> {
+    return validateKnowledgeResult(
+      await this.#access().readConversationContextRevision(revisionId),
+      parseKnowledgeSource,
+    );
   }
 
   #readActionRecord(actionId: number): KnowledgeActionRecord {
@@ -838,10 +908,10 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
   @skipRpcValidation()
   async createManagerAccount(
     managerId: string,
-    capability: ManagerKnowledgeAccessV1,
+    capability: ManagerKnowledgePrivateAccessV1,
   ): Promise<Fetcher<GatekeeperUser>> {
     assertManagerId(managerId);
-    const access = validateStub<ManagerKnowledgeAccessV1>(capability as object);
+    const access = validateStub<ManagerKnowledgePrivateAccessV1>(capability as object);
     await access.assertBoundTo(managerId);
     return this.ctx.exports.CustomAccount({ props: { access: capability } });
   }

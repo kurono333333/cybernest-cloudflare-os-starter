@@ -42,6 +42,15 @@ type TestWorkerExports = {
       catalog: {entries: Array<{id: string; title: string; description: string}>; truncated?: boolean};
       observations: unknown[];
     }>;
+    runConversationBridge(
+      managerId: string,
+      mode?: "valid" | "extra" | "malformed" | "missing",
+    ): Promise<Record<string, unknown>>;
+    runConversationMethod(
+      managerId: string,
+      method: "save" | "current" | "historical",
+      mode?: "valid" | "extra" | "malformed" | "missing",
+    ): Promise<string | null>;
     runAccountScenario(managerId: string): Promise<Record<string, unknown>>;
     runActionScenario(
       managerId: string,
@@ -97,6 +106,71 @@ describe("custom-gatekeeper", () => {
     expect(TYPES_CODE).toContain("at most 1 MiB");
     expect(TYPES_CODE).not.toContain("managerId");
     expect(TYPES_CODE).not.toContain("userId");
+  });
+
+  it("forwards private conversation methods without expanding the Agent KnowledgeBase", async () => {
+    const workerEnv = env as unknown as TestWorkerExports;
+    const factory = workerEnv.TEST_FACTORY.getByName("m07-02-conversation-bridge");
+
+    await expect(factory.runConversationBridge(crypto.randomUUID())).resolves.toEqual({
+      save: {
+        ok: true,
+        value: {
+          revisionId: VALID_REVISION_ID,
+          documentKey: "conversation-context",
+          contentHash: VALID_CONTENT_HASH,
+        },
+      },
+      current: {
+        ok: true,
+        value: {
+          revisionId: VALID_REVISION_ID,
+          documentKey: "conversation-context",
+          contentHash: VALID_CONTENT_HASH,
+          content: "# Conversation\n",
+        },
+      },
+      historical: {
+        ok: true,
+        value: {
+          revisionId: VALID_REVISION_ID,
+          documentKey: "conversation-context",
+          contentHash: VALID_CONTENT_HASH,
+          content: "# Conversation\n",
+        },
+      },
+    });
+    await expect(
+      factory.runConversationBridge(crypto.randomUUID(), "missing"),
+    ).resolves.toEqual({
+      save: {
+        ok: true,
+        value: {
+          revisionId: VALID_REVISION_ID,
+          documentKey: "conversation-context",
+          contentHash: VALID_CONTENT_HASH,
+        },
+      },
+      current: {ok: true, value: null},
+      historical: {
+        ok: true,
+        value: {
+          revisionId: VALID_REVISION_ID,
+          documentKey: "conversation-context",
+          contentHash: VALID_CONTENT_HASH,
+          content: "# Conversation\n",
+        },
+      },
+    });
+
+    for (const method of ["save", "current", "historical"] as const) {
+      await expect(
+        factory.runConversationMethod(crypto.randomUUID(), method, "extra"),
+      ).resolves.toBe("Knowledge Base integrity_failure: malformed value.");
+      await expect(
+        factory.runConversationMethod(crypto.randomUUID(), method, "malformed"),
+      ).resolves.toBe("Knowledge Base integrity_failure: malformed error.");
+    }
   });
 
   it("bounds the native Agent catalog and authorizes only its count", async () => {
