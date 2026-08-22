@@ -1,8 +1,4 @@
-import { RpcTarget } from "cloudflare:workers";
-import { validateRpc, validateStub } from "capnweb-validate";
-import type { ApprovalQueue } from "@gadgets/workshop-shared/gatekeeper";
-
-import type { KnowledgeSession } from "./custom.js";
+import { validateStub } from "capnweb-validate";
 
 const GOLD_RECALL_MAX_QUERY_BYTES = 256;
 const GOLD_RECALL_MAX_PATTERNS = 32;
@@ -22,9 +18,6 @@ export type KnowledgeRecallResult =
 export type GoldRecallAccess = {
   recallGold(query: string): Promise<unknown>;
 };
-
-type RecallObservationQueue = Pick<ApprovalQueue, "authorizeObservation"> &
-  Partial<{ [Symbol.dispose](): void }>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -146,63 +139,5 @@ export async function recallGold(
     // A mixed-version Core or a temporarily unavailable Gold producer must not make ordinary
     // Knowledge list/search/read unavailable. Gold is a recall aid, never an authority dependency.
     return { state: "disabled" };
-  }
-}
-
-@validateRpc()
-export class GoldRecallKnowledgeSession extends RpcTarget {
-  readonly #base: KnowledgeSession;
-  readonly #observationQueue: RecallObservationQueue;
-  readonly #access: GoldRecallAccess | undefined;
-
-  constructor(
-    base: KnowledgeSession,
-    observationQueue: RecallObservationQueue,
-    access: GoldRecallAccess | undefined,
-  ) {
-    super();
-    this.#base = base;
-    this.#observationQueue = observationQueue;
-    this.#access = access;
-  }
-
-  list(
-    options?: Parameters<KnowledgeSession["list"]>[0],
-  ): ReturnType<KnowledgeSession["list"]> {
-    return this.#base.list(options);
-  }
-
-  search(
-    query: string,
-    options?: Parameters<KnowledgeSession["search"]>[1],
-  ): ReturnType<KnowledgeSession["search"]> {
-    return this.#base.search(query, options);
-  }
-
-  read(revisionId: string): ReturnType<KnowledgeSession["read"]> {
-    return this.#base.read(revisionId);
-  }
-
-  proposeUpdate(
-    input: Parameters<KnowledgeSession["proposeUpdate"]>[0],
-  ): ReturnType<KnowledgeSession["proposeUpdate"]> {
-    return this.#base.proposeUpdate(input);
-  }
-
-  async recall(query: string): Promise<KnowledgeRecallResult> {
-    const result = await recallGold(this.#access, query);
-    await this.#observationQueue.authorizeObservation({
-      title: "Knowledge Base recall",
-      description:
-        result.state === "ready"
-          ? `Recalled ${result.patterns.length} abstract semantic direction(s).`
-          : "Semantic recall is currently unavailable; ordinary Knowledge search remains available.",
-    });
-    return result;
-  }
-
-  [Symbol.dispose](): void {
-    this.#base[Symbol.dispose]?.();
-    this.#observationQueue[Symbol.dispose]?.();
   }
 }
