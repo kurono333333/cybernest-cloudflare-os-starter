@@ -1,9 +1,10 @@
 name: Issue 640 Gold Context Validation
 
 on:
-  push:
-    branches:
-      - maintenance/issue-640-gold-context-seam
+  pull_request:
+    paths:
+      - "packages/custom-gatekeeper/**"
+      - ".github/workflows/issue-640-validation.yml"
 
 jobs:
   validate:
