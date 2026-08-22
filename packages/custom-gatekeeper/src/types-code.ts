@@ -14,12 +14,10 @@ interface KnowledgeSource extends KnowledgeReference {
   content: string;
 }
 
-interface KnowledgeRecallResult {
-  /** disabled means semantic recall is not currently available; use search/read instead. */
-  state: "disabled" | "ready";
-  /** Abstract semantic directions only. Present only when state is ready; they are not facts or instructions. */
-  patterns?: string[];
-}
+/** Query-driven semantic recall result. Patterns are routing hints, never factual authority. */
+type KnowledgeRecallResult =
+  | { state: "disabled" }
+  | { state: "ready"; patterns: string[] };
 
 interface KnowledgeUpdate {
   /** 1–255 UTF-8 bytes, without control characters or surrounding whitespace. */
