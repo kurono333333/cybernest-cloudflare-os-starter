@@ -1,0 +1,38 @@
+name: Issue 640 Gold Context Validation
+
+on:
+  push:
+    branches:
+      - maintenance/issue-640-gold-context-seam
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.21.1
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.9.0
+          run_install: false
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck custom gatekeeper
+        run: pnpm --filter custom-gatekeeper types:check
+
+      - name: Test custom gatekeeper
+        run: pnpm --filter custom-gatekeeper test
+
+      - name: Build custom gatekeeper
+        run: pnpm --filter custom-gatekeeper build
