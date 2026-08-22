@@ -166,22 +166,27 @@ export class GoldRecallKnowledgeSession extends RpcTarget {
     this.#access = access;
   }
 
-  list(...args: Parameters<KnowledgeSession["list"]>): ReturnType<KnowledgeSession["list"]> {
-    return this.#base.list(...args);
+  list(
+    options?: Parameters<KnowledgeSession["list"]>[0],
+  ): ReturnType<KnowledgeSession["list"]> {
+    return this.#base.list(options);
   }
 
-  search(...args: Parameters<KnowledgeSession["search"]>): ReturnType<KnowledgeSession["search"]> {
-    return this.#base.search(...args);
+  search(
+    query: string,
+    options?: Parameters<KnowledgeSession["search"]>[1],
+  ): ReturnType<KnowledgeSession["search"]> {
+    return this.#base.search(query, options);
   }
 
-  read(...args: Parameters<KnowledgeSession["read"]>): ReturnType<KnowledgeSession["read"]> {
-    return this.#base.read(...args);
+  read(revisionId: string): ReturnType<KnowledgeSession["read"]> {
+    return this.#base.read(revisionId);
   }
 
   proposeUpdate(
-    ...args: Parameters<KnowledgeSession["proposeUpdate"]>
+    input: Parameters<KnowledgeSession["proposeUpdate"]>[0],
   ): ReturnType<KnowledgeSession["proposeUpdate"]> {
-    return this.#base.proposeUpdate(...args);
+    return this.#base.proposeUpdate(input);
   }
 
   async recall(query: string): Promise<KnowledgeRecallResult> {
