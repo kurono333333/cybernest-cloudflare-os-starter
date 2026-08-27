@@ -16,6 +16,11 @@ export interface KnowledgeSource extends KnowledgeReference {
   content: string;
 }
 
+/** Query-driven semantic recall result. Patterns are routing hints, never factual authority. */
+export type KnowledgeRecallResult =
+  | { state: "disabled" }
+  | { state: "ready"; patterns: string[] };
+
 /** A full replacement proposal; it is not applied until native approval succeeds. */
 export interface KnowledgeUpdate {
   /** 1–255 UTF-8 bytes, without control characters or surrounding whitespace. */
@@ -34,6 +39,8 @@ export interface KnowledgeBase {
   search(query: string, options?: { cursor?: string; limit?: number }): Promise<KnowledgePage>;
   /** Read one current source by a revision ID returned by list() or search(). */
   read(revisionId: string): Promise<KnowledgeSource>;
+  /** Ask where to recall for the current request, then use search/read to ground claims in exact Sources. */
+  recall(query: string): Promise<KnowledgeRecallResult>;
   /** Propose a new or replacement source; current content changes only after approval. */
   proposeUpdate(update: KnowledgeUpdate): Promise<void>;
 }

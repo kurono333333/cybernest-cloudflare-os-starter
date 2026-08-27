@@ -93,22 +93,24 @@ describe("custom-gatekeeper", () => {
     });
   });
 
-  it("publishes only the four bounded KnowledgeBase methods", () => {
+  it("publishes only the five bounded KnowledgeBase methods", () => {
     const knowledgeBase = TYPES_CODE.match(/interface KnowledgeBase \{(?<body>[\s\S]*?)\n\}/u);
     expect(knowledgeBase?.groups?.body).toBeDefined();
     const methods = [...(knowledgeBase?.groups?.body ?? "").matchAll(
       /^\s{2}(\w+)\(/gmu,
     )].map((match) => match[1]);
-    expect(methods).toEqual(["list", "search", "read", "proposeUpdate"]);
+    expect(methods).toEqual(["list", "search", "read", "recall", "proposeUpdate"]);
     expect(TYPES_CODE).toContain("integer from 1 to 50; defaults to 20");
     expect(TYPES_CODE).toContain("at most 256 UTF-8 bytes");
     expect(TYPES_CODE).toContain("1–255 UTF-8 bytes");
     expect(TYPES_CODE).toContain("at most 1 MiB");
+    expect(TYPES_CODE).toContain("routing hints, not authority");
     expect(TYPES_CODE).not.toContain("managerId");
     expect(TYPES_CODE).not.toContain("userId");
+    expect(TYPES_CODE).not.toContain("generation");
   });
 
-  it("forwards private conversation methods without expanding the Agent KnowledgeBase", async () => {
+  it("forwards private conversation methods without exposing them through the Agent KnowledgeBase", async () => {
     const workerEnv = env as unknown as TestWorkerExports;
     const factory = workerEnv.TEST_FACTORY.getByName("m07-02-conversation-bridge");
 
@@ -191,11 +193,12 @@ describe("custom-gatekeeper", () => {
       entries: [{
         id: "knowledge-base",
         title: "Knowledge Base",
-        description: "Available. Use list, search, and read when you need current knowledge.",
+        description: "Available. Use recall to choose a memory direction, then search/read exact sources.",
       }],
       truncated: false,
     });
     expect(JSON.stringify(visible.observations)).not.toContain("content");
+    expect(JSON.stringify(visible.catalog)).not.toContain("BEGIN CYBERNEST GOLD");
   });
 
   it("passes a bounded proposal to the gatekeeper action boundary", async () => {
@@ -217,6 +220,7 @@ describe("custom-gatekeeper", () => {
             content: "# Principles",
           },
         }),
+        recallGold: async () => ({ok: true as const, value: {version: 1, state: "disabled" as const}}),
         assertBoundTo: async () => {},
         applyProposal: async () => ({ ok: false as const, error: { code: "not_used" } }),
         cancelProposal: async () => ({ ok: true as const, value: null }),
@@ -251,6 +255,7 @@ describe("custom-gatekeeper", () => {
         list: async () => listResult,
         search: async () => ({ ok: true as const, value: { items: [], nextCursor: null } }),
         read: async () => readResult,
+        recallGold: async () => ({ok: true as const, value: {version: 1, state: "disabled" as const}}),
         assertBoundTo: async () => {},
         applyProposal: async () => ({ ok: false as const, error: { code: "not_used" } }),
         cancelProposal: async () => ({ ok: true as const, value: null }),
@@ -584,7 +589,7 @@ describe("custom-gatekeeper", () => {
     });
   });
 
-  it("authorizes Knowledge reads before returning data and disposes its queue", async () => {
+  it("authorizes Knowledge reads and recall before returning data and disposes its queue", async () => {
     const observations: unknown[] = [];
     let disposed = false;
     const session = new KnowledgeSession(
@@ -624,6 +629,15 @@ describe("custom-gatekeeper", () => {
             content: "# Principles",
           },
         }),
+        recallGold: async (query: string) => ({
+          ok: true as const,
+          value: {
+            version: 1 as const,
+            state: "ready" as const,
+            generation: "internal-generation",
+            patterns: [`person -> ${query}`],
+          },
+        }),
         assertBoundTo: async () => {},
         applyProposal: async () => {
           throw new Error("not used");
@@ -645,14 +659,23 @@ describe("custom-gatekeeper", () => {
       documentKey: "manager-principles",
       content: "# Principles",
     });
-    expect(observations).toHaveLength(3);
+    await expect(session.recall("  ＹＡＭＡＤＡ  ")).resolves.toEqual({
+      state: "ready",
+      patterns: ["person -> YAMADA"],
+    });
+    expect(observations).toHaveLength(4);
     expect(observations[0]).toMatchObject({ title: "Knowledge Base list" });
     expect(observations[1]).toMatchObject({
       title: "Knowledge Base search",
       description: "Searched the Knowledge Base for manager. Returned 0 current source(s).",
     });
     expect(observations[2]).toMatchObject({ title: "Knowledge Base read" });
+    expect(observations[3]).toMatchObject({
+      title: "Knowledge Base recall",
+      description: "Recalled 1 abstract semantic direction(s).",
+    });
     expect(JSON.stringify(observations)).not.toContain("# Principles");
+    expect(JSON.stringify(observations)).not.toContain("internal-generation");
 
     session[Symbol.dispose]();
     expect(disposed).toBe(true);
@@ -682,6 +705,7 @@ describe("custom-gatekeeper", () => {
             },
           };
         },
+        recallGold: async () => ({ok: true as const, value: {version: 1, state: "disabled" as const}}),
         assertBoundTo: async () => {},
         applyProposal: async () => ({ok: false as const, error: {code: "not_used"}}),
         cancelProposal: async () => ({ok: true as const, value: null}),

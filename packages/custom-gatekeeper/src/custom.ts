@@ -23,6 +23,11 @@ import type {
   VendorDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import TYPES_CODE from "./types-code.js";
+import {
+  recallGold,
+  type GoldRecallAccess,
+  type KnowledgeRecallResult,
+} from "./gold-recall.js";
 
 const CUSTOM_ICON = {
   url:
@@ -92,7 +97,7 @@ type ConversationContextSaveInput = {
   content: string;
 };
 
-interface ManagerKnowledgeAccessV1 {
+interface ManagerKnowledgeAccessV1 extends GoldRecallAccess {
   assertBoundTo(managerId: string): Promise<void>;
   list(options?: KnowledgePageOptions): Promise<KnowledgeResult<KnowledgePage>>;
   search(
@@ -127,6 +132,7 @@ type KnowledgeBase = {
   list(options?: KnowledgePageOptions): Promise<KnowledgePage>;
   search(query: string, options?: KnowledgePageOptions): Promise<KnowledgePage>;
   read(revisionId: string): Promise<KnowledgeSource>;
+  recall(query: string): Promise<KnowledgeRecallResult>;
   proposeUpdate(input: KnowledgeProposalInput): Promise<void>;
 };
 
@@ -579,6 +585,18 @@ export class KnowledgeSession extends RpcTarget implements KnowledgeBase {
     return source;
   }
 
+  async recall(query: string): Promise<KnowledgeRecallResult> {
+    const result = await recallGold(this.#access, query);
+    await this.#approvalQueue.authorizeObservation({
+      title: "Knowledge Base recall",
+      description:
+        result.state === "ready"
+          ? `Recalled ${result.patterns.length} abstract semantic direction(s).`
+          : "Semantic recall is currently unavailable; ordinary Knowledge search remains available.",
+    });
+    return result;
+  }
+
   async proposeUpdate(input: KnowledgeProposalInput): Promise<void> {
     if (this.#propose === undefined) {
       throw gatekeeperError("integrity_failure");
@@ -796,7 +814,7 @@ export class CustomGatekeeper
         {
           id: "knowledge-base",
           title: "Knowledge Base",
-          description: "Available. Use list, search, and read when you need current knowledge.",
+          description: "Available. Use recall to choose a memory direction, then search/read exact sources.",
         },
       ],
       request,

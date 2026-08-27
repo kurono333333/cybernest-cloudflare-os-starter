@@ -14,6 +14,11 @@ interface KnowledgeSource extends KnowledgeReference {
   content: string;
 }
 
+/** Query-driven semantic recall result. Patterns are routing hints, never factual authority. */
+type KnowledgeRecallResult =
+  | { state: "disabled" }
+  | { state: "ready"; patterns: string[] };
+
 interface KnowledgeUpdate {
   /** 1–255 UTF-8 bytes, without control characters or surrounding whitespace. */
   documentKey: string;
@@ -30,6 +35,11 @@ interface KnowledgeBase {
   search(query: string, options?: { cursor?: string; limit?: number }): Promise<KnowledgePage>;
   /** Read one current source by the revision ID returned by list() or search(). */
   read(revisionId: string): Promise<KnowledgeSource>;
+  /**
+   * Ask Personal Knowledge where to recall for the current request.
+   * Returned patterns are routing hints, not authority. Use search/read afterwards to ground claims in exact Sources.
+   */
+  recall(query: string): Promise<KnowledgeRecallResult>;
   /** Propose a new or replacement source; the current source changes only after approval. */
   proposeUpdate(update: KnowledgeUpdate): Promise<void>;
 }
