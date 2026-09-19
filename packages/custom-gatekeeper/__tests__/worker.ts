@@ -81,6 +81,23 @@ type OutcomeMode =
   | "dependency_unavailable"
   | "deadline_exceeded"
   | InvalidInputMode;
+type AdoptionMode =
+  | "committed"
+  | "throw_once"
+  | "throw"
+  | "dependency_unavailable"
+  | "deadline_exceeded"
+  | "malformed"
+  | "wrong_identity";
+type AdoptionOutcomeMode =
+  | "committed"
+  | "unobserved"
+  | "forbidden"
+  | "throw"
+  | "dependency_unavailable"
+  | "deadline_exceeded"
+  | "malformed"
+  | "wrong_identity";
 type FixtureAccessProps = {
   managerId: string;
   token?: string;
@@ -91,6 +108,9 @@ type FixtureAccessProps = {
   bronzeMode?: BronzeMode;
   nextCursor?: NextCursorMode;
   assertMode?: AssertMode;
+  adoptionMode?: AdoptionMode;
+  adoptionOutcomeMode?: AdoptionOutcomeMode;
+  reviewDisplayName?: string;
 };
 
 type BronzeCall = {
@@ -105,10 +125,15 @@ type FixtureAccessInspector = {
   boundInputLog(): Promise<string[]>;
   createInputLog(): Promise<unknown[]>;
   outcomeInputLog(): Promise<unknown[]>;
+  adoptionInputLog(): Promise<unknown[]>;
+  adoptionOutcomeInputLog(): Promise<unknown[]>;
+  setAdoptionOutcomeMode(mode: AdoptionOutcomeMode): Promise<void>;
 };
 
 type FixtureKnowledge = {
   readBronze(input: { sourceId: string; revisionId?: string }): Promise<unknown>;
+  proposeBronzeAdoption(input: unknown): Promise<unknown>;
+  readAdoptionOutcome(input: unknown): Promise<unknown | null>;
 };
 
 type FixtureSummary = {
@@ -134,6 +159,8 @@ type FixtureSession = {
   [Symbol.dispose](): void;
 };
 
+type BronzeTamperField = "document" | "content_hash" | "action_ref" | "fingerprint";
+
 type FixtureGatekeeper = {
   startSession(queue: RpcStub<ApprovalQueue>): Promise<FixtureSession>;
   getAgentCatalog(
@@ -147,6 +174,14 @@ type FixtureGatekeeper = {
   applyAction(actionId: number): Promise<void>;
   rejectAction(actionId: number): Promise<void | { restart?: boolean }>;
   getAutoApprovableActions(): Promise<unknown>;
+  inspectBronzeRow(operationId: string): Promise<Record<string, unknown> | null>;
+  tamperBronzeRow(operationId: string, field: BronzeTamperField): Promise<void>;
+  probeActionCollision(): Promise<{
+    applyError: string | null;
+    rejectError: string | null;
+    createRows: number;
+    bronzeRows: number;
+  }>;
 };
 
 type FixtureGatekeeperProbe = {
@@ -164,6 +199,13 @@ type FixtureGatekeeperProbe = {
     outcomeInputs: unknown[];
     outcome: unknown | null;
     status: string;
+    errors: string[];
+  }>;
+  probeBronzeAccessResolutionFailure(): Promise<{
+    adoptionInputs: unknown[];
+    adoptionOutcomeInputs: unknown[];
+    outcome: unknown | null;
+    bronzeRow: Record<string, unknown> | null;
     errors: string[];
   }>;
   probeApplyRejectRace(): Promise<{ createInputs: unknown[]; errors: string[] }>;
@@ -193,6 +235,9 @@ type AccessLog = {
   boundInputs: string[];
   createInputs: unknown[];
   outcomeInputs: unknown[];
+  adoptionInputs: unknown[];
+  adoptionOutcomeInputs: unknown[];
+  adoptionOutcomeMode?: AdoptionOutcomeMode;
 };
 
 const accessLogs = new Map<string, AccessLog>();
@@ -205,6 +250,8 @@ const accessLog = (props: FixtureAccessProps): AccessLog => {
     boundInputs: [],
     createInputs: [],
     outcomeInputs: [],
+    adoptionInputs: [],
+    adoptionOutcomeInputs: [],
   };
   accessLogs.set(key, created);
   return created;
@@ -223,10 +270,15 @@ const hashText = async (content: string): Promise<string> => {
   ).join("");
 };
 
-const makeSummary = (index: number, state: KnowledgeState): FixtureSummary => ({
+const makeSummary = (
+  index: number,
+  state: KnowledgeState,
+  reviewDisplayName?: string,
+): FixtureSummary => ({
   knowledgeId: KNOWLEDGE_IDS[index] ?? KNOWLEDGE_IDS[0],
   generation: 1,
-  displayName: index === 0 ? "Initial Knowledge" : "Additional Knowledge",
+  displayName:
+    reviewDisplayName ?? (index === 0 ? "Initial Knowledge" : "Additional Knowledge"),
   role: index === 0 ? "initial" : "additional",
   state,
   createdAt: NOW,
@@ -262,6 +314,8 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
   Cloudflare.Env,
   FixtureAccessProps
 > {
+  #adoptionOutcomeMode: AdoptionOutcomeMode | undefined;
+
   async assertBoundTo(managerId: string): Promise<void> {
     accessLog(this.ctx.props).boundInputs.push(managerId);
     if (this.ctx.props.assertMode === "rpc_failure") {
@@ -284,7 +338,7 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
     const requested = input?.limit ?? states.length;
     const items = states
       .slice(0, requested)
-      .map((state, index) => makeSummary(index, state));
+      .map((state, index) => makeSummary(index, state, this.ctx.props.reviewDisplayName));
     if (mode === "empty") return { _tag: "page", items };
     const page: Record<string, unknown> = { _tag: "page", items };
     const nextCursor = this.ctx.props.nextCursor ?? "string";
@@ -370,6 +424,81 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
     return Promise.resolve(buildResult());
   }
 
+  async adoptBronze(input: unknown): Promise<unknown> {
+    const log = accessLog(this.ctx.props);
+    log.adoptionInputs.push(structuredClone(input));
+    const mode = this.ctx.props.adoptionMode ?? "committed";
+    if (mode === "throw") throw new Error("fixture Bronze adoption failure");
+    if (mode === "throw_once" && log.adoptionInputs.length === 1) {
+      throw new Error("fixture response lost after Bronze commit");
+    }
+    if (mode === "dependency_unavailable")
+      return { _tag: "dependency_unavailable", dependency: "knowledge-agent" };
+    if (mode === "deadline_exceeded") return { _tag: "deadline_exceeded" };
+    if (mode === "malformed") return { _tag: "committed", extra: true };
+    const value = input as {
+      operationId: string;
+      knowledgeId: string;
+      generation: 1;
+      document: string;
+      provenance: { sourceKind: string; reference: string; capturedAt: string };
+    };
+    const contentHash = await hashText(value.document);
+    return {
+      _tag: "committed",
+      outcome: "committed",
+      receipt: {
+        receiptId: OTHER_ID,
+        knowledgeId: mode === "wrong_identity" ? OTHER_ID : value.knowledgeId,
+        generation: value.generation,
+        operationId: value.operationId,
+        sourceId: SOURCE_ID,
+        revisionId: REVISION_ID,
+        revisionNumber: 1,
+        contentHash,
+        committedAt: NOW,
+      },
+    };
+  }
+
+  async readAdoptionOutcome(input: unknown): Promise<unknown> {
+    const log = accessLog(this.ctx.props);
+    log.adoptionOutcomeInputs.push(structuredClone(input));
+    const mode =
+      accessLog(this.ctx.props).adoptionOutcomeMode ??
+      this.#adoptionOutcomeMode ??
+      this.ctx.props.adoptionOutcomeMode ??
+      "committed";
+    if (mode === "throw") throw new Error("fixture Bronze outcome failure");
+    if (mode === "forbidden") return { _tag: "forbidden" };
+    if (mode === "unobserved") return { _tag: "unobserved" };
+    if (mode === "dependency_unavailable")
+      return { _tag: "dependency_unavailable", dependency: "knowledge-agent" };
+    if (mode === "deadline_exceeded") return { _tag: "deadline_exceeded" };
+    if (mode === "malformed") return { _tag: "committed", extra: true };
+    const adoption = log.adoptionInputs[0] as {
+      knowledgeId: string;
+      generation: 1;
+      document: string;
+    } | undefined;
+    const operationId = (input as { operationId: string }).operationId;
+    const contentHash = await hashText(adoption?.document ?? "");
+    return {
+      _tag: "committed",
+      receipt: {
+        receiptId: OTHER_ID,
+        knowledgeId: mode === "wrong_identity" ? OTHER_ID : adoption?.knowledgeId,
+        generation: adoption?.generation ?? 1,
+        operationId,
+        sourceId: SOURCE_ID,
+        revisionId: REVISION_ID,
+        revisionNumber: 1,
+        contentHash,
+        committedAt: NOW,
+      },
+    };
+  }
+
   async readCreationOutcome(input: unknown): Promise<unknown> {
     const log = accessLog(this.ctx.props);
     log.outcomeInputs.push(structuredClone(input));
@@ -417,6 +546,18 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
   async outcomeInputLog(): Promise<unknown[]> {
     return accessLog(this.ctx.props).outcomeInputs.map((input) => structuredClone(input));
   }
+  async adoptionInputLog(): Promise<unknown[]> {
+    return accessLog(this.ctx.props).adoptionInputs.map((input) => structuredClone(input));
+  }
+
+  async adoptionOutcomeInputLog(): Promise<unknown[]> {
+    return accessLog(this.ctx.props).adoptionOutcomeInputs.map((input) => structuredClone(input));
+  }
+
+  async setAdoptionOutcomeMode(mode: AdoptionOutcomeMode): Promise<void> {
+    accessLog(this.ctx.props).adoptionOutcomeMode = mode;
+  }
+
 }
 
 class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
@@ -479,8 +620,115 @@ export class InspectableCustomGatekeeper extends DurableObject {
     this.#gatekeeper = new CustomGatekeeper(state, env);
     this.#access = (state.props as unknown as { access: FixtureAccessInspector }).access;
   }
+  async inspectBronzeRow(operationId: string): Promise<Record<string, unknown> | null> {
+    const row = this.ctx.storage.sql
+      .exec<Record<string, unknown>>(
+        "SELECT * FROM custom_gatekeeper_bronze_adoptions WHERE operation_id = ?",
+        operationId,
+      )
+      .toArray()[0];
+    return row === undefined ? null : structuredClone(row);
+  }
 
+  async tamperBronzeRow(operationId: string, field: BronzeTamperField): Promise<void> {
+    const updates: Record<BronzeTamperField, [string, string]> = {
+      document: ["document", "# tampered document\n"],
+      content_hash: ["content_hash", "0".repeat(64)],
+      action_ref: ["action_ref", OTHER_ID],
+      fingerprint: ["payload_fingerprint", "f".repeat(64)],
+    };
+    const update = updates[field];
+    if (update === undefined) throw new Error("unknown Bronze tamper field");
+    this.ctx.storage.sql.exec(
+      "UPDATE custom_gatekeeper_bronze_adoptions SET " + update[0] + " = ? WHERE operation_id = ?",
+      update[1],
+      operationId,
+    );
+  }
+
+
+  async probeActionCollision(): Promise<{
+    applyError: string | null;
+    rejectError: string | null;
+    createRows: number;
+    bronzeRows: number;
+  }> {
+    const operationId = "a4444444-4444-4444-8444-444444444444";
+    const bronzeOperationId = "b4444444-4444-4444-8444-444444444444";
+    const actionRef = "c4444444-4444-4444-8444-444444444444";
+    const bronzeActionRef = "d4444444-4444-4444-8444-444444444444";
+    this.ctx.storage.sql.exec(
+      "INSERT INTO custom_gatekeeper_staged_actions (local_action_id, operation_id, action_ref, kind, display_name, status, payload_fingerprint, outcome_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      1,
+      operationId,
+      actionRef,
+      "knowledge.create",
+      "Collision create",
+      "pending_approval",
+      "0".repeat(64),
+      null,
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT INTO custom_gatekeeper_bronze_adoptions (local_action_id, operation_id, action_ref, kind, knowledge_id, generation, display_name, document, content_hash, source_kind, reference, captured_at, status, payload_fingerprint, outcome_json, outcome_observed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      1,
+      bronzeOperationId,
+      bronzeActionRef,
+      "knowledge.bronze.adopt",
+      "44444444-4444-4444-8444-444444444444",
+      1,
+      "Collision Bronze",
+      "# collision\n",
+      "0".repeat(64),
+      "explicit_user_input",
+      "collision",
+      "2026-01-01T00:00:00.000Z",
+      "pending_approval",
+      "f".repeat(64),
+      null,
+      0,
+    );
+    let applyError: string | null = null;
+    let rejectError: string | null = null;
+    try {
+      await this.#gatekeeper.applyAction(1);
+    } catch (cause) {
+      applyError = messageOf(cause);
+    }
+    try {
+      await this.#gatekeeper.rejectAction(1);
+    } catch (cause) {
+      rejectError = messageOf(cause);
+    }
+    const createRows = this.ctx.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM custom_gatekeeper_staged_actions WHERE local_action_id = 1",
+      )
+      .one().count;
+    const bronzeRows = this.ctx.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM custom_gatekeeper_bronze_adoptions WHERE local_action_id = 1",
+      )
+      .one().count;
+    return { applyError, rejectError, createRows, bronzeRows };
+  }
+
+  async startSession(queue: RpcStub<ApprovalQueue>): Promise<FixtureSession> {
+    return this.#gatekeeper.startSession(queue) as unknown as FixtureSession;
+  }
+
+  async applyAction(actionId: number): Promise<void> {
+    return this.#gatekeeper.applyAction(actionId);
+  }
+
+  async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
+    return this.#gatekeeper.rejectAction(actionId);
+  }
+
+  async getAutoApprovableActions(): Promise<unknown> {
+    return this.#gatekeeper.getAutoApprovableActions();
+  }
   async probeMalformedSession(): Promise<{ duplicateCount: number; error: string | null }> {
+
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
     let duplicateCount = 0;
@@ -600,6 +848,71 @@ export class InspectableCustomGatekeeper extends DurableObject {
         outcomeInputs: await this.#access.outcomeInputLog(),
         outcome,
         status: row.status,
+        errors,
+      };
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
+  }
+
+  async probeBronzeAccessResolutionFailure(): Promise<{
+    adoptionInputs: unknown[];
+    adoptionOutcomeInputs: unknown[];
+    outcome: unknown | null;
+    bronzeRow: Record<string, unknown> | null;
+    errors: string[];
+  }> {
+    const target = new TestApprovalQueue();
+    const queue = new RpcStub<ApprovalQueue>(target);
+    const session = await this.#gatekeeper.startSession(queue);
+    const errors: string[] = [];
+    let outcome: unknown | null = null;
+    let bronzeRow: Record<string, unknown> | null = null;
+    let operationId: string | null = null;
+    try {
+      const page = await session.list({ limit: 1 });
+      const handle = page.items[0]?.access;
+      if (handle === undefined) throw new Error("missing native Bronze handle");
+      const proposal = await handle.proposeBronzeAdoption({
+        document: "# Exact concept\n",
+        provenance: {
+          sourceKind: "explicit_user_input",
+          reference: "s16-sync-fixture",
+          capturedAt: NOW,
+        },
+      }) as { operationId: string };
+      operationId = proposal.operationId;
+      const submission = target.submissions[0];
+      if (submission === undefined) throw new Error("missing native Bronze submission");
+      const props = this.ctx.props as unknown as { access?: unknown };
+      const access = props.access;
+      props.access = undefined;
+      try {
+        await this.#gatekeeper.applyAction(submission.action);
+      } catch (cause) {
+        errors.push(messageOf(cause));
+      } finally {
+        props.access = access;
+      }
+      try {
+        await this.#gatekeeper.applyAction(submission.action);
+      } catch (cause) {
+        errors.push(messageOf(cause));
+      }
+      outcome = await handle.readAdoptionOutcome({ operationId });
+      const row = this.ctx.storage.sql
+        .exec<Record<string, unknown>>(
+          "SELECT * FROM custom_gatekeeper_bronze_adoptions WHERE operation_id = ?",
+          operationId,
+        )
+        .toArray()[0];
+      bronzeRow = row === undefined ? null : structuredClone(row);
+      return {
+        adoptionInputs: await this.#access.adoptionInputLog(),
+        adoptionOutcomeInputs: await this.#access.adoptionOutcomeInputLog(),
+        outcome,
+        bronzeRow,
         errors,
       };
     } finally {
@@ -918,6 +1231,311 @@ export class TestGatekeeperFactory extends DurableObject {
       queueDisposals: snapshot.disposals,
       autoApprovable: await gatekeeper.getAutoApprovableActions(),
     };
+  }
+
+  async runBronzeProposal(options: {
+    document?: string;
+    provenance?: {
+      sourceKind: "conversation" | "user_document" | "explicit_user_input";
+      reference: string;
+      capturedAt: string;
+    };
+    adoptionMode?: AdoptionMode;
+    outcomeMode?: AdoptionOutcomeMode;
+    secondOutcomeMode?: AdoptionOutcomeMode;
+    readOutcomeTwice?: boolean;
+    decision?: "none" | "approve" | "retry" | "reject";
+    wrongHandle?: boolean;
+    displayName?: string;
+    submitFailure?: boolean;
+    tamper?: BronzeTamperField;
+  } = {}): Promise<{
+    proposal: unknown | null;
+    outcome: unknown | null;
+    error: string | null;
+    submissions: Array<{ action: number; description: unknown }>;
+    adoptionInputs: unknown[];
+    adoptionOutcomeInputs: unknown[];
+    observations: ObservationDescription[];
+    bronzeRow: Record<string, unknown> | null;
+    queueDisposals: number;
+  }> {
+    const workerExports = this.#exports();
+    const access = workerExports.TestKnowledgeAccess({
+      props: {
+        managerId: MANAGER_ID,
+        states: options.wrongHandle ? ["ready", "ready"] : ["ready"],
+        adoptionMode: options.adoptionMode,
+        adoptionOutcomeMode: options.outcomeMode,
+        reviewDisplayName: options.displayName,
+        token: crypto.randomUUID(),
+      },
+    });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const facetName = "fixture-s16-bronze-" + crypto.randomUUID();
+    const gatekeeper = this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as FixtureGatekeeper;
+    const target = new TestApprovalQueue(null, options.submitFailure ?? false);
+    const queue = new RpcStub<ApprovalQueue>(target);
+    const defaultDocument = "# Exact concept\n\n~~~\nnot a fence escape\n~~~~~\n";
+    const defaultProvenance = {
+      sourceKind: "explicit_user_input" as const,
+      reference: "s16-fixture",
+      capturedAt: NOW,
+    };
+    let proposal: unknown | null = null;
+    let outcome: unknown | null = null;
+    let error: string | null = null;
+    let operationId: string | null = null;
+    try {
+      const session = await gatekeeper.startSession(queue);
+      try {
+        const page = await session.list({ limit: options.wrongHandle ? 2 : 1 });
+        const proposalHandle = page.items[0]?.access;
+        const outcomeHandle = options.wrongHandle ? page.items[1]?.access : proposalHandle;
+        if (proposalHandle === undefined || outcomeHandle === undefined) {
+          throw new Error("missing ready Knowledge fixture handle");
+        }
+        proposal = await proposalHandle.proposeBronzeAdoption({
+          document: options.document ?? defaultDocument,
+          provenance: options.provenance ?? defaultProvenance,
+        });
+        if (isRecord(proposal) && typeof proposal.operationId === "string") {
+          operationId = proposal.operationId;
+        }
+        const submission = target.submissions[0];
+        if (submission !== undefined && operationId !== null && options.tamper !== undefined) {
+          try {
+            await gatekeeper.tamperBronzeRow(operationId, options.tamper);
+          } catch (cause) {
+            error = messageOf(cause);
+          }
+        }
+        if (submission !== undefined && options.decision === "approve") {
+          try {
+            await gatekeeper.applyAction(submission.action);
+          } catch (cause) {
+            error = messageOf(cause);
+          }
+        }
+        if (submission !== undefined && options.decision === "retry") {
+          try {
+            await gatekeeper.applyAction(submission.action);
+          } catch {
+            // Response-loss fixture: the second callback must only read the same operation.
+          }
+          try {
+            await gatekeeper.applyAction(submission.action);
+          } catch (cause) {
+            error = messageOf(cause);
+          }
+        }
+        if (submission !== undefined && options.decision === "reject") {
+          await gatekeeper.rejectAction(submission.action);
+        }
+        if (
+          options.decision !== "reject" &&
+          operationId !== null
+        ) {
+          try {
+            outcome = await outcomeHandle.readAdoptionOutcome({ operationId });
+          } catch (cause) {
+            error ??= messageOf(cause);
+          }
+          if (options.secondOutcomeMode !== undefined) {
+            await (access as unknown as {
+              setAdoptionOutcomeMode(mode: AdoptionOutcomeMode): Promise<void>;
+            }).setAdoptionOutcomeMode(options.secondOutcomeMode);
+          }
+          if (options.readOutcomeTwice || options.secondOutcomeMode !== undefined) {
+            try {
+              await outcomeHandle.readAdoptionOutcome({ operationId });
+            } catch (cause) {
+              error ??= messageOf(cause);
+            }
+          }
+        }
+      } finally {
+        session[Symbol.dispose]();
+      }
+    } catch (cause) {
+      error = messageOf(cause);
+    } finally {
+      queue[Symbol.dispose]();
+    }
+    let bronzeRow: Record<string, unknown> | null = null;
+    if (operationId !== null) {
+      try {
+        bronzeRow = await gatekeeper.inspectBronzeRow(operationId);
+      } catch (cause) {
+        error ??= messageOf(cause);
+      }
+    }
+    const snapshot = target.snapshot();
+    return {
+      proposal,
+      outcome,
+      error,
+      submissions: snapshot.submissions,
+      adoptionInputs: await access.adoptionInputLog(),
+      adoptionOutcomeInputs: await access.adoptionOutcomeInputLog(),
+      observations: snapshot.observations,
+      bronzeRow,
+      queueDisposals: snapshot.disposals,
+    };
+  }
+
+  async runBronzeSynchronousAccessFailureRecovery(): Promise<{
+    adoptionInputs: unknown[];
+    adoptionOutcomeInputs: unknown[];
+    outcome: unknown | null;
+    bronzeRow: Record<string, unknown> | null;
+    errors: string[];
+  }> {
+    const workerExports = this.#exports();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+    });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const facetName = "fixture-s16-access-failure-recovery-" + crypto.randomUUID();
+    const gatekeeper = this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as FixtureGatekeeperProbe;
+    return gatekeeper.probeBronzeAccessResolutionFailure();
+  }
+
+  async runCombinedCapacityAdoptionThenCreate(): Promise<{
+    adoptionSuccesses: number;
+    adoptionFailures: number;
+    createError: string | null;
+    submissions: number;
+  }> {
+    const workerExports = this.#exports();
+    const access = workerExports.TestKnowledgeAccess({
+      props: {
+        managerId: MANAGER_ID,
+        states: ["ready"],
+        token: crypto.randomUUID(),
+      },
+    });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const facetName = "fixture-s16-combined-capacity-" + crypto.randomUUID();
+    const gatekeeper = this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as FixtureGatekeeper;
+    const target = new TestApprovalQueue();
+    const queue = new RpcStub<ApprovalQueue>(target);
+    const session = await gatekeeper.startSession(queue);
+    try {
+      const page = await session.list({ limit: 1 });
+      const handle = page.items[0]?.access;
+      if (handle === undefined) throw new Error("missing native Bronze handle");
+      const results = await Promise.allSettled(
+        Array.from({ length: 64 }, (_, index) =>
+          handle.proposeBronzeAdoption({
+            document: "# Combined " + index + "\n",
+            provenance: {
+              sourceKind: "explicit_user_input",
+              reference: "s16-combined-" + index,
+              capturedAt: NOW,
+            },
+          }),
+        ),
+      );
+      let createError: string | null = null;
+      try {
+        await session.proposeKnowledgeCreate({ displayName: "Blocked create" });
+      } catch (cause) {
+        createError = messageOf(cause);
+      }
+      return {
+        adoptionSuccesses: results.filter((result) => result.status === "fulfilled").length,
+        adoptionFailures: results.filter((result) => result.status === "rejected").length,
+        createError,
+        submissions: target.snapshot().submissions.length,
+      };
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
+  }
+
+  async probeActionCollision(): Promise<{
+    applyError: string | null;
+    rejectError: string | null;
+    createRows: number;
+    bronzeRows: number;
+  }> {
+    const workerExports = this.#exports();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+    });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const facetName = "fixture-s16-action-collision-" + crypto.randomUUID();
+    const gatekeeper = this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as FixtureGatekeeper;
+    return gatekeeper.probeActionCollision();
+  }
+
+  async runConcurrentBronzeProposals(count: number): Promise<{
+    successes: number;
+    capacityFailures: number;
+    submissions: number;
+    adoptionInputs: unknown[];
+  }> {
+    const workerExports = this.#exports();
+    const access = workerExports.TestKnowledgeAccess({
+      props: {
+        managerId: MANAGER_ID,
+        states: ["ready"],
+        token: crypto.randomUUID(),
+      },
+    });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const facetName = "fixture-s16-capacity-" + crypto.randomUUID();
+    const gatekeeper = this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as FixtureGatekeeper;
+    const target = new TestApprovalQueue();
+    const queue = new RpcStub<ApprovalQueue>(target);
+    const session = await gatekeeper.startSession(queue);
+    try {
+      const page = await session.list({ limit: 1 });
+      const handle = page.items[0]?.access;
+      if (handle === undefined) throw new Error("missing native Bronze handle");
+      const results = await Promise.allSettled(
+        Array.from({ length: count }, (_, index) =>
+          handle.proposeBronzeAdoption({
+            document: "# Concurrent " + index + "\n",
+            provenance: {
+              sourceKind: "explicit_user_input",
+              reference: "s16-capacity-" + index,
+              capturedAt: NOW,
+            },
+          }),
+        ),
+      );
+      return {
+        successes: results.filter((result) => result.status === "fulfilled").length,
+        capacityFailures: results.filter(
+          (result) =>
+            result.status === "rejected" &&
+            messageOf(result.reason).includes("capacity_exceeded"),
+        ).length,
+        submissions: target.snapshot().submissions.length,
+        adoptionInputs: await access.adoptionInputLog(),
+      };
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
   }
 
   async runInvalidCreate(mode: InvalidInputMode): Promise<{

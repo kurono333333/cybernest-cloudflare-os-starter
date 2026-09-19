@@ -21,9 +21,20 @@ const NOW = "2026-01-01T00:00:00.000Z";
 
 type ListInput = { cursor?: string; limit?: number };
 type BronzeInput = { sourceId: string; revisionId?: string };
+type BronzeProvenance = {
+  sourceKind: "conversation" | "user_document" | "explicit_user_input";
+  reference: string;
+  capturedAt: string;
+};
+type BronzeAdoptionInput = {
+  document: string;
+  provenance: BronzeProvenance;
+};
 type FakeAccess = {
   list(input?: ListInput): Promise<unknown>;
   readBronze(input: Record<string, unknown>): Promise<unknown>;
+  adoptBronze(input: Record<string, unknown>): Promise<unknown>;
+  readAdoptionOutcome(input: Record<string, unknown>): Promise<unknown>;
 };
 
 const summary = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
@@ -87,6 +98,8 @@ class FakeAccessImpl implements FakeAccess {
   bronzeError: Error | null = null;
   readonly listInputs: Array<ListInput | undefined> = [];
   readonly bronzeInputs: Array<Record<string, unknown>> = [];
+  readonly adoptionInputs: Array<Record<string, unknown>> = [];
+  readonly adoptionOutcomeInputs: Array<Record<string, unknown>> = [];
 
   async list(input?: ListInput): Promise<unknown> {
     this.listInputs.push(input);
@@ -98,6 +111,30 @@ class FakeAccessImpl implements FakeAccess {
     this.bronzeInputs.push({ ...input });
     if (this.bronzeError !== null) throw this.bronzeError;
     return this.bronzeResult;
+  }
+
+  async adoptBronze(input: Record<string, unknown>): Promise<unknown> {
+    this.adoptionInputs.push({ ...input });
+    return {
+      _tag: "committed",
+      outcome: "committed",
+      receipt: {
+        receiptId: REVISION_ID,
+        knowledgeId: input.knowledgeId,
+        generation: input.generation,
+        operationId: input.operationId,
+        sourceId: SOURCE_ID,
+        revisionId: REVISION_ID,
+        revisionNumber: 1,
+        contentHash: "a".repeat(64),
+        committedAt: NOW,
+      },
+    };
+  }
+
+  async readAdoptionOutcome(input: Record<string, unknown>): Promise<unknown> {
+    this.adoptionOutcomeInputs.push({ ...input });
+    return { _tag: "unobserved" };
   }
 }
 
@@ -1022,5 +1059,404 @@ describe("S15 native approval integration", () => {
     expect(result.error).toMatch(/integrity_failure/);
     expect(result.outcome).toBeNull();
     expect(result.observations).toHaveLength(0);
+  });
+});
+
+
+describe("S16 native approved exact Bronze adoption (test-first)", () => {
+  const exactDocument = "# Exact concept\n\n~~~\nnot a fence escape\n~~~~~\n";
+  const provenance: BronzeProvenance = {
+    sourceKind: "explicit_user_input",
+    reference: "s16-fixture",
+    capturedAt: NOW,
+  };
+
+  it("requires only the two sealed-handle methods and hides authority fields", () => {
+    expect(TYPES_CODE).toContain(
+      "proposeBronzeAdoption(input: { document: string; provenance: BronzeProvenance }): Promise<BronzeAdoptionProposal>;",
+    );
+    expect(TYPES_CODE).toContain(
+      "readAdoptionOutcome(input: { operationId: string }): Promise<KnowledgeAdoptionOutcome | null>;",
+    );
+    expect(TYPES_CODE).not.toMatch(
+      /proposeBronzeAdoption\([^)]*(managerId|knowledgeId|generation|contentHash|actionRef|approved|raw)/u,
+    );
+  });
+
+  it("fails closed before any access call until the missing proposal owner exists", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    const adoption = handle as unknown as {
+      proposeBronzeAdoption(input: BronzeAdoptionInput): Promise<unknown>;
+    };
+
+    await expect(
+      adoption.proposeBronzeAdoption({ document: exactDocument, provenance }),
+    ).rejects.toThrow(/dependency_unavailable/);
+    expect(access.bronzeInputs).toHaveLength(0);
+    expect(queue.observations).toHaveLength(1);
+  });
+
+  it("rejects authority injection and malformed exact documents before any capability mutation", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    const adoption = handle as unknown as {
+      proposeBronzeAdoption(input: unknown): Promise<unknown>;
+    };
+    await expect(
+      adoption.proposeBronzeAdoption({
+        document: "\uD800",
+        provenance,
+        managerId: KNOWLEDGE_ID,
+        knowledgeId: OTHER_KNOWLEDGE_ID,
+        generation: 99,
+        contentHash: "0".repeat(64),
+        actionRef: KNOWLEDGE_ID,
+        approved: true,
+        rawCapability: {},
+      }),
+    ).rejects.toThrow(/invalid_input/);
+    expect(access.bronzeInputs).toHaveLength(0);
+    expect(queue.observations).toHaveLength(1);
+  });
+
+  it("rejects malformed provenance before any capability mutation", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    const adoption = handle as unknown as {
+      proposeBronzeAdoption(input: unknown): Promise<unknown>;
+    };
+
+    await expect(
+      adoption.proposeBronzeAdoption({
+        document: exactDocument,
+        provenance: {
+          sourceKind: "explicit_user_input",
+          reference: " untrimmed",
+          capturedAt: "2026-01-01T00:00:00Z",
+        },
+      }),
+    ).rejects.toThrow(/invalid_input/);
+    expect(access.bronzeInputs).toHaveLength(0);
+    expect(queue.observations).toHaveLength(1);
+  });
+});
+
+describe("S16 actual Gatekeeper DO / RpcTarget / ApprovalQueue boundary (test-first)", () => {
+  const exactDocument = "# Exact concept\n\n~~~\nnot a fence escape\n~~~~~\n";
+  const provenance: BronzeProvenance = {
+    sourceKind: "explicit_user_input",
+    reference: "s16-fixture",
+    capturedAt: NOW,
+  };
+
+  type TestFactory = {
+    runBronzeProposal(options?: {
+      document?: string;
+      provenance?: BronzeProvenance;
+      adoptionMode?:
+        | "committed"
+        | "throw_once"
+        | "throw"
+        | "dependency_unavailable"
+        | "deadline_exceeded"
+        | "malformed"
+        | "wrong_identity";
+      outcomeMode?:
+        | "committed"
+        | "unobserved"
+        | "forbidden"
+        | "throw"
+        | "dependency_unavailable"
+        | "deadline_exceeded"
+        | "malformed"
+        | "wrong_identity";
+      secondOutcomeMode?:
+        | "committed"
+        | "unobserved"
+        | "forbidden"
+        | "throw"
+        | "dependency_unavailable"
+        | "deadline_exceeded"
+        | "malformed"
+        | "wrong_identity";
+      readOutcomeTwice?: boolean;
+      decision?: "none" | "approve" | "retry" | "reject";
+      wrongHandle?: boolean;
+      displayName?: string;
+      submitFailure?: boolean;
+      tamper?: "document" | "content_hash" | "action_ref" | "fingerprint";
+    }): Promise<{
+      proposal: unknown | null;
+      outcome: unknown | null;
+      error: string | null;
+      submissions: Array<{ action: number; description: Record<string, unknown> }>;
+      adoptionInputs: unknown[];
+      adoptionOutcomeInputs: unknown[];
+      observations: ObservationDescription[];
+      bronzeRow: Record<string, unknown> | null;
+      queueDisposals: number;
+    }>;
+    runBronzeSynchronousAccessFailureRecovery(): Promise<{
+      adoptionInputs: unknown[];
+      adoptionOutcomeInputs: unknown[];
+      outcome: unknown | null;
+      bronzeRow: Record<string, unknown> | null;
+      errors: string[];
+    }>;
+    runCombinedCapacityAdoptionThenCreate(): Promise<{
+      adoptionSuccesses: number;
+      adoptionFailures: number;
+      createError: string | null;
+      submissions: number;
+    }>;
+    runConcurrentBronzeProposals(count: number): Promise<{
+      successes: number;
+      capacityFailures: number;
+      submissions: number;
+      adoptionInputs: unknown[];
+    }>;
+    probeActionCollision(): Promise<{
+      applyError: string | null;
+      rejectError: string | null;
+      createRows: number;
+      bronzeRows: number;
+    }>;
+  };
+  const testEnv = env as unknown as { TEST_FACTORY: DurableObjectNamespace<TestFactory> };
+  const factory = (): DurableObjectStub<TestFactory> =>
+    testEnv.TEST_FACTORY.getByName("s16-" + crypto.randomUUID());
+
+  it("stages complete inert exact bytes and performs no Core/target mutation before approval", async () => {
+    const result = await factory().runBronzeProposal({
+      document: exactDocument,
+      provenance,
+      decision: "none",
+    });
+    expect(result.error).toBeNull();
+    expect(result.proposal).toMatchObject({ status: "pending_approval" });
+    expect(result.adoptionInputs).toHaveLength(0);
+    expect(result.adoptionOutcomeInputs).toHaveLength(0);
+    expect(result.submissions).toHaveLength(1);
+    const description = result.submissions[0]?.description;
+    expect(description).toMatchObject({ implementsRevert: false, awaitDecision: true });
+    expect(description?.description).toContain(exactDocument);
+    expect(description?.description).toContain("s16-fixture");
+    expect(description?.description).toMatch(/[0-9a-f]{64}/u);
+    expect(result.bronzeRow).toMatchObject({ status: "pending_approval" });
+    expect(result.bronzeRow?.document).toBe(exactDocument);
+  });
+
+  it("keeps document and untrusted metadata inert inside a dynamically safe fence", async () => {
+    const hostileDocument = "~~~~~\n```\n[document](https://evil.invalid)\n~~~~~~";
+    const hostileDisplayName = "[name](https://evil.invalid) `display`";
+    const hostileReference = "![reference](https://evil.invalid) `ref`";
+    const result = await factory().runBronzeProposal({
+      document: hostileDocument,
+      displayName: hostileDisplayName,
+      provenance: {
+        sourceKind: "explicit_user_input",
+        reference: hostileReference,
+        capturedAt: NOW,
+      },
+      decision: "none",
+    });
+    expect(result.error).toBeNull();
+    const rendered = String(result.submissions[0]?.description?.description);
+    expect(rendered).toContain(hostileDocument);
+    expect(rendered).toContain(hostileDisplayName);
+    expect(rendered).toContain(hostileReference);
+    const openingFence = rendered.split("\n")[1];
+    expect(openingFence).toMatch(/^(`{3,}|~{3,})$/u);
+    const fenceCharacter = openingFence?.[0] ?? "";
+    expect(fenceCharacter).not.toBe("");
+    const selectedInputMax = Math.max(
+      ...[hostileDocument, hostileDisplayName, hostileReference].map((value) =>
+        [...value.matchAll(new RegExp(fenceCharacter + "+", "gu"))].reduce(
+          (max, match) => Math.max(max, match[0].length),
+          0,
+        ),
+      ),
+      0,
+    );
+    expect(openingFence?.length).toBeGreaterThan(selectedInputMax);
+    expect(rendered.split("\n").at(-1)).toBe(openingFence);
+  });
+
+  it("rejects without adoption and removes the staged Bronze row", async () => {
+    const result = await factory().runBronzeProposal({
+      document: exactDocument,
+      provenance,
+      decision: "reject",
+    });
+    expect(result.error).toBeNull();
+    expect(result.adoptionInputs).toHaveLength(0);
+    expect(result.adoptionOutcomeInputs).toHaveLength(0);
+    expect(result.outcome).toBeNull();
+    expect(result.bronzeRow).toBeNull();
+  });
+
+  it("rejects a wrong Knowledge handle before Core/adoption observation", async () => {
+    const result = await factory().runBronzeProposal({
+      wrongHandle: true,
+      decision: "approve",
+    });
+    expect(result.error).toMatch(/integrity_failure|wrong|handle/iu);
+    expect(result.adoptionInputs).toHaveLength(1);
+    expect(result.adoptionOutcomeInputs).toHaveLength(0);
+    expect(result.submissions).toHaveLength(1);
+  });
+
+  it("rolls back the complete staged proposal when native submit fails", async () => {
+    const result = await factory().runBronzeProposal({
+      submitFailure: true,
+      decision: "none",
+    });
+    expect(result.proposal).toBeNull();
+    expect(result.error).toMatch(/dependency_unavailable/);
+    expect(result.submissions).toHaveLength(0);
+    expect(result.adoptionInputs).toHaveLength(0);
+    expect(result.bronzeRow).toBeNull();
+  });
+
+  it.each(["document", "content_hash", "action_ref", "fingerprint"] as const)(
+    "fails closed on a tampered Bronze %s before Core mutation",
+    async (tamper) => {
+      const result = await factory().runBronzeProposal({
+        document: exactDocument,
+        provenance,
+        tamper,
+        decision: "approve",
+      });
+      expect(result.error).toMatch(/integrity_failure/);
+      expect(result.adoptionInputs).toHaveLength(0);
+      expect(result.adoptionOutcomeInputs).toHaveLength(0);
+      expect(result.bronzeRow).toMatchObject({ status: "pending_approval" });
+    },
+  );
+
+  it("approves once, preserves exact payload, and compacts the staged document", async () => {
+    const result = await factory().runBronzeProposal({
+      document: exactDocument,
+      provenance,
+      decision: "approve",
+    });
+    expect(result.error).toBeNull();
+    expect(result.adoptionInputs).toHaveLength(1);
+    expect(result.adoptionInputs[0]).toMatchObject({
+      knowledgeId: KNOWLEDGE_ID,
+      generation: 1,
+      document: exactDocument,
+      provenance,
+    });
+    expect(result.adoptionInputs[0]).not.toHaveProperty("approved");
+    expect(result.outcome).toMatchObject({ status: "applied", outcome: "committed" });
+    expect(result.adoptionOutcomeInputs).toHaveLength(1);
+    expect(result.bronzeRow).toMatchObject({ status: "applied" });
+    expect(result.bronzeRow?.document).toBeNull();
+  });
+
+  it("keeps one dispatch across response loss and reads only the same operation outcome", async () => {
+    const result = await factory().runBronzeProposal({
+      document: exactDocument,
+      provenance,
+      adoptionMode: "throw_once",
+      decision: "retry",
+    });
+    expect(result.adoptionInputs).toHaveLength(1);
+    expect(result.adoptionOutcomeInputs).toHaveLength(2);
+    expect(result.bronzeRow).toMatchObject({ status: "applied", document: null });
+    expect(result.outcome).toMatchObject({ status: "applied", outcome: "committed" });
+  });
+
+  it("rolls back synchronously before Promise acquisition, then permits one later dispatch", async () => {
+    const result = await factory().runBronzeSynchronousAccessFailureRecovery();
+    expect(result.adoptionInputs).toHaveLength(1);
+    expect(result.adoptionOutcomeInputs).toHaveLength(1);
+    expect(result.errors[0]).toMatch(/dependency_unavailable/);
+    expect(result.bronzeRow).toMatchObject({ status: "applied", document: null });
+  });
+
+  it("freshly observes an already observed applied receipt instead of returning the cache", async () => {
+    const result = await factory().runBronzeProposal({
+      decision: "approve",
+      outcomeMode: "committed",
+      secondOutcomeMode: "forbidden",
+    });
+    expect(result.adoptionOutcomeInputs).toHaveLength(2);
+    expect(result.error).toMatch(/forbidden/);
+    expect(result.outcome).toMatchObject({ status: "applied" });
+    expect(result.bronzeRow).toMatchObject({
+      status: "applied",
+      outcome_observed: 1,
+      document: null,
+    });
+  });
+
+  it.each(["forbidden", "dependency_unavailable", "malformed", "unobserved"] as const)(
+    "does not disclose a cached applied receipt after fresh %s outcome failure",
+    async (outcomeMode) => {
+      const result = await factory().runBronzeProposal({
+        decision: "approve",
+        outcomeMode,
+      });
+      expect(result.adoptionOutcomeInputs).toHaveLength(1);
+      expect(result.bronzeRow).toMatchObject({ status: "applied", document: null });
+      expect(result.outcome).not.toMatchObject({ status: "applied", receipt: expect.anything() });
+      if (outcomeMode === "unobserved") {
+        expect(result.outcome).toMatchObject({ status: "outcome_unknown" });
+      } else {
+        expect(result.error).toMatch(/forbidden|dependency_unavailable|integrity_failure/);
+      }
+    },
+  );
+
+  it("chooses the shorter dynamic fence at the maximum document boundary", async () => {
+    const document = "~".repeat(65536);
+    const result = await factory().runBronzeProposal({
+      document,
+      decision: "none",
+    });
+    expect(result.error).toBeNull();
+    const rendered = String(result.submissions[0]?.description?.description);
+    const openingFence = rendered.split("\n")[1];
+    expect(openingFence).toBe("```");
+    expect(rendered.split("\n").at(-1)).toBe(openingFence);
+    expect(rendered).toContain(document);
+    expect(rendered.length).toBeLessThan(document.length * 2);
+  });
+
+  it.each(["dependency_unavailable", "deadline_exceeded"] as const)(
+    "keeps post-dispatch %s nonterminal and reads the same operation only",
+    async (mode) => {
+      const result = await factory().runBronzeProposal({
+        adoptionMode: mode,
+        outcomeMode: "unobserved",
+        decision: "approve",
+      });
+      expect(result.adoptionInputs).toHaveLength(1);
+      expect(result.adoptionOutcomeInputs).toHaveLength(1);
+      expect(result.bronzeRow).toMatchObject({ status: "applying", document: null });
+      expect(result.outcome).toMatchObject({ status: "outcome_unknown" });
+    },
+  );
+
+  it("enforces the combined create plus adoption pending cap when create follows 64 adoptions", async () => {
+    const result = await factory().runCombinedCapacityAdoptionThenCreate();
+    expect(result.adoptionSuccesses).toBe(64);
+    expect(result.adoptionFailures).toBe(0);
+    expect(result.createError).toMatch(/capacity_exceeded/);
+    expect(result.submissions).toBe(64);
+  });
+
+  it("fails closed on an actual SQLite local-action collision across both action tables", async () => {
+    const result = await factory().probeActionCollision();
+    expect(result.applyError).toMatch(/integrity_failure/);
+    expect(result.rejectError).toMatch(/integrity_failure/);
+    expect(result.createRows).toBe(1);
+    expect(result.bronzeRows).toBe(1);
   });
 });

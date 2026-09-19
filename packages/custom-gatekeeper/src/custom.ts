@@ -38,6 +38,40 @@ const MAX_DOC = 65536;
 const MAX_PAGE = 50;
 type ListInput = { cursor?: string; limit?: number };
 type BronzeInput = { sourceId: string; revisionId?: string };
+type BronzeProvenance = {
+  sourceKind: "conversation" | "user_document" | "explicit_user_input";
+  reference: string;
+  capturedAt: string;
+};
+type BronzeAdoptionInput = {
+  document: string;
+  provenance: BronzeProvenance;
+};
+type BronzeIdentity = {
+  knowledgeId: string;
+  generation: 1;
+};
+type BronzeReceipt = {
+  receiptId: string;
+  knowledgeId: string;
+  generation: 1;
+  operationId: string;
+  sourceId: string;
+  revisionId: string;
+  revisionNumber: 1;
+  contentHash: string;
+  committedAt: string;
+};
+type KnowledgeAdoptionOutcome =
+  | { operationId: string; status: "pending_approval" }
+  | { operationId: string; status: "outcome_unknown"; reason: "outcome_unknown" }
+  | { operationId: string; status: "failed"; reason: BronzeTerminalFailure }
+  | {
+      operationId: string;
+      status: "applied";
+      outcome: "committed" | "already_committed";
+      receipt: BronzeReceipt;
+    };
 export type KnowledgeAccess = {
   assertBoundTo(managerId: string): Promise<void>;
   list(input?: ListInput): Promise<unknown>;
@@ -50,6 +84,20 @@ export type KnowledgeAccess = {
     displayName: string;
   }): Promise<unknown>;
   readCreationOutcome(input: { operationId: string }): Promise<unknown>;
+  adoptBronze(input: {
+    operationId: string;
+    actionRef: string;
+    knowledgeId: string;
+    generation: 1;
+    document: string;
+    contentHash: string;
+    provenance: BronzeProvenance;
+  }): Promise<unknown>;
+  readAdoptionOutcome(input: {
+    operationId: string;
+    knowledgeId: string;
+    generation: 1;
+  }): Promise<unknown>;
 };
 type Access = KnowledgeAccess;
 type Summary = {
@@ -196,6 +244,33 @@ const observation = (title: string, description: string) => ({
 });
 const MAX_PENDING_PROPOSALS = 64;
 const ACTION_KIND = "knowledge.create";
+const BRONZE_ACTION_KIND = "knowledge.bronze.adopt";
+const BRONZE_ADOPTION_FAILURE_TAGS = [
+  "service_not_ready",
+  "not_found",
+  "provisioning",
+  "blocked",
+  "forbidden",
+  "invalid_input",
+  "payload_too_large",
+  "operation_conflict",
+  "integrity_failure",
+  "deadline_exceeded",
+  "outcome_unknown",
+  "dependency_unavailable",
+] as const;
+type BronzeFailure = (typeof BRONZE_ADOPTION_FAILURE_TAGS)[number];
+const BRONZE_ADOPTION_TERMINAL_FAILURE_TAGS = [
+  "service_not_ready",
+  "not_found",
+  "provisioning",
+  "blocked",
+  "forbidden",
+  "invalid_input",
+  "payload_too_large",
+  "operation_conflict",
+] as const;
+type BronzeTerminalFailure = (typeof BRONZE_ADOPTION_TERMINAL_FAILURE_TAGS)[number];
 type ProposalResult = { operationId: string; status: "pending_approval" };
 type CreationStatus =
   | "pending_approval"
@@ -216,6 +291,17 @@ type ProposalPort = {
     operationId: string,
     queue: RpcStub<ApprovalQueue>,
   ): Promise<CreationOutcome | null>;
+  proposeBronze(
+    input: BronzeAdoptionInput,
+    identity: BronzeIdentity,
+    displayName: string,
+    queue: RpcStub<ApprovalQueue>,
+  ): Promise<ProposalResult>;
+  readBronzeOutcome(
+    operationId: string,
+    identity: BronzeIdentity,
+    queue: RpcStub<ApprovalQueue>,
+  ): Promise<KnowledgeAdoptionOutcome | null>;
 };
 type StoredAction = {
   local_action_id: number;
@@ -226,6 +312,24 @@ type StoredAction = {
   status: "pending_approval" | "applying" | "applied" | "failed";
   payload_fingerprint: string;
   outcome_json: string | null;
+};
+type StoredBronzeAction = {
+  local_action_id: number;
+  operation_id: string;
+  action_ref: string;
+  kind: string;
+  knowledge_id: string;
+  generation: 1;
+  display_name: string;
+  document: string | null;
+  content_hash: string;
+  source_kind: BronzeProvenance["sourceKind"];
+  reference: string;
+  captured_at: string;
+  status: "pending_approval" | "applying" | "applied" | "failed";
+  payload_fingerprint: string;
+  outcome_json: string | null;
+  outcome_observed: number;
 };
 const creationFailureTags = [
   "service_not_ready",
@@ -375,6 +479,108 @@ const payloadHash = async (
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 };
+const documentHash = async (document: string): Promise<string> => {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(document),
+  );
+  return Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+};
+
+const bronzeFingerprint = async (input: {
+  operationId: string;
+  actionRef: string;
+  knowledgeId: string;
+  generation: 1;
+  displayName: string;
+  contentHash: string;
+  provenance: BronzeProvenance;
+}): Promise<string> => {
+  const canonical = JSON.stringify([
+    1,
+    BRONZE_ACTION_KIND,
+    input.operationId,
+    input.actionRef,
+    input.knowledgeId,
+    input.generation,
+    input.displayName,
+    input.contentHash,
+    [
+      input.provenance.sourceKind,
+      input.provenance.reference,
+      input.provenance.capturedAt,
+    ],
+  ]);
+  return documentHash(canonical);
+};
+
+const validBronzeProvenance = (value: unknown): value is BronzeProvenance =>
+  rec(value) &&
+  exact(value, ["sourceKind", "reference", "capturedAt"]) &&
+  (["conversation", "user_document", "explicit_user_input"] as unknown[]).includes(
+    value.sourceKind,
+  ) &&
+  visible(value.reference, 512) &&
+  time(value.capturedAt);
+
+const validBronzeInput = (value: unknown): value is BronzeAdoptionInput =>
+  rec(value) &&
+  exact(value, ["document", "provenance"]) &&
+  documentText(value.document, MAX_DOC) &&
+  validBronzeProvenance(value.provenance);
+
+const maxFenceRun = (value: string, character: string): number => {
+  let max = 0;
+  const pattern = new RegExp(
+    character === String.fromCharCode(96)
+      ? String.fromCharCode(96) + "+"
+      : "~+",
+    "gu",
+  );
+  for (const match of value.matchAll(pattern)) max = Math.max(max, match[0].length);
+  return max;
+};
+
+const bronzeReviewDescription = (input: {
+  displayName: string;
+  document: string;
+  contentHash: string;
+  provenance: BronzeProvenance;
+}): string => {
+  const values = [
+    input.displayName,
+    input.provenance.sourceKind,
+    input.provenance.reference,
+    input.provenance.capturedAt,
+    input.document,
+  ];
+  const backticks = Math.max(
+    ...values.map((value) => maxFenceRun(value, String.fromCharCode(96))),
+    0,
+  );
+  const tildes = Math.max(...values.map((value) => maxFenceRun(value, "~")), 0);
+  const backtickLength = Math.max(backticks, 2) + 1;
+  const tildeLength = Math.max(tildes, 2) + 1;
+  const fenceCharacter = backtickLength <= tildeLength ? String.fromCharCode(96) : "~";
+  const fenceLength = fenceCharacter === String.fromCharCode(96) ? backtickLength : tildeLength;
+  const fence = fenceCharacter.repeat(fenceLength);
+  return [
+    "Review one create-only Knowledge Bronze adoption.",
+    fence,
+    "targetDisplayName=" + input.displayName,
+    "sourceKind=" + input.provenance.sourceKind,
+    "reference=" + input.provenance.reference,
+    "capturedAt=" + input.provenance.capturedAt,
+    "utf8Bytes=" + new TextEncoder().encode(input.document).byteLength,
+    "contentHash=" + input.contentHash,
+    "document:",
+    input.document,
+    fence,
+  ].join("\n");
+};
+
 const validStoredAction = (row: StoredAction): boolean =>
   Number.isSafeInteger(row.local_action_id) &&
   row.local_action_id >= 1 &&
@@ -384,6 +590,161 @@ const validStoredAction = (row: StoredAction): boolean =>
   visible(row.display_name, 120) &&
   ["pending_approval", "applying", "applied", "failed"].includes(row.status) &&
   /^[0-9a-f]{64}$/u.test(row.payload_fingerprint);
+
+const validStoredBronzeAction = (row: StoredBronzeAction): boolean =>
+  Number.isSafeInteger(row.local_action_id) &&
+  row.local_action_id >= 1 &&
+  uuid(row.operation_id) &&
+  uuid(row.action_ref) &&
+  row.kind === BRONZE_ACTION_KIND &&
+  uuid(row.knowledge_id) &&
+  row.generation === 1 &&
+  visible(row.display_name, 120) &&
+  (row.document === null || documentText(row.document, MAX_DOC)) &&
+  /^[0-9a-f]{64}$/u.test(row.content_hash) &&
+  (["conversation", "user_document", "explicit_user_input"] as unknown[]).includes(
+    row.source_kind,
+  ) &&
+  visible(row.reference, 512) &&
+  time(row.captured_at) &&
+  ["pending_approval", "applying", "applied", "failed"].includes(row.status) &&
+  /^[0-9a-f]{64}$/u.test(row.payload_fingerprint) &&
+  (row.outcome_observed === 0 || row.outcome_observed === 1);
+
+const bronzeIdentityMatches = (
+  row: StoredBronzeAction,
+  identity: BronzeIdentity,
+): boolean => row.knowledge_id === identity.knowledgeId && row.generation === identity.generation;
+
+const bronzeProvenanceFromRow = (row: StoredBronzeAction): BronzeProvenance => ({
+  sourceKind: row.source_kind,
+  reference: row.reference,
+  capturedAt: row.captured_at,
+});
+
+const bronzeReceipt = (
+  value: unknown,
+  row: StoredBronzeAction,
+): BronzeReceipt | undefined => {
+  if (
+    !rec(value) ||
+    !exact(value, [
+      "receiptId",
+      "knowledgeId",
+      "generation",
+      "operationId",
+      "sourceId",
+      "revisionId",
+      "revisionNumber",
+      "contentHash",
+      "committedAt",
+    ]) ||
+    !uuid(value.receiptId) ||
+    value.knowledgeId !== row.knowledge_id ||
+    value.generation !== row.generation ||
+    value.operationId !== row.operation_id ||
+    !uuid(value.sourceId) ||
+    !uuid(value.revisionId) ||
+    value.revisionNumber !== 1 ||
+    value.contentHash !== row.content_hash ||
+    !/^[0-9a-f]{64}$/u.test(value.contentHash) ||
+    !time(value.committedAt)
+  )
+    return;
+  return value as BronzeReceipt;
+};
+
+const adoptionResult = (
+  value: unknown,
+  row: StoredBronzeAction,
+  readOnly = false,
+): { outcome: KnowledgeAdoptionOutcome } | { failure: BronzeFailure } | undefined => {
+  if (!rec(value) || typeof value._tag !== "string") return;
+  if (value._tag === "committed" || value._tag === "already_committed") {
+    if (
+      readOnly
+        ? !exact(value, ["_tag", "receipt"])
+        : !exact(value, ["_tag", "outcome", "receipt"]) || value.outcome !== value._tag
+    )
+      return;
+    const receipt = bronzeReceipt(value.receipt, row);
+    return receipt === undefined
+      ? undefined
+      : {
+          outcome: {
+            operationId: row.operation_id,
+            status: "applied",
+            outcome: value._tag,
+            receipt,
+          },
+        };
+  }
+  if (value._tag === "unobserved") {
+    return exact(value, ["_tag"])
+      ? {
+          outcome: {
+            operationId: row.operation_id,
+            status: "outcome_unknown",
+            reason: "outcome_unknown",
+          },
+        }
+      : undefined;
+  }
+  if (value._tag === "invalid_input") {
+    return validInvalidInputResult(value) ? { failure: "invalid_input" } : undefined;
+  }
+  if (value._tag === "dependency_unavailable") {
+    return exact(value, ["_tag", "dependency"]) &&
+      value.dependency === "knowledge-agent"
+      ? { failure: "dependency_unavailable" }
+      : undefined;
+  }
+  return BRONZE_ADOPTION_FAILURE_TAGS.includes(value._tag as BronzeFailure) &&
+    exact(value, ["_tag"])
+    ? { failure: value._tag as BronzeFailure }
+    : undefined;
+};
+
+const storedBronzeOutcome = (
+  value: string | null,
+  row: StoredBronzeAction,
+): KnowledgeAdoptionOutcome | undefined => {
+  if (value === null) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return;
+  }
+  if (!rec(parsed) || parsed.operationId !== row.operation_id) return;
+  if (parsed.status === "failed") {
+    return exact(parsed, ["operationId", "status", "reason"]) &&
+      BRONZE_ADOPTION_TERMINAL_FAILURE_TAGS.includes(
+        parsed.reason as BronzeTerminalFailure,
+      )
+      ? (parsed as KnowledgeAdoptionOutcome)
+      : undefined;
+  }
+  if (
+    parsed.status !== "applied" ||
+    !exact(parsed, ["operationId", "status", "outcome", "receipt"]) ||
+    (parsed.outcome !== "committed" && parsed.outcome !== "already_committed")
+  )
+    return;
+  const receipt = bronzeReceipt(parsed.receipt, row);
+  return receipt === undefined
+    ? undefined
+    : (parsed as KnowledgeAdoptionOutcome);
+};
+
+const bronzeFailureOutcome = (
+  operationId: string,
+  reason: BronzeTerminalFailure,
+): KnowledgeAdoptionOutcome => ({
+  operationId,
+  status: "failed",
+  reason,
+});
 function summary(v: unknown): Summary | undefined {
   if (
     !rec(v) ||
@@ -503,13 +864,44 @@ export class Knowledge extends RpcTarget {
   readonly #a: Access;
   readonly #id: string;
   readonly #g: 1;
+  readonly #displayName: string;
+  readonly #port: ProposalPort | undefined;
   #disposed = false;
-  constructor(q: RpcStub<ApprovalQueue>, a: Access, id: string, g: 1) {
+  constructor(
+    q: RpcStub<ApprovalQueue>,
+    a: Access,
+    id: string,
+    g: 1,
+    displayName: string,
+    port?: ProposalPort,
+  ) {
     super();
     this.#q = q;
     this.#a = a;
     this.#id = id;
     this.#g = g;
+    this.#displayName = displayName;
+    this.#port = port;
+  }
+  async proposeBronzeAdoption(i: unknown): Promise<ProposalResult> {
+    if (!validBronzeInput(i)) throw err("invalid_input");
+    if (this.#port === undefined) throw err("dependency_unavailable");
+    return this.#port.proposeBronze(
+      i,
+      { knowledgeId: this.#id, generation: this.#g },
+      this.#displayName,
+      this.#q,
+    );
+  }
+  async readAdoptionOutcome(i: unknown): Promise<KnowledgeAdoptionOutcome | null> {
+    if (!rec(i) || !exact(i, ["operationId"]) || !uuid(i.operationId))
+      throw err("invalid_input");
+    if (this.#port === undefined) throw err("dependency_unavailable");
+    return this.#port.readBronzeOutcome(
+      i.operationId,
+      { knowledgeId: this.#id, generation: this.#g },
+      this.#q,
+    );
   }
   async readBronze(i: BronzeInput): Promise<Revision | null> {
     if (
@@ -645,6 +1037,8 @@ export class KnowledgeSession extends RpcTarget {
             this.#a,
             s.knowledgeId,
             s.generation,
+            s.displayName,
+            this.#port,
           );
         } catch {
           for (const createdHandle of created) {
@@ -740,6 +1134,24 @@ export class CustomGatekeeper
           payload_fingerprint TEXT NOT NULL,
           outcome_json TEXT
         );
+        CREATE TABLE IF NOT EXISTS custom_gatekeeper_bronze_adoptions (
+          local_action_id INTEGER PRIMARY KEY,
+          operation_id TEXT NOT NULL UNIQUE,
+          action_ref TEXT NOT NULL UNIQUE,
+          kind TEXT NOT NULL,
+          knowledge_id TEXT NOT NULL,
+          generation INTEGER NOT NULL,
+          display_name TEXT NOT NULL,
+          document TEXT,
+          content_hash TEXT NOT NULL,
+          source_kind TEXT NOT NULL,
+          reference TEXT NOT NULL,
+          captured_at TEXT NOT NULL,
+          status TEXT NOT NULL,
+          payload_fingerprint TEXT NOT NULL,
+          outcome_json TEXT,
+          outcome_observed INTEGER NOT NULL DEFAULT 0
+        );
       `);
     });
   }
@@ -771,6 +1183,10 @@ export class CustomGatekeeper
       const port: ProposalPort = {
         propose: (displayName, approvalQueue) => this.#propose(displayName, approvalQueue),
         readOutcome: (operationId, approvalQueue) => this.#readOutcome(operationId, approvalQueue),
+        proposeBronze: (input, identity, displayName, approvalQueue) =>
+          this.#proposeBronze(input, identity, displayName, approvalQueue),
+        readBronzeOutcome: (operationId, identity, approvalQueue) =>
+          this.#readBronzeOutcome(operationId, identity, approvalQueue),
       };
       return new KnowledgeSession(queue, access, port);
     } catch (cause) {
@@ -787,7 +1203,9 @@ export class CustomGatekeeper
     const actionRef = crypto.randomUUID();
     const fingerprint = await payloadHash(operationId, actionRef, displayName);
     const pending = this.ctx.storage.sql
-      .exec<{ count: number }>("SELECT COUNT(*) AS count FROM custom_gatekeeper_staged_actions WHERE status IN ('pending_approval', 'applying')")
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM (SELECT status FROM custom_gatekeeper_staged_actions UNION ALL SELECT status FROM custom_gatekeeper_bronze_adoptions) WHERE status IN ('pending_approval', 'applying')",
+      )
       .one().count;
     if (pending >= MAX_PENDING_PROPOSALS) throw err("capacity_exceeded");
     const next = this.ctx.storage.sql
@@ -819,6 +1237,263 @@ export class CustomGatekeeper
     }
     return { operationId, status: "pending_approval" };
   }
+  async #proposeBronze(
+    input: BronzeAdoptionInput,
+    identity: BronzeIdentity,
+    displayName: string,
+    queue: RpcStub<ApprovalQueue>,
+  ): Promise<ProposalResult> {
+    const operationId = crypto.randomUUID();
+    const actionRef = crypto.randomUUID();
+    const contentHash = await documentHash(input.document);
+    const fingerprint = await bronzeFingerprint({
+      operationId,
+      actionRef,
+      knowledgeId: identity.knowledgeId,
+      generation: identity.generation,
+      displayName,
+      contentHash,
+      provenance: input.provenance,
+    });
+    const pending = this.ctx.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM (SELECT status FROM custom_gatekeeper_staged_actions UNION ALL SELECT status FROM custom_gatekeeper_bronze_adoptions) WHERE status IN ('pending_approval', 'applying')",
+      )
+      .one().count;
+    if (pending >= MAX_PENDING_PROPOSALS) throw err("capacity_exceeded");
+    const next = this.ctx.storage.sql
+      .exec<{ next_id: number }>(
+        "SELECT next_id FROM custom_gatekeeper_action_sequence WHERE id = 1",
+      )
+      .one().next_id;
+    this.ctx.storage.sql.exec(
+      "UPDATE custom_gatekeeper_action_sequence SET next_id = next_id + 1 WHERE id = 1",
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT INTO custom_gatekeeper_bronze_adoptions (local_action_id, operation_id, action_ref, kind, knowledge_id, generation, display_name, document, content_hash, source_kind, reference, captured_at, status, payload_fingerprint, outcome_json, outcome_observed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      next,
+      operationId,
+      actionRef,
+      BRONZE_ACTION_KIND,
+      identity.knowledgeId,
+      identity.generation,
+      displayName,
+      input.document,
+      contentHash,
+      input.provenance.sourceKind,
+      input.provenance.reference,
+      input.provenance.capturedAt,
+      "pending_approval",
+      fingerprint,
+      null,
+      0,
+    );
+    const description: ActionDescription = {
+      title: "Review Knowledge Bronze adoption",
+      description: bronzeReviewDescription({
+        displayName,
+        document: input.document,
+        contentHash,
+        provenance: input.provenance,
+      }),
+      implementsRevert: false,
+      awaitDecision: true,
+    };
+    try {
+      await queue.submitAction(next, description);
+    } catch {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM custom_gatekeeper_bronze_adoptions WHERE local_action_id = ? AND operation_id = ?",
+        next,
+        operationId,
+      );
+      throw err("dependency_unavailable");
+    }
+    return { operationId, status: "pending_approval" };
+  }
+
+  async #readBronzeOutcome(
+    operationId: string,
+    identity: BronzeIdentity,
+    queue: RpcStub<ApprovalQueue>,
+  ): Promise<KnowledgeAdoptionOutcome | null> {
+    const readRow = (): StoredBronzeAction | undefined =>
+      this.ctx.storage.sql
+        .exec<StoredBronzeAction>(
+          "SELECT local_action_id, operation_id, action_ref, kind, knowledge_id, generation, display_name, document, content_hash, source_kind, reference, captured_at, status, payload_fingerprint, outcome_json, outcome_observed FROM custom_gatekeeper_bronze_adoptions WHERE operation_id = ?",
+          operationId,
+        )
+        .toArray()[0];
+    const unknown = (): KnowledgeAdoptionOutcome => ({
+      operationId,
+      status: "outcome_unknown",
+      reason: "outcome_unknown",
+    });
+    let row = readRow();
+    if (row === undefined) return null;
+    if (!validStoredBronzeAction(row)) throw err("integrity_failure");
+    if (!bronzeIdentityMatches(row, identity)) throw err("integrity_failure");
+    const expectedFingerprint = await bronzeFingerprint({
+      operationId: row.operation_id,
+      actionRef: row.action_ref,
+      knowledgeId: row.knowledge_id,
+      generation: row.generation,
+      displayName: row.display_name,
+      contentHash: row.content_hash,
+      provenance: bronzeProvenanceFromRow(row),
+    });
+    row = readRow();
+    if (row === undefined) return null;
+    if (
+      !validStoredBronzeAction(row) ||
+      !bronzeIdentityMatches(row, identity) ||
+      row.payload_fingerprint !== expectedFingerprint
+    )
+      throw err("integrity_failure");
+    if (row.status === "pending_approval") {
+      const result: KnowledgeAdoptionOutcome = {
+        operationId,
+        status: "pending_approval",
+      };
+      await queue.authorizeObservation(
+        observation(
+          "Knowledge Bronze adoption outcome",
+          "Read a bounded Knowledge Bronze adoption outcome.",
+        ),
+      );
+      return result;
+    }
+    if (row.status === "failed") {
+      const result = storedBronzeOutcome(row.outcome_json, row);
+      if (result === undefined || result.status !== "failed")
+        throw err("integrity_failure");
+      await queue.authorizeObservation(
+        observation(
+          "Knowledge Bronze adoption outcome",
+          "Read a bounded Knowledge Bronze adoption outcome.",
+        ),
+      );
+      return result;
+    }
+    if (row.status === "applied") {
+      const cached = storedBronzeOutcome(row.outcome_json, row);
+      if (cached === undefined || cached.status !== "applied")
+        throw err("integrity_failure");
+      let raw: unknown;
+      try {
+        raw = await this.#access().readAdoptionOutcome({
+          operationId: row.operation_id,
+          knowledgeId: row.knowledge_id,
+          generation: row.generation,
+        });
+      } catch {
+        await queue.authorizeObservation(
+          observation(
+            "Knowledge Bronze adoption outcome",
+            "Read a bounded Knowledge Bronze adoption outcome.",
+          ),
+        );
+        return unknown();
+      }
+      const observed = adoptionResult(raw, row, true);
+      if (observed === undefined) throw err("integrity_failure");
+      if ("failure" in observed) {
+        if (observed.failure === "outcome_unknown") {
+          await queue.authorizeObservation(
+            observation(
+              "Knowledge Bronze adoption outcome",
+              "Read a bounded Knowledge Bronze adoption outcome.",
+            ),
+          );
+          return unknown();
+        }
+        throw err(observed.failure);
+      }
+      if (observed.outcome.status === "outcome_unknown") {
+        await queue.authorizeObservation(
+          observation(
+            "Knowledge Bronze adoption outcome",
+            "Read a bounded Knowledge Bronze adoption outcome.",
+          ),
+        );
+        return observed.outcome;
+      }
+      if (observed.outcome.status !== "applied") throw err("integrity_failure");
+      const result = observed.outcome;
+      this.ctx.storage.sql.exec(
+        "UPDATE custom_gatekeeper_bronze_adoptions SET outcome_json = ?, outcome_observed = 1 WHERE local_action_id = ? AND status = 'applied'",
+        JSON.stringify(result),
+        row.local_action_id,
+      );
+      await queue.authorizeObservation(
+        observation(
+          "Knowledge Bronze adoption outcome",
+          "Read a bounded Knowledge Bronze adoption outcome.",
+        ),
+      );
+      return result;
+    }
+    if (row.status !== "applying") throw err("integrity_failure");
+
+    let raw: unknown;
+    try {
+      const access = this.#access();
+      raw = await access.readAdoptionOutcome({
+        operationId: row.operation_id,
+        knowledgeId: row.knowledge_id,
+        generation: row.generation,
+      });
+    } catch {
+      await queue.authorizeObservation(
+        observation(
+          "Knowledge Bronze adoption outcome",
+          "Read a bounded Knowledge Bronze adoption outcome.",
+        ),
+      );
+      return unknown();
+    }
+    const decoded = adoptionResult(raw, row, true);
+    if (decoded === undefined) {
+      await queue.authorizeObservation(
+        observation(
+          "Knowledge Bronze adoption outcome",
+          "Read a bounded Knowledge Bronze adoption outcome.",
+        ),
+      );
+      return unknown();
+    }
+    if ("outcome" in decoded) {
+      if (decoded.outcome.status === "outcome_unknown") {
+        await queue.authorizeObservation(
+          observation(
+            "Knowledge Bronze adoption outcome",
+            "Read a bounded Knowledge Bronze adoption outcome.",
+          ),
+        );
+        return decoded.outcome;
+      }
+      this.ctx.storage.sql.exec(
+        "UPDATE custom_gatekeeper_bronze_adoptions SET status = 'applied', outcome_json = ?, outcome_observed = 1 WHERE local_action_id = ? AND status = 'applying'",
+        JSON.stringify(decoded.outcome),
+        row.local_action_id,
+      );
+      await queue.authorizeObservation(
+        observation(
+          "Knowledge Bronze adoption outcome",
+          "Read a bounded Knowledge Bronze adoption outcome.",
+        ),
+      );
+      return decoded.outcome;
+    }
+    await queue.authorizeObservation(
+      observation(
+        "Knowledge Bronze adoption outcome",
+        "Read a bounded Knowledge Bronze adoption outcome.",
+      ),
+    );
+    return unknown();
+  }
+
   async #readOutcome(operationId: string, queue: RpcStub<ApprovalQueue>): Promise<CreationOutcome | null> {
     const readRow = (): StoredAction | undefined => this.ctx.storage.sql
       .exec<StoredAction>("SELECT local_action_id, operation_id, action_ref, kind, display_name, status, payload_fingerprint, outcome_json FROM custom_gatekeeper_staged_actions WHERE operation_id = ?", operationId)
@@ -887,6 +1562,180 @@ export class CustomGatekeeper
     throw err(decoded.failure);
   }
   async applyAction(actionId: number): Promise<void> {
+    if (!Number.isSafeInteger(actionId) || actionId < 1)
+      throw err("invalid_input");
+    const createRows = this.ctx.storage.sql
+      .exec<{ local_action_id: number }>(
+        "SELECT local_action_id FROM custom_gatekeeper_staged_actions WHERE local_action_id = ?",
+        actionId,
+      )
+      .toArray();
+    const bronzeRows = this.ctx.storage.sql
+      .exec<{ local_action_id: number }>(
+        "SELECT local_action_id FROM custom_gatekeeper_bronze_adoptions WHERE local_action_id = ?",
+        actionId,
+      )
+      .toArray();
+    if (createRows.length > 0 && bronzeRows.length > 0) throw err("integrity_failure");
+    if (createRows.length > 0) return this.#applyCreationAction(actionId);
+    if (bronzeRows.length > 0) return this.#applyBronzeAction(actionId);
+    throw err("invalid_input");
+  }
+
+  async #applyBronzeAction(actionId: number): Promise<void> {
+    const readRow = (): StoredBronzeAction | undefined =>
+      this.ctx.storage.sql
+        .exec<StoredBronzeAction>(
+          "SELECT local_action_id, operation_id, action_ref, kind, knowledge_id, generation, display_name, document, content_hash, source_kind, reference, captured_at, status, payload_fingerprint, outcome_json, outcome_observed FROM custom_gatekeeper_bronze_adoptions WHERE local_action_id = ?",
+          actionId,
+        )
+        .toArray()[0];
+    const readApplyingOutcome = async (
+      current: StoredBronzeAction,
+    ): Promise<"applied" | "outcome_unknown"> => {
+      let raw: unknown;
+      try {
+        raw = await this.#access().readAdoptionOutcome({
+          operationId: current.operation_id,
+          knowledgeId: current.knowledge_id,
+          generation: current.generation,
+        });
+      } catch {
+        return "outcome_unknown";
+      }
+      const decoded = adoptionResult(raw, current, true);
+      if (decoded === undefined || !("outcome" in decoded))
+        return "outcome_unknown";
+      if (decoded.outcome.status === "outcome_unknown") return "outcome_unknown";
+      this.ctx.storage.sql.exec(
+        "UPDATE custom_gatekeeper_bronze_adoptions SET status = 'applied', outcome_json = ?, outcome_observed = 1 WHERE local_action_id = ? AND status = 'applying'",
+        JSON.stringify(decoded.outcome),
+        current.local_action_id,
+      );
+      return "applied";
+    };
+    let row = readRow();
+    if (row === undefined) throw err("invalid_input");
+    if (!validStoredBronzeAction(row)) throw err("integrity_failure");
+    const expectedFingerprint = await bronzeFingerprint({
+      operationId: row.operation_id,
+      actionRef: row.action_ref,
+      knowledgeId: row.knowledge_id,
+      generation: row.generation,
+      displayName: row.display_name,
+      contentHash: row.content_hash,
+      provenance: bronzeProvenanceFromRow(row),
+    });
+    row = readRow();
+    if (
+      row === undefined ||
+      !validStoredBronzeAction(row) ||
+      row.payload_fingerprint !== expectedFingerprint
+    )
+      throw err(row === undefined ? "invalid_input" : "integrity_failure");
+    if (row.status === "applied") {
+      if (storedBronzeOutcome(row.outcome_json, row) === undefined)
+        throw err("integrity_failure");
+      return;
+    }
+    if (row.status === "failed") {
+      const result = storedBronzeOutcome(row.outcome_json, row);
+      if (result === undefined || result.status !== "failed")
+        throw err("integrity_failure");
+      throw err(result.reason);
+    }
+    if (row.status === "applying") {
+      const observed = await readApplyingOutcome(row);
+      if (observed === "applied") return;
+      throw err("outcome_unknown");
+    }
+    if (row.status !== "pending_approval") throw err("integrity_failure");
+    if (row.document === null || (await documentHash(row.document)) !== row.content_hash)
+      throw err("integrity_failure");
+
+    const transition = this.ctx.storage.sql.exec(
+      "UPDATE custom_gatekeeper_bronze_adoptions SET status = 'applying' WHERE local_action_id = ? AND status = 'pending_approval'",
+      actionId,
+    );
+    row = readRow();
+    if (
+      row === undefined ||
+      !validStoredBronzeAction(row) ||
+      row.payload_fingerprint !== expectedFingerprint
+    )
+      throw err(row === undefined ? "invalid_input" : "integrity_failure");
+    if (transition.rowsWritten !== 1) {
+      if (row.status === "applied") {
+        if (storedBronzeOutcome(row.outcome_json, row) === undefined)
+          throw err("integrity_failure");
+        return;
+      }
+      if (row.status === "failed") {
+        const result = storedBronzeOutcome(row.outcome_json, row);
+        if (result === undefined || result.status !== "failed")
+          throw err("integrity_failure");
+        throw err(result.reason);
+      }
+      if (row.status !== "applying") throw err("integrity_failure");
+      const observed = await readApplyingOutcome(row);
+      if (observed === "applied") return;
+      throw err("outcome_unknown");
+    }
+    if (row.document === null || (await documentHash(row.document)) !== row.content_hash)
+      throw err("integrity_failure");
+
+    const rollbackApplying = () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE custom_gatekeeper_bronze_adoptions SET status = 'pending_approval' WHERE local_action_id = ? AND status = 'applying'",
+        actionId,
+      );
+    };
+    let call: Promise<unknown>;
+    try {
+      call = this.#access().adoptBronze({
+        operationId: row.operation_id,
+        actionRef: row.action_ref,
+        knowledgeId: row.knowledge_id,
+        generation: row.generation,
+        document: row.document,
+        contentHash: row.content_hash,
+        provenance: bronzeProvenanceFromRow(row),
+      });
+    } catch {
+      rollbackApplying();
+      throw err("dependency_unavailable");
+    }
+    this.ctx.storage.sql.exec(
+      "UPDATE custom_gatekeeper_bronze_adoptions SET document = NULL WHERE local_action_id = ? AND status = 'applying'",
+      actionId,
+    );
+    let raw: unknown;
+    try {
+      raw = await call;
+    } catch {
+      throw err("outcome_unknown");
+    }
+    const decoded = adoptionResult(raw, row);
+    if (decoded === undefined) throw err("outcome_unknown");
+    if ("failure" in decoded) {
+      if (!BRONZE_ADOPTION_TERMINAL_FAILURE_TAGS.includes(decoded.failure as BronzeTerminalFailure))
+        throw err(decoded.failure);
+      const outcome = bronzeFailureOutcome(row.operation_id, decoded.failure as BronzeTerminalFailure);
+      this.ctx.storage.sql.exec(
+        "UPDATE custom_gatekeeper_bronze_adoptions SET status = 'failed', outcome_json = ? WHERE local_action_id = ? AND status = 'applying'",
+        JSON.stringify(outcome),
+        actionId,
+      );
+      throw err(decoded.failure);
+    }
+    this.ctx.storage.sql.exec(
+      "UPDATE custom_gatekeeper_bronze_adoptions SET status = 'applied', outcome_json = ?, outcome_observed = 0 WHERE local_action_id = ? AND status = 'applying'",
+      JSON.stringify(decoded.outcome),
+      actionId,
+    );
+  }
+
+  async #applyCreationAction(actionId: number): Promise<void> {
     if (!Number.isSafeInteger(actionId) || actionId < 1) throw err("invalid_input");
     const readRow = (): StoredAction | undefined => this.ctx.storage.sql
       .exec<StoredAction>("SELECT local_action_id, operation_id, action_ref, kind, display_name, status, payload_fingerprint, outcome_json FROM custom_gatekeeper_staged_actions WHERE local_action_id = ?", actionId)
@@ -1007,7 +1856,32 @@ export class CustomGatekeeper
   }
   async rejectAction(actionId: number): Promise<void> {
     if (!Number.isSafeInteger(actionId) || actionId < 1) return;
-    this.ctx.storage.sql.exec("DELETE FROM custom_gatekeeper_staged_actions WHERE local_action_id = ? AND status = 'pending_approval'", actionId);
+    const createRows = this.ctx.storage.sql
+      .exec<{ local_action_id: number }>(
+        "SELECT local_action_id FROM custom_gatekeeper_staged_actions WHERE local_action_id = ?",
+        actionId,
+      )
+      .toArray();
+    const bronzeRows = this.ctx.storage.sql
+      .exec<{ local_action_id: number }>(
+        "SELECT local_action_id FROM custom_gatekeeper_bronze_adoptions WHERE local_action_id = ?",
+        actionId,
+      )
+      .toArray();
+    if (createRows.length > 0 && bronzeRows.length > 0) throw err("integrity_failure");
+    if (createRows.length > 0) {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM custom_gatekeeper_staged_actions WHERE local_action_id = ? AND status = 'pending_approval'",
+        actionId,
+      );
+      return;
+    }
+    if (bronzeRows.length > 0) {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM custom_gatekeeper_bronze_adoptions WHERE local_action_id = ? AND status = 'pending_approval'",
+        actionId,
+      );
+    }
   }
   async getAgentCatalog(
     r: AgentCatalogRequest,

@@ -1,13 +1,16 @@
 # Custom Gatekeeper
 
-This package installs the Manager-private, read-only Knowledge Base singleton for Cloudflare OS.
-The native Agent surface is deliberately small:
+This package installs the Manager-private Knowledge Base singleton for Cloudflare OS. Native reads
+remain bounded and read-only, while exact Bronze adoption is available only through the existing
+native approval callback and Core-sealed private path. The native Agent surface is deliberately small:
 
 ```ts
 KnowledgeBase.list({ cursor?, limit? })
   -> KnowledgePage
 KnowledgeSummary.state === "ready"
   -> Knowledge.readBronze({ sourceId, revisionId? })
+  -> Knowledge.proposeBronzeAdoption({ document, provenance })
+  -> Knowledge.readAdoptionOutcome({ operationId })
 ```
 
 `list` returns bounded summaries. Only a `ready` summary receives a `Knowledge` capability; that
@@ -22,10 +25,12 @@ install path validates the exact capability props and binds the capability to th
 creating the singleton account. Legacy `undefined`/`{}` account props remain inspectable for
 backward compatibility, but cannot create a bound Gatekeeper.
 
-## S14 boundary
+## S16 boundary
 
-This slice has no search API, flat read API, LLM or MCP endpoint, OAuth flow, public HTTP resource,
-or write/proposal/action API. Manual writes and Core adoption are deferred to the next slice.
+This package has no search API, flat read API, LLM or MCP endpoint, OAuth flow, or public HTTP
+resource. Bronze proposals retain exact UTF-8 bytes and bounded provenance in the Gatekeeper DO;
+only the native `applyAction` callback may cross the Core-sealed private Service Binding to the
+existing KnowledgeWrite -> Root -> target transaction. No public write route or blind retry exists.
 
 ## Files and checks
 
