@@ -1,39 +1,42 @@
-/** A current Knowledge Base source reference. */
-export interface KnowledgeReference {
-  revisionId: string;
-  documentKey: string;
-  contentHash: string;
+export interface KnowledgeSummary {
+  knowledgeId: string;
+  generation: 1;
+  displayName: string;
+  role: "initial" | "additional";
+  state: "provisioning" | "ready" | "blocked";
+  createdAt: string;
+  updatedAt: string;
+  access?: Knowledge;
 }
-
-/** A bounded page of current Knowledge Base source references. */
 export interface KnowledgePage {
-  items: KnowledgeReference[];
+  items: KnowledgeSummary[];
   nextCursor: string | null;
 }
-
-/** One current Knowledge Base source. */
-export interface KnowledgeSource extends KnowledgeReference {
-  content: string;
+export interface Knowledge {
+  readBronze(input: {
+    sourceId: string;
+    revisionId?: string;
+  }): Promise<KnowledgeRevision | null>;
 }
-
-/** A full replacement proposal; it is not applied until native approval succeeds. */
-export interface KnowledgeUpdate {
-  /** 1–255 UTF-8 bytes, without control characters or surrounding whitespace. */
-  documentKey: string;
-  /** null when creating; otherwise the current revision ID returned by list() or search(). */
-  baseSourceRevisionId: string | null;
-  /** Exact Markdown content, at most 1 MiB. */
-  content: string;
+export interface KnowledgeRevision {
+  knowledgeId: string;
+  generation: 1;
+  sourceId: string;
+  revisionId: string;
+  revisionNumber: 1;
+  baseRevisionId: string | null;
+  document: string;
+  contentHash: string;
+  type: "Source";
+  title: string;
+  description: string;
+  provenance: {
+    sourceKind: "conversation" | "user_document" | "explicit_user_input";
+    reference: string;
+    capturedAt: string;
+  };
+  committedAt: string;
 }
-
-/** Current long-term knowledge available to this Manager. */
 export interface KnowledgeBase {
-  /** List current sources in stable document-key order; limit is an integer from 1 to 50; defaults to 20. */
   list(options?: { cursor?: string; limit?: number }): Promise<KnowledgePage>;
-  /** Search by a normalized non-empty query of at most 256 UTF-8 bytes; limit is 1–50 and defaults to 20. */
-  search(query: string, options?: { cursor?: string; limit?: number }): Promise<KnowledgePage>;
-  /** Read one current source by a revision ID returned by list() or search(). */
-  read(revisionId: string): Promise<KnowledgeSource>;
-  /** Propose a new or replacement source; current content changes only after approval. */
-  proposeUpdate(update: KnowledgeUpdate): Promise<void>;
 }

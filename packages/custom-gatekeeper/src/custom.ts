@@ -1,8 +1,8 @@
 import {
-  DurableObject,
   RpcStub,
   RpcTarget,
   WorkerEntrypoint,
+  DurableObject,
 } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc, validateStub } from "capnweb-validate";
 import { boundAgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
@@ -18,483 +18,260 @@ import type {
   GatekeeperUserVerifier,
   ObservationAuthorizer,
   ResourceConfiguratorFrame,
-  ResourceDescription,
   SupportedResource,
   VendorDescription,
+  ResourceDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import TYPES_CODE from "./types-code.js";
-
 const CUSTOM_ICON = {
   url:
     "data:image/svg+xml," +
     encodeURIComponent(
-      "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256' fill='none' stroke='currentColor' stroke-width='20'><path d='M52 72h152v112H52z'/><path d='m52 88 76 52 76-52'/></svg>",
+      "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'><path d='M32 32h192v192H32z'/></svg>",
     ),
 };
-
-const MANAGER_UUID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu;
-const CANONICAL_UUID =
+const UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
-
-type KnowledgeError = {
-  code: string;
-  revisionId?: string;
+const TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u;
+const MAX_DOC = 65536;
+const MAX_PAGE = 50;
+type ListInput = { cursor?: string; limit?: number };
+type BronzeInput = { sourceId: string; revisionId?: string };
+type Access = {
+  assertBoundTo(managerId: string): Promise<void>;
+  list(input?: ListInput): Promise<unknown>;
+  readBronze(
+    input: { knowledgeId: string; generation: 1 } & BronzeInput,
+  ): Promise<unknown>;
 };
-
-const KNOWLEDGE_ERROR_CODES = new Set([
-  "access_denied",
-  "target_missing",
-  "invalid_input",
-  "revision_conflict",
-  "capacity_exceeded",
-  "temporarily_unavailable",
-  "integrity_failure",
-]);
-
-type KnowledgeReference = {
-  revisionId: string;
-  documentKey: string;
-  contentHash: string;
+type Summary = {
+  knowledgeId: string;
+  generation: 1;
+  displayName: string;
+  role: "initial" | "additional";
+  state: "provisioning" | "ready" | "blocked";
+  createdAt: string;
+  updatedAt: string;
 };
-
-type KnowledgePage = {
-  items: KnowledgeReference[];
+type Page = {
+  items: Array<Summary & { access?: Knowledge }>;
   nextCursor: string | null;
 };
-
-type KnowledgeSource = KnowledgeReference & {
-  content: string;
-};
-
-type KnowledgeResult<T> =
-  | { ok: true; value: T }
-  | { ok: false; error: KnowledgeError };
-
-type KnowledgePageOptions = {
-  cursor?: string;
-  limit?: number;
-};
-
-type KnowledgeProposal = {
+type Revision = {
+  knowledgeId: string;
+  generation: 1;
+  sourceId: string;
   revisionId: string;
-  documentKey: string;
-  baseSourceRevisionId: string | null;
-  content: string;
-};
-
-type KnowledgeProposalInput = Omit<KnowledgeProposal, "revisionId">;
-
-type ConversationContextSaveInput = {
-  revisionId: string;
-  baseSourceRevisionId: string | null;
+  revisionNumber: 1;
+  baseRevisionId: string | null;
+  document: string;
   contentHash: string;
-  content: string;
+  type: "Source";
+  title: string;
+  description: string;
+  provenance: {
+    sourceKind: "conversation" | "user_document" | "explicit_user_input";
+    reference: string;
+    capturedAt: string;
+  };
+  committedAt: string;
+};
+export type KnowledgeAccountProps = { access: Access };
+const err = (tag: string) => new Error("Knowledge Base " + tag + ".");
+const rec = (v: unknown): v is Record<string, unknown> => {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
+  const prototype = Object.getPrototypeOf(v);
+  return prototype === Object.prototype || prototype === null;
+};
+const exact = (v: Record<string, unknown>, k: readonly string[]) =>
+  Object.keys(v).length === k.length &&
+  k.every((x) => Object.prototype.hasOwnProperty.call(v, x));
+const uuid = (v: unknown): v is string => typeof v === "string" && UUID.test(v);
+const time = (v: unknown): v is string => {
+  if (typeof v !== "string" || !TS.test(v)) return false;
+  try {
+    const parsed = Date.parse(v);
+    return Number.isFinite(parsed) && new Date(parsed).toISOString() === v;
+  } catch {
+    return false;
+  }
+};
+const text = (v: unknown, max: number, nonEmpty = true): v is string => {
+  if (typeof v !== "string" || (nonEmpty && !v.length)) return false;
+  for (let i = 0; i < v.length; i++) {
+    const c = v.charCodeAt(i);
+    if (c >= 55296 && c <= 56319) {
+      const n = v.charCodeAt(++i);
+      if (n < 56320 || n > 57343) return false;
+    } else if (c >= 56320 && c <= 57343) return false;
+  }
+  return new TextEncoder().encode(v).byteLength <= max;
+};
+const visible = (v: unknown, max: number): v is string =>
+  text(v, max) &&
+  v.trim() === v &&
+  v.trim().length > 0 &&
+  !/[\u0000-\u001F\u007F-\u009F\u2028\u2029\uFEFF]/u.test(v);
+const projectionText = (v: unknown, max: number): v is string =>
+  text(v, max) && v.trim().length > 0;
+const documentText = (v: unknown, max: number): v is string => {
+  if (!text(v, max)) return false;
+  for (let i = 0; i < v.length; i += 1) {
+    const code = v.charCodeAt(i);
+    if (code === 0xfeff && i !== 0) return false;
+    if ((code <= 0x1f && code !== 0x09 && code !== 0x0a && code !== 0x0d) || code === 0x7f)
+      return false;
+    if (code >= 0xd800 && code <= 0xdbff) i += 1;
+  }
+  return true;
 };
 
-interface ManagerKnowledgeAccessV1 {
-  assertBoundTo(managerId: string): Promise<void>;
-  list(options?: KnowledgePageOptions): Promise<KnowledgeResult<KnowledgePage>>;
-  search(
-    query: string,
-    options?: KnowledgePageOptions,
-  ): Promise<KnowledgeResult<KnowledgePage>>;
-  read(revisionId: string): Promise<KnowledgeResult<KnowledgeSource>>;
-  applyProposal(input: KnowledgeProposal): Promise<KnowledgeResult<KnowledgeReference>>;
-  cancelProposal(revisionId: string): Promise<KnowledgeResult<null>>;
-}
-
-interface ManagerKnowledgeConversationAccessV1 {
-  saveConversationContext(
-    input: ConversationContextSaveInput,
-  ): Promise<KnowledgeResult<KnowledgeReference>>;
-  readCurrentConversationContext(): Promise<KnowledgeResult<KnowledgeSource | null>>;
-  readConversationContextRevision(
-    revisionId: string,
-  ): Promise<KnowledgeResult<KnowledgeSource>>;
-}
-
-type ManagerKnowledgePrivateAccessV1 = ManagerKnowledgeAccessV1 &
-  ManagerKnowledgeConversationAccessV1;
-
-export type KnowledgeAccountProps = {
-  access: ManagerKnowledgePrivateAccessV1;
-};
-
-type KnowledgeGatekeeperProps = KnowledgeAccountProps;
-
-type KnowledgeBase = {
-  list(options?: KnowledgePageOptions): Promise<KnowledgePage>;
-  search(query: string, options?: KnowledgePageOptions): Promise<KnowledgePage>;
-  read(revisionId: string): Promise<KnowledgeSource>;
-  proposeUpdate(input: KnowledgeProposalInput): Promise<void>;
-};
-
-type ProposalQueue = Pick<ApprovalQueue, "authorizeObservation" | "submitAction"> &
-  Partial<{ [Symbol.dispose](): void }>;
-
-type PendingKnowledgeAction = {
-  state: "pending";
-  revisionId: string;
-  documentKey: string;
-  baseSourceRevisionId: string | null;
-  contentHash: string;
-  body: ArrayBuffer;
-};
-
-type KnowledgeActionTombstone = {
-  state: "applied" | "rejected";
-};
-
-type KnowledgeActionRecord = PendingKnowledgeAction | KnowledgeActionTombstone;
-
-type ProposalHandler = (input: KnowledgeProposalInput) => Promise<void>;
-
-const ACTION_COUNTER_KEY = "knowledge:next-action-id";
-const ACTION_KEY_PREFIX = "knowledge:action:";
-const MAX_BODY_BYTES = 1_048_576;
-const MAX_DOCUMENT_KEY_BYTES = 255;
-const MAX_REVISION_ID_LENGTH = 36;
-const MAX_SAFE_ACTION_ID = Number.MAX_SAFE_INTEGER;
-const PENDING_ACTION_KEYS = [
-  "state",
-  "revisionId",
-  "documentKey",
-  "baseSourceRevisionId",
-  "contentHash",
-  "body",
+const LIST_FAILURE_TAGS = [
+  "forbidden",
+  "service_not_ready",
+  "invalid_input",
+  "integrity_failure",
+  "deadline_exceeded",
+  "dependency_unavailable",
 ] as const;
-
-const actionKey = (actionId: number) => ACTION_KEY_PREFIX + actionId;
-
-const gatekeeperError = (code: string): Error =>
-  new Error("Knowledge Base " + code + ".");
-
-function hasUnpairedSurrogate(value: string): boolean {
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (Number.isNaN(next) || next < 0xdc00 || next > 0xdfff) return true;
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return true;
-    }
-  }
-  return false;
-}
-
-function isValidDocumentKey(value: string): boolean {
-  return (
-    value.length > 0 &&
-    new TextEncoder().encode(value).byteLength <= MAX_DOCUMENT_KEY_BYTES &&
-    value.trim() === value &&
-    !/\p{Cc}/u.test(value) &&
-    !hasUnpairedSurrogate(value)
-  );
-}
-
-function assertProposalInput(input: KnowledgeProposalInput): void {
-  if (
-    !isRecord(input) ||
-    Object.keys(input).length !== 3 ||
-    !("documentKey" in input) ||
-    !("baseSourceRevisionId" in input) ||
-    !("content" in input)
-  ) {
-    throw gatekeeperError("invalid_input");
-  }
-  if (
-    typeof input.documentKey !== "string" ||
-    !isValidDocumentKey(input.documentKey)
-  ) {
-    throw gatekeeperError("invalid_input");
-  }
-  if (
-    input.baseSourceRevisionId !== null &&
-    (typeof input.baseSourceRevisionId !== "string" ||
-      input.baseSourceRevisionId.length !== MAX_REVISION_ID_LENGTH ||
-      !CANONICAL_UUID.test(input.baseSourceRevisionId))
-  ) {
-    throw gatekeeperError("invalid_input");
-  }
-  if (typeof input.content !== "string" || hasUnpairedSurrogate(input.content)) {
-    throw gatekeeperError("invalid_input");
-  }
-  if (new TextEncoder().encode(input.content).byteLength > MAX_BODY_BYTES) {
-    throw gatekeeperError("capacity_exceeded");
-  }
-}
-
-const textBytes = (content: string): Uint8Array => new TextEncoder().encode(content);
-
-const bytesToHash = async (bytes: Uint8Array): Promise<string> => {
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)]
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-};
-
-const preview = (content: string): string => Array.from(content).slice(0, 2_000).join("");
-
-const literalBlock = (value: string): string =>
-  value
-    .split(/\r\n|[\r\n]/u)
-    .map((line) => "    " + line)
-    .join("\n");
-
-const proposalDescription = (
-  proposal: KnowledgeProposal,
-  contentHash: string,
-): string => {
-  const operation = proposal.baseSourceRevisionId === null ? "create" : "replace";
-  return [
-    "Operation: " + operation,
-    "Document key:\n" + literalBlock(proposal.documentKey),
-    "Revision ID:\n" + literalBlock(proposal.revisionId),
-    "Base revision:\n" +
-      literalBlock(proposal.baseSourceRevisionId ?? "none"),
-    "Content hash (SHA-256):\n" + literalBlock(contentHash),
-    "Preview (first 2,000 Unicode code points):\n" +
-      literalBlock(preview(proposal.content)),
-  ].join("\n\n");
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  // Validate the serialized data shape. Cap'n Web stubs may carry non-enumerable or symbol
-  // bookkeeping properties that are not part of the RPC value and must not become contract data.
-  const actual = Object.keys(value);
-  return (
-    actual.length === keys.length &&
-    keys.every((key) => Object.prototype.hasOwnProperty.call(value, key))
-  );
-}
-
-function assertManagerId(managerId: string): void {
-  if (!MANAGER_UUID.test(managerId)) {
-    throw new TypeError("Manager ID must be a UUID.");
-  }
-}
-
-function isLegacyAccountProps(value: unknown): boolean {
-  return value === undefined || (isRecord(value) && Object.keys(value).length === 0);
-}
-
-function validateKnowledgeAccountProps(value: unknown): KnowledgeAccountProps {
-  if (!isRecord(value) || Object.keys(value).length !== 1 || !("access" in value)) {
-    throw new TypeError("Knowledge Account props must contain only access.");
-  }
-
-  const access = value.access;
-  if ((typeof access !== "object" && typeof access !== "function") || access === null) {
-    throw new TypeError("Knowledge Account access must be an RPC stub.");
-  }
-
-  return {
-    access: validateStub<ManagerKnowledgePrivateAccessV1>(access as object),
-  };
-}
-
-export function parseKnowledgeActionRecord(value: unknown): KnowledgeActionRecord {
-  if (!isRecord(value) || typeof value.state !== "string") {
-    throw gatekeeperError("integrity_failure");
-  }
-
-  if (value.state === "applied" || value.state === "rejected") {
-    if (!hasExactKeys(value, ["state"])) {
-      throw gatekeeperError("integrity_failure");
-    }
-    return { state: value.state };
-  }
-
-  if (
-    value.state !== "pending" ||
-    !hasExactKeys(value, PENDING_ACTION_KEYS) ||
-    typeof value.revisionId !== "string" ||
-    !CANONICAL_UUID.test(value.revisionId) ||
-    typeof value.documentKey !== "string" ||
-    !isValidDocumentKey(value.documentKey) ||
-    typeof value.contentHash !== "string" ||
-    !/^[0-9a-f]{64}$/u.test(value.contentHash) ||
-    (value.baseSourceRevisionId !== null &&
-      (typeof value.baseSourceRevisionId !== "string" ||
-        !CANONICAL_UUID.test(value.baseSourceRevisionId))) ||
-    !(value.body instanceof ArrayBuffer) ||
-    value.body.byteLength > MAX_BODY_BYTES
-  ) {
-    throw gatekeeperError("integrity_failure");
-  }
-
-  return {
-    state: "pending",
-    revisionId: value.revisionId,
-    documentKey: value.documentKey,
-    baseSourceRevisionId: value.baseSourceRevisionId,
-    contentHash: value.contentHash,
-    body: value.body,
-  };
-}
-
-export function nextKnowledgeActionId(value: unknown): number {
-  const nextActionId = value === undefined ? 1 : value;
-  if (
-    typeof nextActionId !== "number" ||
-    !Number.isSafeInteger(nextActionId) ||
-    nextActionId <= 0
-  ) {
-    throw gatekeeperError("integrity_failure");
-  }
-  if (nextActionId >= MAX_SAFE_ACTION_ID) {
-    throw gatekeeperError("capacity_exceeded");
-  }
-  return nextActionId;
-}
-
-export function assertKnowledgeActionId(actionId: number): void {
-  if (
-    !Number.isSafeInteger(actionId) ||
-    actionId <= 0 ||
-    actionId >= MAX_SAFE_ACTION_ID
-  ) {
-    throw gatekeeperError("integrity_failure");
-  }
-}
-
-function parseKnowledgeReference(value: unknown): KnowledgeReference | undefined {
-  if (
-    !isRecord(value) ||
-    !hasExactKeys(value, ["revisionId", "documentKey", "contentHash"]) ||
-    typeof value.revisionId !== "string" ||
-    !CANONICAL_UUID.test(value.revisionId) ||
-    typeof value.documentKey !== "string" ||
-    !isValidDocumentKey(value.documentKey) ||
-    typeof value.contentHash !== "string" ||
-    !/^[0-9a-f]{64}$/u.test(value.contentHash)
-  ) {
-    return undefined;
-  }
-
-  return {
-    revisionId: value.revisionId,
-    documentKey: value.documentKey,
-    contentHash: value.contentHash,
-  };
-}
-
-function parseKnowledgePage(value: unknown): KnowledgePage | undefined {
-  if (
-    !isRecord(value) ||
-    !hasExactKeys(value, ["items", "nextCursor"]) ||
-    !Array.isArray(value.items) ||
-    value.items.length > 50 ||
-    (value.nextCursor !== null &&
-      (typeof value.nextCursor !== "string" || !isValidDocumentKey(value.nextCursor)))
-  ) {
-    return undefined;
-  }
-
-  const items: KnowledgeReference[] = [];
-  for (const item of value.items) {
-    const reference = parseKnowledgeReference(item);
-    if (reference === undefined) return undefined;
-    items.push(reference);
-  }
-
-  return { items, nextCursor: value.nextCursor };
-}
-
-function parseKnowledgeSource(value: unknown): KnowledgeSource | undefined {
-  if (
-    !isRecord(value) ||
-    !hasExactKeys(value, ["revisionId", "documentKey", "contentHash", "content"]) ||
-    typeof value.content !== "string" ||
-    hasUnpairedSurrogate(value.content) ||
-    new TextEncoder().encode(value.content).byteLength > MAX_BODY_BYTES
-  ) {
-    return undefined;
-  }
-
-  const reference = parseKnowledgeReference({
-    revisionId: value.revisionId,
-    documentKey: value.documentKey,
-    contentHash: value.contentHash,
-  });
-  if (reference === undefined) return undefined;
-
-  return { ...reference, content: value.content };
-}
-
-function parseNullableKnowledgeSource(
+const BRONZE_FAILURE_TAGS = [
+  "forbidden",
+  "service_not_ready",
+  "invalid_input",
+  "integrity_failure",
+  "deadline_exceeded",
+  "dependency_unavailable",
+  "provisioning",
+  "blocked",
+] as const;
+const DEPENDENCIES = [
+  "operator-authority",
+  "knowledge-read",
+  "manager-root",
+  "knowledge-agent",
+] as const;
+const LIST_DEPENDENCIES = [
+  "operator-authority",
+  "knowledge-read",
+  "manager-root",
+] as const;
+type FailureTag = (typeof LIST_FAILURE_TAGS)[number] | (typeof BRONZE_FAILURE_TAGS)[number];
+const failure = (
   value: unknown,
-): KnowledgeSource | null | undefined {
-  return value === null ? null : parseKnowledgeSource(value);
-}
-
-function validateKnowledgeResult<T>(
-  result: unknown,
-  parseValue: (value: unknown) => T | undefined,
-): KnowledgeResult<T> {
-  if (!isRecord(result) || typeof result.ok !== "boolean") {
-    throw new Error("Knowledge Base integrity_failure: malformed result.");
+  allowed: readonly string[],
+  dependencies: readonly string[] = DEPENDENCIES,
+): FailureTag | undefined => {
+  if (!rec(value) || typeof value._tag !== "string") return;
+  if (value._tag === "dependency_unavailable") {
+    return exact(value, ["_tag", "dependency"]) &&
+      typeof value.dependency === "string" &&
+      dependencies.includes(value.dependency)
+      ? (value._tag as FailureTag)
+      : undefined;
   }
-
-  if (result.ok) {
-    if (!hasExactKeys(result, ["ok", "value"])) {
-      throw new Error("Knowledge Base integrity_failure: malformed result.");
-    }
-    const value = parseValue(result.value);
-    if (value === undefined) {
-      throw new Error("Knowledge Base integrity_failure: malformed value.");
-    }
-    return { ok: true, value };
-  }
-
+  return exact(value, ["_tag"]) && allowed.includes(value._tag)
+    ? (value._tag as FailureTag)
+    : undefined;
+};
+const observation = (title: string, description: string) => ({
+  title,
+  description,
+  prohibitAllSharing: true,
+});
+function summary(v: unknown): Summary | undefined {
   if (
-    !hasExactKeys(result, ["ok", "error"]) ||
-    !isRecord(result.error) ||
-    (!hasExactKeys(result.error, ["code"]) &&
-      !hasExactKeys(result.error, ["code", "revisionId"])) ||
-    typeof result.error.code !== "string" ||
-    !KNOWLEDGE_ERROR_CODES.has(result.error.code) ||
-    (Object.prototype.hasOwnProperty.call(result.error, "revisionId") &&
-      (typeof result.error.revisionId !== "string" ||
-        !CANONICAL_UUID.test(result.error.revisionId)))
-  ) {
-    throw new Error("Knowledge Base integrity_failure: malformed error.");
+    !rec(v) ||
+    !exact(v, [
+      "knowledgeId",
+      "generation",
+      "displayName",
+      "role",
+      "state",
+      "createdAt",
+      "updatedAt",
+    ]) ||
+    !uuid(v.knowledgeId) ||
+    v.generation !== 1 ||
+    !visible(v.displayName, 120) ||
+    !(["initial", "additional"] as unknown[]).includes(v.role) ||
+    !(["provisioning", "ready", "blocked"] as unknown[]).includes(v.state) ||
+    !time(v.createdAt) ||
+    !time(v.updatedAt)
+  )
+    return;
+  return v as Summary;
+}
+function page(v: unknown, limit: number): Summary[] | undefined {
+  if (
+    !rec(v) ||
+    !(
+      exact(v, ["_tag", "items"]) || exact(v, ["_tag", "items", "nextCursor"])
+    ) ||
+    v._tag !== "page" ||
+    !Array.isArray(v.items) ||
+    v.items.length > Math.min(limit, MAX_PAGE) ||
+    (Object.prototype.hasOwnProperty.call(v, "nextCursor") &&
+      v.nextCursor !== null &&
+      (typeof v.nextCursor !== "string" ||
+        !v.nextCursor.length ||
+        new TextEncoder().encode(v.nextCursor).byteLength > 256 ||
+        !/^[A-Za-z0-9_-]+$/u.test(v.nextCursor)))
+  )
+    return;
+  const out: Summary[] = [];
+  for (const x of v.items) {
+    const s = summary(x);
+    if (!s) return;
+    out.push(s);
   }
-
-  return {
-    ok: false,
-    error: {
-      code: result.error.code,
-      ...(typeof result.error.revisionId === "string"
-        ? { revisionId: result.error.revisionId }
-        : {}),
-    },
-  };
+  return out;
 }
-
-function unwrapKnowledgeResult<T>(
-  result: unknown,
-  parseValue: (value: unknown) => T | undefined,
-): T {
-  const validated = validateKnowledgeResult(result, parseValue);
-  if (validated.ok) return validated.value;
-
-  const revisionId = validated.error.revisionId
-    ? " (" + validated.error.revisionId + ")"
-    : "";
-  throw new Error("Knowledge Base " + validated.error.code + revisionId + ".");
+function revision(
+  v: unknown,
+  e: { knowledgeId: string; sourceId: string; revisionId?: string },
+): Revision | undefined {
+  if (
+    !rec(v) ||
+    !exact(v, [
+      "knowledgeId",
+      "generation",
+      "sourceId",
+      "revisionId",
+      "revisionNumber",
+      "baseRevisionId",
+      "document",
+      "contentHash",
+      "type",
+      "title",
+      "description",
+      "provenance",
+      "committedAt",
+    ]) ||
+    v.knowledgeId !== e.knowledgeId ||
+    v.generation !== 1 ||
+    v.sourceId !== e.sourceId ||
+    (e.revisionId !== undefined && v.revisionId !== e.revisionId) ||
+    !uuid(v.revisionId) ||
+    v.revisionNumber !== 1 ||
+    (v.baseRevisionId !== null && !uuid(v.baseRevisionId)) ||
+    !documentText(v.document, MAX_DOC) ||
+    typeof v.contentHash !== "string" ||
+    !/^[0-9a-f]{64}$/u.test(v.contentHash) ||
+    v.type !== "Source" ||
+    !projectionText(v.title, 256) ||
+    !projectionText(v.description, 1024) ||
+    !rec(v.provenance) ||
+    !exact(v.provenance, ["sourceKind", "reference", "capturedAt"]) ||
+    !(
+      ["conversation", "user_document", "explicit_user_input"] as unknown[]
+    ).includes(v.provenance.sourceKind) ||
+    !visible(v.provenance.reference, 512) ||
+    !time(v.provenance.capturedAt) ||
+    !time(v.committedAt)
+  )
+    return;
+  return v as Revision;
 }
-
-function normalizedQuery(query: string): string {
-  return query.normalize("NFKC").trim().toLowerCase();
-}
-
 export function describeCustomVendor(): VendorDescription {
   return {
     displayName: "Custom Gatekeeper",
@@ -507,7 +284,6 @@ export function describeCustomVendor(): VendorDescription {
     providesAuth: false,
   };
 }
-
 export function describeCustomAccount(): AccountDescription {
   return {
     displayName: "Knowledge Base",
@@ -515,251 +291,222 @@ export function describeCustomAccount(): AccountDescription {
     singleton: { tsType: "KnowledgeBase" },
   };
 }
-
 @validateRpc()
-export class KnowledgeSession extends RpcTarget implements KnowledgeBase {
-  readonly #approvalQueue: ProposalQueue;
-  readonly #access: ManagerKnowledgeAccessV1;
-  readonly #propose: ProposalHandler | undefined;
-
-  constructor(
-    approvalQueue: ProposalQueue,
-    access: ManagerKnowledgeAccessV1,
-    propose?: ProposalHandler,
-  ) {
+export class Knowledge extends RpcTarget {
+  readonly #q: RpcStub<ApprovalQueue>;
+  readonly #a: Access;
+  readonly #id: string;
+  readonly #g: 1;
+  #disposed = false;
+  constructor(q: RpcStub<ApprovalQueue>, a: Access, id: string, g: 1) {
     super();
-    this.#approvalQueue = approvalQueue;
-    this.#access = access;
-    this.#propose = propose;
+    this.#q = q;
+    this.#a = a;
+    this.#id = id;
+    this.#g = g;
   }
-
-  async list(options?: KnowledgePageOptions): Promise<KnowledgePage> {
-    const page = unwrapKnowledgeResult(
-      await this.#access.list(options),
-      parseKnowledgePage,
-    );
-    await this.#approvalQueue.authorizeObservation({
-      title: "Knowledge Base list",
-      description: "Listed " + page.items.length + " current Knowledge Base source(s).",
-    });
-    return page;
-  }
-
-  async search(query: string, options?: KnowledgePageOptions): Promise<KnowledgePage> {
-    const page = unwrapKnowledgeResult(
-      await this.#access.search(query, options),
-      parseKnowledgePage,
-    );
-    await this.#approvalQueue.authorizeObservation({
-      title: "Knowledge Base search",
-      description:
-        "Searched the Knowledge Base for " +
-        normalizedQuery(query) +
-        ". Returned " +
-        page.items.length +
-        " current source(s).",
-    });
-    return page;
-  }
-
-  async read(revisionId: string): Promise<KnowledgeSource> {
-    const source = unwrapKnowledgeResult(
-      await this.#access.read(revisionId),
-      parseKnowledgeSource,
-    );
-    await this.#approvalQueue.authorizeObservation({
-      title: "Knowledge Base read",
-      description:
-        "Read current Knowledge Base source " +
-        source.documentKey +
-        " (" +
-        source.revisionId +
-        ").",
-    });
-    return source;
-  }
-
-  async proposeUpdate(input: KnowledgeProposalInput): Promise<void> {
-    if (this.#propose === undefined) {
-      throw gatekeeperError("integrity_failure");
+  async readBronze(i: BronzeInput): Promise<Revision | null> {
+    if (
+      !rec(i) ||
+      !exact(
+        i,
+        i.revisionId === undefined ? ["sourceId"] : ["sourceId", "revisionId"],
+      ) ||
+      !uuid(i.sourceId) ||
+      (i.revisionId !== undefined && !uuid(i.revisionId))
+    )
+      throw err("invalid_input");
+    let raw: unknown;
+    try {
+      raw = await this.#a.readBronze({
+        ...i,
+        knowledgeId: this.#id,
+        generation: this.#g,
+      });
+    } catch {
+      throw err("dependency_unavailable");
     }
-    return this.#propose(input);
-  }
+    if (!rec(raw)) throw err("integrity_failure");
+    if (exact(raw, ["_tag"]) && raw._tag === "not_found") {
+      await this.#q.authorizeObservation(
+        observation(
+          "Knowledge Bronze read",
+          "Read returned no matching Bronze source.",
+        ),
+      );
+      return null;
+    }
 
-  [Symbol.dispose](): void {
-    this.#approvalQueue[Symbol.dispose]?.();
+    const failureTag = failure(raw, BRONZE_FAILURE_TAGS);
+    if (failureTag !== undefined) {
+      await this.#q.authorizeObservation(
+        observation("Knowledge Bronze read", "Read returned a safe failure."),
+      );
+      throw err(failureTag);
+    }
+    if (!exact(raw, ["_tag", "revision"]) || raw._tag !== "found")
+      throw err("integrity_failure");
+    const r = revision(raw.revision, {
+      knowledgeId: this.#id,
+      sourceId: i.sourceId,
+      revisionId: i.revisionId,
+    });
+    if (!r) throw err("integrity_failure");
+    const digest = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(r.document),
+    );
+    const hash = Array.from(new Uint8Array(digest), (b) =>
+      b.toString(16).padStart(2, "0"),
+    ).join("");
+    if (hash !== r.contentHash) throw err("integrity_failure");
+    await this.#q.authorizeObservation(
+      observation("Knowledge Bronze read", "Read one Knowledge Bronze source."),
+    );
+    return r;
   }
+  [Symbol.dispose]() {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    this.#q[Symbol.dispose]?.();
+  }
+}
+@validateRpc()
+export class KnowledgeSession extends RpcTarget {
+  readonly #q: RpcStub<ApprovalQueue>;
+  readonly #a: Access;
+  readonly #h = new Set<Knowledge>();
+  #disposed = false;
+  constructor(q: RpcStub<ApprovalQueue>, a: Access) {
+    super();
+    this.#q = q;
+    this.#a = a;
+  }
+  async list(o?: ListInput): Promise<Page> {
+    if (
+      o !== undefined &&
+      (!rec(o) ||
+        Object.keys(o).some((k) => k !== "cursor" && k !== "limit") ||
+        (o.cursor !== undefined &&
+          (typeof o.cursor !== "string" ||
+            !/^[A-Za-z0-9_-]+$/u.test(o.cursor) ||
+            new TextEncoder().encode(o.cursor).byteLength > 256)) ||
+        (o.limit !== undefined &&
+          (!Number.isInteger(o.limit) || o.limit < 1 || o.limit > 50)))
+    )
+      throw err("invalid_input");
+    const limit = o?.limit ?? 20;
+    let raw: unknown;
+    try {
+      raw = await this.#a.list(o);
+    } catch {
+      throw err("dependency_unavailable");
+    }
+    if (!rec(raw)) throw err("integrity_failure");
+
+    const failureTag = failure(raw, LIST_FAILURE_TAGS, LIST_DEPENDENCIES);
+    if (failureTag !== undefined) {
+      await this.#q.authorizeObservation(
+        observation("Knowledge Base catalog", "Listed a safe Knowledge result."),
+      );
+      throw err(failureTag);
+    }
+    if (raw._tag !== "page") throw err("integrity_failure");
+    const ss = page(raw, limit);
+    if (!ss) throw err("integrity_failure");
+    const items: Page["items"] = [];
+    const created: Knowledge[] = [];
+    for (const s of ss) {
+      if (s.state === "ready") {
+        let h: Knowledge;
+        try {
+          h = new Knowledge(
+            this.#q.dup(),
+            this.#a,
+            s.knowledgeId,
+            s.generation,
+          );
+        } catch {
+          for (const createdHandle of created) {
+            this.#h.delete(createdHandle);
+            try {
+              createdHandle[Symbol.dispose]();
+            } catch {
+              // Preserve the capability error.
+            }
+          }
+          throw err("dependency_unavailable");
+        }
+        this.#h.add(h);
+        created.push(h);
+        items.push({ ...s, access: h });
+      } else items.push(s);
+    }
+    try {
+      await this.#q.authorizeObservation(
+        observation(
+          "Knowledge Base catalog",
+          "Listed " + items.length + " Knowledge summaries.",
+        ),
+      );
+    } catch (cause) {
+      for (const createdHandle of created) {
+        this.#h.delete(createdHandle);
+        try {
+          createdHandle[Symbol.dispose]();
+        } catch {
+          // Preserve the authorization error.
+        }
+      }
+      throw cause;
+    }
+    return {
+      items,
+      nextCursor: (raw.nextCursor as string | undefined) ?? null,
+    };
+  }
+  [Symbol.dispose]() {
+    if (this.#disposed) return;
+    this.#disposed = true;
+    for (const h of this.#h) {
+      try {
+        h[Symbol.dispose]();
+      } catch {
+        // Disposal is best effort after the session has ended.
+      }
+    }
+    this.#h.clear();
+    try {
+      this.#q[Symbol.dispose]?.();
+    } catch {
+      // Disposal is best effort after the session has ended.
+    }
+  }
+}
+type Props = KnowledgeAccountProps;
+function isManagerId(v: unknown): v is string {
+  return typeof v === "string" && UUID.test(v);
+}
+function legacyProps(v: unknown): boolean {
+  return v === undefined || (rec(v) && Object.keys(v).length === 0);
+}
+function validateProps(v: unknown): Props {
+  if (!rec(v) || !exact(v, ["access"]) || !v.access)
+    throw new TypeError("Knowledge Account props must contain only access.");
+  return { access: validateStub<Access>(v.access as object) };
 }
 
 @validateRpc()
 export class CustomGatekeeper
-  extends DurableObject<Cloudflare.Env, KnowledgeGatekeeperProps>
+  extends DurableObject<Cloudflare.Env, Props>
   implements Gatekeeper<KnowledgeBase>
 {
-  readonly #actionTails = new Map<number, Promise<void>>();
-
-  #access(): ManagerKnowledgePrivateAccessV1 {
-    return validateKnowledgeAccountProps(this.ctx.props as unknown).access;
+  #access() {
+    const p = this.ctx.props as unknown;
+    if (!rec(p) || !exact(p, ["access"]) || !p.access)
+      throw new TypeError("Knowledge Account props must contain only access.");
+    return validateStub<Access>(p.access as object);
   }
-
-  async saveConversationContext(
-    input: ConversationContextSaveInput,
-  ): Promise<KnowledgeResult<KnowledgeReference>> {
-    return validateKnowledgeResult(
-      await this.#access().saveConversationContext(input),
-      parseKnowledgeReference,
-    );
-  }
-
-  async readCurrentConversationContext(): Promise<
-    KnowledgeResult<KnowledgeSource | null>
-  > {
-    return validateKnowledgeResult(
-      await this.#access().readCurrentConversationContext(),
-      parseNullableKnowledgeSource,
-    );
-  }
-
-  async readConversationContextRevision(
-    revisionId: string,
-  ): Promise<KnowledgeResult<KnowledgeSource>> {
-    return validateKnowledgeResult(
-      await this.#access().readConversationContextRevision(revisionId),
-      parseKnowledgeSource,
-    );
-  }
-
-  #readActionRecord(actionId: number): KnowledgeActionRecord {
-    return parseKnowledgeActionRecord(this.ctx.storage.kv.get<unknown>(actionKey(actionId)));
-  }
-
-  #stageAction(
-    proposal: KnowledgeProposal,
-    contentHash: string,
-    body: Uint8Array,
-  ): number {
-    const storedBody = body.buffer.slice(
-      body.byteOffset,
-      body.byteOffset + body.byteLength,
-    ) as ArrayBuffer;
-
-    return this.ctx.storage.transactionSync(() => {
-      const storedNext = this.ctx.storage.kv.get<unknown>(ACTION_COUNTER_KEY);
-      const nextActionId = nextKnowledgeActionId(storedNext);
-
-      this.ctx.storage.kv.put<PendingKnowledgeAction>(actionKey(nextActionId), {
-        state: "pending",
-        revisionId: proposal.revisionId,
-        documentKey: proposal.documentKey,
-        baseSourceRevisionId: proposal.baseSourceRevisionId,
-        contentHash,
-        body: storedBody,
-      });
-      this.ctx.storage.kv.put(ACTION_COUNTER_KEY, nextActionId + 1);
-      return nextActionId;
-    });
-  }
-
-  async #proposeUpdate(
-    approvalQueue: Pick<ApprovalQueue, "submitAction">,
-    input: KnowledgeProposalInput,
-  ): Promise<void> {
-    assertProposalInput(input);
-    const body = textBytes(input.content);
-    const proposal: KnowledgeProposal = {
-      revisionId: crypto.randomUUID(),
-      ...input,
-    };
-    const contentHash = await bytesToHash(body);
-    const actionId = this.#stageAction(proposal, contentHash, body);
-
-    try {
-      await approvalQueue.submitAction(actionId, {
-        title: "Knowledge Base update",
-        description: proposalDescription(proposal, contentHash),
-        awaitDecision: true,
-        autoApprovable: false,
-        implementsRevert: false,
-      });
-    } catch (error) {
-      this.ctx.storage.kv.delete(actionKey(actionId));
-      throw error;
-    }
-  }
-
-  #serializeAction(
-    actionId: number,
-    operation: () => Promise<void>,
-  ): Promise<void> {
-    const previous = this.#actionTails.get(actionId) ?? Promise.resolve();
-    const current = previous.catch(() => undefined).then(operation);
-    this.#actionTails.set(actionId, current);
-    return current.finally(() => {
-      if (this.#actionTails.get(actionId) === current) {
-        this.#actionTails.delete(actionId);
-      }
-    });
-  }
-
-  async #applyActionNow(actionId: number): Promise<void> {
-    const record = this.#readActionRecord(actionId);
-    if (record.state === "applied") return;
-    if (record.state === "rejected") throw gatekeeperError("integrity_failure");
-    if (record.state !== "pending") throw gatekeeperError("integrity_failure");
-
-    const body = new Uint8Array(record.body);
-    if (body.byteLength > MAX_BODY_BYTES) {
-      throw gatekeeperError("integrity_failure");
-    }
-    const contentHash = await bytesToHash(body);
-    if (contentHash !== record.contentHash) {
-      throw gatekeeperError("integrity_failure");
-    }
-
-    let content: string;
-    try {
-      content = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(body);
-    } catch {
-      throw gatekeeperError("integrity_failure");
-    }
-
-    const reference = unwrapKnowledgeResult(
-      await this.#access().applyProposal({
-        revisionId: record.revisionId,
-        documentKey: record.documentKey,
-        baseSourceRevisionId: record.baseSourceRevisionId,
-        content,
-      }),
-      parseKnowledgeReference,
-    );
-    if (
-      reference.revisionId !== record.revisionId ||
-      reference.documentKey !== record.documentKey ||
-      reference.contentHash !== record.contentHash
-    ) {
-      throw gatekeeperError("integrity_failure");
-    }
-
-    this.ctx.storage.kv.put<KnowledgeActionTombstone>(actionKey(actionId), {
-      state: "applied",
-    });
-  }
-
-  async #rejectActionNow(actionId: number): Promise<void> {
-    const record = this.#readActionRecord(actionId);
-    if (record.state === "rejected") return;
-    if (record.state === "applied") throw gatekeeperError("integrity_failure");
-    if (record.state !== "pending") throw gatekeeperError("integrity_failure");
-
-    unwrapKnowledgeResult(
-      await this.#access().cancelProposal(record.revisionId),
-      (value) => (value === null ? null : undefined),
-    );
-    this.ctx.storage.kv.put<KnowledgeActionTombstone>(actionKey(actionId), {
-      state: "rejected",
-    });
-  }
-
   async describe(): Promise<ResourceDescription> {
     return {
       url: "knowledge://current",
@@ -769,70 +516,66 @@ export class CustomGatekeeper
       tsType: "KnowledgeBase",
     };
   }
-
   async getTypeScriptTypes(): Promise<string> {
     return TYPES_CODE;
   }
-
   async getAutoApprovableActions(): Promise<[]> {
     return [];
   }
-
-  async startSession(approvalQueue: RpcStub<ApprovalQueue>): Promise<KnowledgeSession> {
-    const queue = approvalQueue.dup();
-    return new KnowledgeSession(
-      queue,
-      this.#access(),
-      (input) => this.#proposeUpdate(queue, input),
-    );
+  async startSession(q: RpcStub<ApprovalQueue>) {
+    const access = this.#access();
+    const queue = q.dup();
+    try {
+      return new KnowledgeSession(queue, access);
+    } catch (cause) {
+      try {
+        queue[Symbol.dispose]?.();
+      } catch {
+        // Preserve the constructor failure while still attempting ownership cleanup.
+      }
+      throw cause;
+    }
   }
-
   async getAgentCatalog(
-    request: AgentCatalogRequest,
-    authorizer: RpcStub<ObservationAuthorizer>,
+    r: AgentCatalogRequest,
+    a: RpcStub<ObservationAuthorizer>,
   ): Promise<AgentCatalog> {
-    const catalog = boundAgentCatalog(
+    const c = boundAgentCatalog(
       [
         {
           id: "knowledge-base",
           title: "Knowledge Base",
-          description: "Available. Use list, search, and read when you need current knowledge.",
+          description:
+            "Available. Use list to inspect current Knowledge summaries.",
         },
       ],
-      request,
+      r,
     );
-    await authorizer.authorizeObservation({
-      title: "Knowledge Base catalog",
-      description:
-        "Listed " +
-        catalog.entries.length +
-        " Knowledge Base catalog entr" +
-        (catalog.entries.length === 1 ? "y." : "ies."),
-    });
-    return catalog;
+    await a.authorizeObservation(
+      observation(
+        "Knowledge Base catalog",
+        "Listed " + c.entries.length + " Knowledge Base catalog entries.",
+      ),
+    );
+    return c;
   }
-
-  async addObserver(_id: string, _user: Fetcher<GatekeeperUserVerifier>): Promise<void> {
+  async addObserver(
+    _observerId: string,
+    _user: Fetcher<GatekeeperUserVerifier>,
+  ) {
     throw new Error("Knowledge Base is private to its Manager.");
   }
-
-  async removeObserver(_id: string): Promise<void> {}
-
-  async applyAction(action: number): Promise<void> {
-    assertKnowledgeActionId(action);
-    return this.#serializeAction(action, () => this.#applyActionNow(action));
+  async removeObserver() {}
+  async applyAction() {
+    throw err("invalid_input");
   }
-
-  async rejectAction(action: number): Promise<void> {
-    assertKnowledgeActionId(action);
-    return this.#serializeAction(action, () => this.#rejectActionNow(action));
+  async rejectAction() {
+    throw err("invalid_input");
   }
-
-  async revertAction(_action: number): Promise<void> {
-    throw new Error("Knowledge Base requires a new proposal to change a previous update.");
+  async revertAction() {
+    throw err("invalid_input");
   }
 }
-
 @validateRpc()
 export class CustomAccount
   extends WorkerEntrypoint<Cloudflare.Env>
@@ -841,93 +584,85 @@ export class CustomAccount
   async describe(): Promise<AccountDescription> {
     return describeCustomAccount();
   }
-
-  async inspectManagerBinding(managerId: string): Promise<"legacy" | "bound"> {
-    assertManagerId(managerId);
-    if (isLegacyAccountProps(this.ctx.props)) return "legacy";
-    const props = validateKnowledgeAccountProps(this.ctx.props as unknown);
-    await props.access.assertBoundTo(managerId);
+  async inspectManagerBinding(
+    managerIdValue: string,
+  ): Promise<"legacy" | "bound"> {
+    if (!isManagerId(managerIdValue))
+      throw new TypeError("Manager ID must be a UUID.");
+    if (legacyProps(this.ctx.props)) return "legacy";
+    const p = validateProps(this.ctx.props);
+    await p.access.assertBoundTo(managerIdValue);
     return "bound";
   }
-
-  async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<KnowledgeBase>>> {
-    const rawProps = this.ctx.props as unknown;
-    validateKnowledgeAccountProps(rawProps);
-    // Preserve the native ServiceStub; the validation wrapper is not persistable through ctx.exports.
-    return this.ctx.exports.CustomGatekeeper({
-      props: rawProps as KnowledgeGatekeeperProps,
-    });
+  async getSingletonGatekeeperClass(): Promise<
+    DurableObjectClass<Gatekeeper<KnowledgeBase>>
+  > {
+    const p = this.ctx.props as unknown;
+    validateProps(p);
+    return this.ctx.exports.CustomGatekeeper({ props: p as Props });
   }
-
   async getSupportedResources(): Promise<SupportedResource[]> {
     return [];
   }
-
-  getGatekeeperClassFor(_url: string): never {
+  getGatekeeperClassFor(): never {
     throw new Error("Knowledge Base has no URL-addressed resources.");
   }
-
-  startResourceConfigurator(_resourceUrlPattern: string): Promise<ResourceConfiguratorFrame> {
+  startResourceConfigurator(): Promise<ResourceConfiguratorFrame> {
     throw new Error("Knowledge Base has no URL-addressed resources.");
   }
-
-  async ensureResources(_resourceUrlPatterns: string[]): Promise<{ url?: string }> {
+  async ensureResources() {
     return {};
   }
-
-  async revoke(): Promise<void> {}
-
+  async revoke() {}
   reconnect(): Promise<{ url: string }> {
     throw new Error("Knowledge Base has no credentials to reconnect.");
   }
-
-  async getAuthenticatedEmail(): Promise<string | null> {
+  async getAuthenticatedEmail() {
     return null;
   }
-
-  @skipRpcValidation()
-  async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
+  @skipRpcValidation() async getVerifier(): Promise<
+    Fetcher<GatekeeperUserVerifier>
+  > {
     return this.ctx.exports.CustomVerifier({});
   }
 }
-
 @validateRpc()
 export class CustomVerifier
   extends WorkerEntrypoint<Cloudflare.Env>
   implements GatekeeperUserVerifier
 {
-  verify(): void {}
+  verify() {}
 }
-
 @validateRpc()
 export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
-  async describe(): Promise<VendorDescription> {
+  async describe() {
     return describeCustomVendor();
   }
-
-  @skipRpcValidation()
-  async createManagerAccount(
+  @skipRpcValidation() async createManagerAccount(
     managerId: string,
-    capability: ManagerKnowledgePrivateAccessV1,
+    capability: Access,
   ): Promise<Fetcher<GatekeeperUser>> {
-    assertManagerId(managerId);
-    const access = validateStub<ManagerKnowledgePrivateAccessV1>(capability as object);
-    await access.assertBoundTo(managerId);
+    if (!isManagerId(managerId))
+      throw new TypeError("Manager ID must be a UUID.");
+    const a = validateStub<Access>(capability as object);
+    await a.assertBoundTo(managerId);
     return this.ctx.exports.CustomAccount({ props: { access: capability } });
   }
-
   connectAccount(
-    _callback: Fetcher<GatekeeperConnectCallback>,
-    _options?: GatekeeperConnectOptions,
+    _c: Fetcher<GatekeeperConnectCallback>,
+    _o?: GatekeeperConnectOptions,
   ): Promise<{ url: string }> {
-    throw new Error("Knowledge Base is installed by the Manager runtime and has no connect flow.");
+    throw new Error(
+      "Knowledge Base is installed by the Manager runtime and has no connect flow.",
+    );
   }
-
-  async getSupportedResources(_options?: { userId?: string }): Promise<SupportedResource[]> {
+  async getSupportedResources(): Promise<SupportedResource[]> {
     return [];
   }
-
   async getTypeScriptTypes(): Promise<string> {
     return TYPES_CODE;
   }
 }
+export type KnowledgeBase = {
+  list(options?: { cursor?: string; limit?: number }): Promise<Page>;
+};

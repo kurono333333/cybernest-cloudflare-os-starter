@@ -1,694 +1,633 @@
 import { env } from "cloudflare:workers";
+import type { RpcStub } from "cloudflare:workers";
+import type {
+  ApprovalQueue,
+  ObservationDescription,
+} from "@gadgets/workshop-shared/gatekeeper";
 import { describe, expect, it } from "vitest";
+import TYPES_CODE from "../src/types-code.js";
 import {
+  Knowledge,
   KnowledgeSession,
-  assertKnowledgeActionId,
   describeCustomAccount,
   describeCustomVendor,
-  nextKnowledgeActionId,
-  parseKnowledgeActionRecord,
 } from "../src/custom.js";
-import TYPES_CODE from "../src/types-code.js";
 
-const VALID_REVISION_ID = "44444444-4444-4444-8444-444444444444";
-const VALID_CONTENT_HASH = "a".repeat(64);
-const PENDING_ACTION_KEYS = [
-  "baseSourceRevisionId",
-  "body",
-  "contentHash",
-  "documentKey",
-  "revisionId",
-  "state",
-];
-const APPLIED_TOMBSTONE = {
-  state: "applied",
-  keys: ["state"],
-  bodyByteLength: null,
-};
-const REJECTED_TOMBSTONE = {
-  state: "rejected",
-  keys: ["state"],
-  bodyByteLength: null,
+const KNOWLEDGE_ID = "44444444-4444-4444-8444-444444444444";
+const OTHER_KNOWLEDGE_ID = "54444444-4444-4444-8444-444444444444";
+const SOURCE_ID = "74444444-4444-4444-8444-444444444444";
+const REVISION_ID = "84444444-8444-4444-8444-444444444444";
+const NOW = "2026-01-01T00:00:00.000Z";
+
+type ListInput = { cursor?: string; limit?: number };
+type BronzeInput = { sourceId: string; revisionId?: string };
+type FakeAccess = {
+  list(input?: ListInput): Promise<unknown>;
+  readBronze(input: Record<string, unknown>): Promise<unknown>;
 };
 
-type TestWorkerExports = {
-  TEST_FACTORY: DurableObjectNamespace<{
-    runProposal(managerId: string, content?: string): Promise<{
-      submission: { action: number; description: Record<string, unknown> };
-      proposalCallCount: number;
-      proposalContent: string;
-    }>;
-    runCatalog(managerId: string, limit: number): Promise<{
-      catalog: {entries: Array<{id: string; title: string; description: string}>; truncated?: boolean};
-      observations: unknown[];
-    }>;
-    runConversationBridge(
-      managerId: string,
-      mode?: "valid" | "extra" | "malformed" | "missing",
-    ): Promise<Record<string, unknown>>;
-    runConversationMethod(
-      managerId: string,
-      method: "save" | "current" | "historical",
-      mode?: "valid" | "extra" | "malformed" | "missing",
-    ): Promise<string | null>;
-    runAccountScenario(managerId: string): Promise<Record<string, unknown>>;
-    runActionScenario(
-      managerId: string,
-      scenario: string,
-    ): Promise<Record<string, unknown>>;
-  }>;
+const summary = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  knowledgeId: KNOWLEDGE_ID,
+  generation: 1,
+  displayName: "Initial Knowledge",
+  role: "initial",
+  state: "ready",
+  createdAt: NOW,
+  updatedAt: NOW,
+  ...overrides,
+});
+
+const revision = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+  knowledgeId: KNOWLEDGE_ID,
+  generation: 1,
+  sourceId: SOURCE_ID,
+  revisionId: REVISION_ID,
+  revisionNumber: 1,
+  baseRevisionId: null,
+  document: "# K",
+  contentHash:
+    "896969cf655830641e58e58c011508ac9d3e7ff9cfbd87d3152a41347949b582",
+  type: "Source",
+  title: "Knowledge",
+  description: "Description",
+  provenance: {
+    sourceKind: "explicit_user_input",
+    reference: "fixture",
+    capturedAt: NOW,
+  },
+  committedAt: NOW,
+  ...overrides,
+});
+
+class FakeQueue {
+  readonly observations: ObservationDescription[] = [];
+  duplicateCount = 0;
+  disposeCount = 0;
+  reject = false;
+
+  async authorizeObservation(description: ObservationDescription): Promise<void> {
+    this.observations.push({ ...description });
+    if (this.reject) throw new Error("observation denied");
+  }
+
+  dup(): FakeQueue {
+    this.duplicateCount += 1;
+    return this;
+  }
+
+  [Symbol.dispose](): void {
+    this.disposeCount += 1;
+  }
+}
+
+class FakeAccessImpl implements FakeAccess {
+  listResult: unknown = { _tag: "page", items: [] };
+  bronzeResult: unknown = { _tag: "not_found" };
+  listError: Error | null = null;
+  bronzeError: Error | null = null;
+  readonly listInputs: Array<ListInput | undefined> = [];
+  readonly bronzeInputs: Array<Record<string, unknown>> = [];
+
+  async list(input?: ListInput): Promise<unknown> {
+    this.listInputs.push(input);
+    if (this.listError !== null) throw this.listError;
+    return this.listResult;
+  }
+
+  async readBronze(input: Record<string, unknown>): Promise<unknown> {
+    this.bronzeInputs.push({ ...input });
+    if (this.bronzeError !== null) throw this.bronzeError;
+    return this.bronzeResult;
+  }
+}
+
+const newSession = (
+  queue: FakeQueue,
+  access: FakeAccessImpl,
+): KnowledgeSession =>
+  new KnowledgeSession(
+    queue as unknown as RpcStub<ApprovalQueue>,
+    access as unknown as never,
+  );
+
+const newHandle = async (
+  queue: FakeQueue,
+  access: FakeAccessImpl,
+  item: Record<string, unknown> = summary(),
+): Promise<Knowledge> => {
+  access.listResult = { _tag: "page", items: [item] };
+  const result = await newSession(queue, access).list();
+  const handle = result.items[0]?.access;
+  if (handle === undefined) throw new Error("Expected a ready Knowledge handle.");
+  return handle;
 };
 
-describe("custom-gatekeeper", () => {
-  it("describes a private Knowledge singleton without advertising ambient provisioning", () => {
+describe("S14 public surface and descriptions", () => {
+  it("publishes a private Knowledge Base singleton with exact metadata", () => {
+    expect(describeCustomAccount()).toEqual({
+      displayName: "Knowledge Base",
+      avatar: expect.objectContaining({ url: expect.stringContaining("data:image/svg+xml") }),
+      singleton: { tsType: "KnowledgeBase" },
+    });
     expect(describeCustomVendor()).toMatchObject({
       displayName: "Custom Gatekeeper",
       providesAuth: false,
     });
-    expect(describeCustomVendor()).not.toHaveProperty("autoProvisionsAccount");
-    expect(describeCustomAccount()).toMatchObject({
-      displayName: "Knowledge Base",
-      singleton: { tsType: "KnowledgeBase" },
-    });
   });
 
-  it("accepts only the exact Manager-bound Account props and the legacy no-props shape", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m05-02-account-props");
-    const result = await factory.runAccountScenario(crypto.randomUUID());
-
-    expect(result).toMatchObject({
-      bound: "bound",
-      legacyUndefined: "legacy",
-      legacyEmpty: "legacy",
-      displayName: "Knowledge Base",
-      singletonType: "KnowledgeBase",
-      missingError: expect.stringMatching(/only access/u),
-      extraError: expect.stringMatching(/only access/u),
-      malformedError: expect.stringMatching(/RPC stub/u),
-      mismatchError: expect.stringMatching(/wrong manager/u),
-      rpcError: expect.stringMatching(/test capability unavailable/u),
-      connectError: expect.stringMatching(/no connect flow/u),
-      supportedResources: [],
-    });
+  it("keeps only list on KnowledgeBase and readBronze on Knowledge", () => {
+    expect(TYPES_CODE).toContain("interface KnowledgeBase");
+    expect(TYPES_CODE).toContain("list(options?");
+    expect(TYPES_CODE).toContain("interface Knowledge");
+    expect(TYPES_CODE).toContain("readBronze(input");
+    expect(TYPES_CODE).not.toMatch(
+      /managerId|userId|targetName|raw|search\(|read\(|proposeUpdate\(/,
+    );
   });
+});
 
-  it("publishes only the four bounded KnowledgeBase methods", () => {
-    const knowledgeBase = TYPES_CODE.match(/interface KnowledgeBase \{(?<body>[\s\S]*?)\n\}/u);
-    expect(knowledgeBase?.groups?.body).toBeDefined();
-    const methods = [...(knowledgeBase?.groups?.body ?? "").matchAll(
-      /^\s{2}(\w+)\(/gmu,
-    )].map((match) => match[1]);
-    expect(methods).toEqual(["list", "search", "read", "proposeUpdate"]);
-    expect(TYPES_CODE).toContain("integer from 1 to 50; defaults to 20");
-    expect(TYPES_CODE).toContain("at most 256 UTF-8 bytes");
-    expect(TYPES_CODE).toContain("1–255 UTF-8 bytes");
-    expect(TYPES_CODE).toContain("at most 1 MiB");
-    expect(TYPES_CODE).not.toContain("managerId");
-    expect(TYPES_CODE).not.toContain("userId");
-  });
-
-  it("forwards private conversation methods without expanding the Agent KnowledgeBase", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m07-02-conversation-bridge");
-
-    await expect(factory.runConversationBridge(crypto.randomUUID())).resolves.toEqual({
-      save: {
-        ok: true,
-        value: {
-          revisionId: VALID_REVISION_ID,
-          documentKey: "conversation-context",
-          contentHash: VALID_CONTENT_HASH,
-        },
-      },
-      current: {
-        ok: true,
-        value: {
-          revisionId: VALID_REVISION_ID,
-          documentKey: "conversation-context",
-          contentHash: VALID_CONTENT_HASH,
-          content: "# Conversation\n",
-        },
-      },
-      historical: {
-        ok: true,
-        value: {
-          revisionId: VALID_REVISION_ID,
-          documentKey: "conversation-context",
-          contentHash: VALID_CONTENT_HASH,
-          content: "# Conversation\n",
-        },
-      },
-    });
-    await expect(
-      factory.runConversationBridge(crypto.randomUUID(), "missing"),
-    ).resolves.toEqual({
-      save: {
-        ok: true,
-        value: {
-          revisionId: VALID_REVISION_ID,
-          documentKey: "conversation-context",
-          contentHash: VALID_CONTENT_HASH,
-        },
-      },
-      current: {ok: true, value: null},
-      historical: {
-        ok: true,
-        value: {
-          revisionId: VALID_REVISION_ID,
-          documentKey: "conversation-context",
-          contentHash: VALID_CONTENT_HASH,
-          content: "# Conversation\n",
-        },
-      },
-    });
-
-    for (const method of ["save", "current", "historical"] as const) {
-      await expect(
-        factory.runConversationMethod(crypto.randomUUID(), method, "extra"),
-      ).resolves.toBe("Knowledge Base integrity_failure: malformed value.");
-      await expect(
-        factory.runConversationMethod(crypto.randomUUID(), method, "malformed"),
-      ).resolves.toBe("Knowledge Base integrity_failure: malformed error.");
-    }
-  });
-
-  it("bounds the native Agent catalog and authorizes only its count", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m05-02-catalog");
-
-    const hidden = await factory.runCatalog(crypto.randomUUID(), 0);
-    expect(hidden.catalog).toEqual({entries: [], truncated: true});
-    expect(hidden.observations).toEqual([
-      expect.objectContaining({
-        title: "Knowledge Base catalog",
-        description: "Listed 0 Knowledge Base catalog entries.",
-      }),
-    ]);
-
-    const visible = await factory.runCatalog(crypto.randomUUID(), 1);
-    expect(visible.catalog).toEqual({
-      entries: [{
-        id: "knowledge-base",
-        title: "Knowledge Base",
-        description: "Available. Use list, search, and read when you need current knowledge.",
-      }],
-      truncated: false,
-    });
-    expect(JSON.stringify(visible.observations)).not.toContain("content");
-  });
-
-  it("passes a bounded proposal to the gatekeeper action boundary", async () => {
-    let received: unknown;
-    const session = new KnowledgeSession(
-      {
-        authorizeObservation: () => Promise.resolve(),
-        submitAction: () => Promise.resolve(),
-      },
-      {
-        list: async () => ({ ok: true as const, value: { items: [], nextCursor: null } }),
-        search: async () => ({ ok: true as const, value: { items: [], nextCursor: null } }),
-        read: async () => ({
-          ok: true as const,
-          value: {
-            revisionId: "44444444-4444-4444-8444-444444444444",
-            documentKey: "principles",
-            contentHash: "a".repeat(64),
-            content: "# Principles",
-          },
-        }),
-        assertBoundTo: async () => {},
-        applyProposal: async () => ({ ok: false as const, error: { code: "not_used" } }),
-        cancelProposal: async () => ({ ok: true as const, value: null }),
-      },
-      async (input) => {
-        received = input;
-      },
-    );
-
-    await session.proposeUpdate({
-      documentKey: "principles",
-      baseSourceRevisionId: null,
-      content: "# New principles",
-    });
-    expect(received).toEqual({
-      documentKey: "principles",
-      baseSourceRevisionId: null,
-      content: "# New principles",
-    });
-  });
-
-  it("rejects capability results that are not exact Agent projections", async () => {
-    let observationCount = 0;
-    const approvalQueue = {
-      authorizeObservation: async () => {
-        observationCount += 1;
-      },
-      submitAction: async () => {},
-    };
-    const makeAccess = (listResult: unknown, readResult: unknown) =>
-      ({
-        list: async () => listResult,
-        search: async () => ({ ok: true as const, value: { items: [], nextCursor: null } }),
-        read: async () => readResult,
-        assertBoundTo: async () => {},
-        applyProposal: async () => ({ ok: false as const, error: { code: "not_used" } }),
-        cancelProposal: async () => ({ ok: true as const, value: null }),
-      }) as ConstructorParameters<typeof KnowledgeSession>[1];
-
-    const extraReference = new KnowledgeSession(
-      approvalQueue,
-      makeAccess(
-        {
-          ok: true,
-          value: {
-            items: [
-              {
-                revisionId: VALID_REVISION_ID,
-                documentKey: "manager-principles",
-                contentHash: VALID_CONTENT_HASH,
-                userId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-              },
-            ],
-            nextCursor: null,
-          },
-        },
-        { ok: true, value: null },
-      ),
-    );
-
-    await expect(extraReference.list()).rejects.toThrow(/integrity_failure/u);
-
-    const extraEnvelope = new KnowledgeSession(
-      approvalQueue,
-      makeAccess(
-        { ok: true, value: { items: [], nextCursor: null }, managerId: "hidden" },
-        { ok: true, value: null },
-      ),
-    );
-    await expect(extraEnvelope.list()).rejects.toThrow(/integrity_failure/u);
-
-    const unknownError = new KnowledgeSession(
-      approvalQueue,
-      makeAccess(
-        { ok: true, value: { items: [], nextCursor: null } },
-        { ok: false, error: { code: "unknown_internal_code" } },
-      ),
-    );
-    await expect(unknownError.read(VALID_REVISION_ID)).rejects.toThrow(
-      /integrity_failure/u,
-    );
-    expect(observationCount).toBe(0);
-  });
-
-  it("accepts only the exact pending and state-only terminal record shapes", () => {
-    const pending = {
-      state: "pending" as const,
-      revisionId: VALID_REVISION_ID,
-      documentKey: "manager-principles",
-      baseSourceRevisionId: null,
-      contentHash: VALID_CONTENT_HASH,
-      body: new ArrayBuffer(0),
-    };
-
-    expect(parseKnowledgeActionRecord(pending)).toEqual(pending);
-    expect(() =>
-      parseKnowledgeActionRecord({ ...pending, userId: "hidden" }),
-    ).toThrow(/integrity_failure/u);
-    expect(() =>
-      parseKnowledgeActionRecord({ ...pending, body: new Uint8Array() }),
-    ).toThrow(/integrity_failure/u);
-    expect(() =>
-      parseKnowledgeActionRecord({ ...pending, version: 1 }),
-    ).toThrow(/integrity_failure/u);
-    expect(() =>
-      parseKnowledgeActionRecord({
-        ...pending,
-        body: new ArrayBuffer(1_048_577),
-      }),
-    ).toThrow(/integrity_failure/u);
-
-    expect(parseKnowledgeActionRecord({ state: "applied" })).toEqual({
-      state: "applied",
-    });
-    expect(parseKnowledgeActionRecord({ state: "rejected" })).toEqual({
-      state: "rejected",
-    });
-    expect(() =>
-      parseKnowledgeActionRecord({ state: "applied", version: 1 }),
-    ).toThrow(/integrity_failure/u);
-  });
-
-  it("applies the exact staged UTF-8 content, including a leading BOM, idempotently", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m05-03");
-    const result = await factory.runProposal(crypto.randomUUID());
-
-    expect(result.submission.description).toMatchObject({
-      awaitDecision: true,
-      autoApprovable: false,
-      implementsRevert: false,
-    });
-    expect(result.submission.description).not.toHaveProperty("actionKind");
-    expect(result.submission.description.description).toContain(
-      "Content hash (SHA-256):",
-    );
-    expect(result.proposalCallCount).toBe(1);
-    expect(result.proposalContent).toBe("\uFEFF# Approved principles");
-  });
-
-  it("keeps every approval preview line literal across CR, LF, and CRLF", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-card");
-    const content = "# title\r# injected\n[link](https://example.test)\r\n```";
-
-    const result = await factory.runProposal(crypto.randomUUID(), content);
-    const description = String(result.submission.description.description);
-
-    expect(result.proposalContent).toBe(content);
-    expect(description).toContain(
-      "Preview (first 2,000 Unicode code points):\n" +
-        "    # title\n" +
-        "    # injected\n" +
-        "    [link](https://example.test)\n" +
-        "    ```",
-    );
-    expect(description).not.toContain("\r");
-  });
-
-  it("round-trips an exact 1 MiB non-BMP action and leaves only an applied tombstone", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-one-mib");
-    const result = await factory.runActionScenario(
-      crypto.randomUUID(),
-      "one-mib-non-bmp",
-    );
-    expect(result.appliedContentByteLength).toBe(1_048_576);
-    expect(result.appliedContentHash).toBe(result.expectedHash);
-    expect(result.applyCalls).toBe(1);
-    expect(result.record).toMatchObject(APPLIED_TOMBSTONE);
-  });
-
-  it("keeps capacity and mismatched apply failures pending for the same correlated retry", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-apply-failures");
-
-    const capacity = await factory.runActionScenario(
-      crypto.randomUUID(),
-      "capacity-retry",
-    );
-    expect(capacity.firstError).toMatch(/capacity_exceeded/u);
-    expect(capacity.pendingAfterFailure).toMatchObject({
-      state: "pending",
-      keys: PENDING_ACTION_KEYS,
-      bodyByteLength: expect.any(Number),
-    });
-    expect(capacity.terminalRecord).toMatchObject(APPLIED_TOMBSTONE);
-    const correlations = capacity.correlations as Array<{
-      revisionId: string;
-      documentKey: string;
-    }>;
-    expect(correlations).toHaveLength(2);
-    expect(correlations[1]).toEqual(correlations[0]);
-
-    const mismatch = await factory.runActionScenario(
-      crypto.randomUUID(),
-      "mismatch-retry",
-    );
-    expect(mismatch.errors).toEqual([
-      expect.stringMatching(/integrity_failure/u),
-      expect.stringMatching(/integrity_failure/u),
-      expect.stringMatching(/integrity_failure/u),
-    ]);
-    expect(mismatch.applyCalls).toBe(4);
-    expect(mismatch.terminalRecord).toMatchObject(APPLIED_TOMBSTONE);
-    const mismatchCorrelations = mismatch.correlations as Array<{
-      revisionId: string;
-      documentKey: string;
-    }>;
-    expect(mismatchCorrelations).toHaveLength(4);
-    expect(new Set(mismatchCorrelations.map(({revisionId}) => revisionId)).size).toBe(1);
-    expect(new Set(mismatchCorrelations.map(({documentKey}) => documentKey)).size).toBe(1);
-  });
-
-  it("keeps reject terminal and cancellation-conflict semantics one-way", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-reject");
-
-    const rejected = await factory.runActionScenario(
-      crypto.randomUUID(),
-      "reject-terminal",
-    );
-    expect(rejected.applyAfterReject).toMatch(/integrity_failure/u);
-    expect(rejected.applyCalls).toBe(0);
-    expect(rejected.cancelCalls).toBe(1);
-    expect(rejected.terminalRecord).toMatchObject(REJECTED_TOMBSTONE);
-
-    const conflict = await factory.runActionScenario(
-      crypto.randomUUID(),
-      "cancel-conflict",
-    );
-    expect(conflict.firstError).toMatch(/revision_conflict/u);
-    expect(conflict.pendingAfterConflict).toMatchObject({
-      state: "pending",
-      keys: PENDING_ACTION_KEYS,
-    });
-    expect(conflict.applyAfterReject).toMatch(/integrity_failure/u);
-    expect(conflict.applyCalls).toBe(0);
-    const cancelInputs = conflict.cancelInputs as string[];
-    expect(cancelInputs).toHaveLength(2);
-    expect(cancelInputs[1]).toBe(cancelInputs[0]);
-    expect(conflict.terminalRecord).toMatchObject(REJECTED_TOMBSTONE);
-  });
-
-  it("fails closed on submission loss and never reuses its action ID", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-storage-guards");
-
-    const submission = await factory.runActionScenario(
-      crypto.randomUUID(),
-      "submission-loss",
-    );
-    expect(submission.firstError).toMatch(/response lost/u);
-    expect(submission).toMatchObject({
-      firstAction: 1,
-      lostRecord: null,
-      lostCallbackError: expect.stringMatching(/integrity_failure/u),
-      applyCallsAfterLoss: 0,
-      secondAction: 2,
-      applyCalls: 1,
-      secondRecord: APPLIED_TOMBSTONE,
-    });
-
-    const unpaired = await factory.runActionScenario(
-      crypto.randomUUID(),
-      "unpaired-content",
-    );
-    expect(unpaired).toMatchObject({
-      error: expect.stringMatching(/invalid_input/u),
-      submissions: 0,
-    });
-  });
-
-  it("fails closed on callback, counter, staged-write, and stored-record corruption", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-
-    const callback = await workerEnv.TEST_FACTORY
-      .getByName("m05-03-invalid-callback")
-      .runActionScenario(crypto.randomUUID(), "invalid-callback");
-    expect(callback).toMatchObject({
-      error: expect.stringMatching(/integrity_failure/u),
-      before: [],
-      after: [],
-      applyCalls: 0,
-      cancelCalls: 0,
-    });
-
-    const counters = await workerEnv.TEST_FACTORY
-      .getByName("m05-03-counter-guards")
-      .runActionScenario(crypto.randomUUID(), "counter-guards");
-    expect(counters).toMatchObject({
-      malformedError: expect.stringMatching(/integrity_failure/u),
-      exhaustedError: expect.stringMatching(/capacity_exceeded/u),
-      submissions: 0,
-      actionKeys: [],
-      applyCalls: 0,
-    });
-
-    const writeFailure = await workerEnv.TEST_FACTORY
-      .getByName("m05-03-write-failure")
-      .runActionScenario(crypto.randomUUID(), "staged-write-failure");
-    expect(writeFailure).toMatchObject({
-      error: expect.stringMatching(/injected staged write failure/u),
-      submissions: 0,
-      knowledgeKeys: [],
-      applyCalls: 0,
-    });
-
-    const corruption = await workerEnv.TEST_FACTORY
-      .getByName("m05-03-stored-corruption")
-      .runActionScenario(crypto.randomUUID(), "stored-corruption");
-    const results = corruption.results as Array<{
-      error: string;
-      coreCalls: number;
-      record: {state: string; keys: string[]};
-    }>;
-    expect(results).toHaveLength(4);
-    for (const result of results) {
-      expect(result.error).toMatch(/integrity_failure/u);
-      expect(result.coreCalls).toBe(0);
-      expect(result.record).toMatchObject({state: "pending"});
-    }
-  });
-
-  it("rejects malformed counters and callback IDs before deriving action state", () => {
-    expect(nextKnowledgeActionId(undefined)).toBe(1);
-    expect(nextKnowledgeActionId(1)).toBe(1);
-    expect(nextKnowledgeActionId(Number.MAX_SAFE_INTEGER - 1)).toBe(
-      Number.MAX_SAFE_INTEGER - 1,
-    );
-    for (const value of [null, "1", 0, -1, 1.5, Number.NaN]) {
-      expect(() => nextKnowledgeActionId(value)).toThrow(/integrity_failure/u);
-    }
-    expect(() => nextKnowledgeActionId(Number.MAX_SAFE_INTEGER)).toThrow(
-      /capacity_exceeded/u,
-    );
-
-    expect(() => assertKnowledgeActionId(1)).not.toThrow();
-    expect(() => assertKnowledgeActionId(Number.MAX_SAFE_INTEGER - 1)).not.toThrow();
-    for (const value of [0, -1, 1.5, Number.MAX_SAFE_INTEGER]) {
-      expect(() => assertKnowledgeActionId(value)).toThrow(/integrity_failure/u);
-    }
-  });
-
-  it("serializes concurrent apply and reject callbacks without coalescing them", async () => {
-    const workerEnv = env as unknown as TestWorkerExports;
-    const factory = workerEnv.TEST_FACTORY.getByName("m05-03-concurrency");
-    const result = await factory.runActionScenario(
-      crypto.randomUUID(),
-      "concurrent-apply-reject",
-    );
-
-    expect([result.applyStatus, result.rejectStatus].toSorted()).toEqual([
-      "fulfilled",
-      "rejected",
-    ]);
-    expect(Number(result.applyCalls) + Number(result.cancelCalls)).toBe(1);
-    expect(`${result.applyError ?? ""}${result.rejectError ?? ""}`).toMatch(
-      /integrity_failure/u,
-    );
-    expect(result.terminalRecord).toMatchObject({
-      state: expect.stringMatching(/^(applied|rejected)$/u),
-      keys: ["state"],
-      bodyByteLength: null,
-    });
-  });
-
-  it("authorizes Knowledge reads before returning data and disposes its queue", async () => {
-    const observations: unknown[] = [];
-    let disposed = false;
-    const session = new KnowledgeSession(
-      {
-        authorizeObservation(value: unknown) {
-          observations.push(value);
-          return Promise.resolve();
-        },
-        [Symbol.dispose]() {
-          disposed = true;
-        },
-      },
-      {
-        list: async () => ({
-          ok: true as const,
-          value: {
-            items: [
-              {
-                revisionId: VALID_REVISION_ID,
-                documentKey: "manager-principles",
-                contentHash: VALID_CONTENT_HASH,
-              },
-            ],
-            nextCursor: null,
-          },
-        }),
-        search: async () => ({
-          ok: true as const,
-          value: { items: [], nextCursor: null },
-        }),
-        read: async () => ({
-          ok: true as const,
-          value: {
-            revisionId: VALID_REVISION_ID,
-            documentKey: "manager-principles",
-            contentHash: VALID_CONTENT_HASH,
-            content: "# Principles",
-          },
-        }),
-        assertBoundTo: async () => {},
-        applyProposal: async () => {
-          throw new Error("not used");
-        },
-        cancelProposal: async () => {
-          throw new Error("not used");
-        },
-      },
-    );
-
-    await expect(session.list()).resolves.toMatchObject({
-      items: [{ documentKey: "manager-principles" }],
-    });
-    await expect(session.search("  ＭＡＮＡＧＥＲ  ")).resolves.toEqual({
+describe("S14 list projection", () => {
+  it.each([
+    ["undefined", undefined],
+    ["empty", {}],
+    ["cursor-only", { cursor: "cursor" }],
+    ["limit-only", { limit: 1 }],
+    ["both", { cursor: "cursor", limit: 1 }],
+  ])("accepts %s options", async (_name, input) => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    access.listResult = { _tag: "page", items: [] };
+    await expect(newSession(queue, access).list(input)).resolves.toEqual({
       items: [],
       nextCursor: null,
     });
-    await expect(session.read(VALID_REVISION_ID)).resolves.toMatchObject({
-      documentKey: "manager-principles",
-      content: "# Principles",
-    });
-    expect(observations).toHaveLength(3);
-    expect(observations[0]).toMatchObject({ title: "Knowledge Base list" });
-    expect(observations[1]).toMatchObject({
-      title: "Knowledge Base search",
-      description: "Searched the Knowledge Base for manager. Returned 0 current source(s).",
-    });
-    expect(observations[2]).toMatchObject({ title: "Knowledge Base read" });
-    expect(JSON.stringify(observations)).not.toContain("# Principles");
-
-    session[Symbol.dispose]();
-    expect(disposed).toBe(true);
+    expect(access.listInputs).toHaveLength(1);
   });
 
-  it("returns no Knowledge data when observation authorization fails", async () => {
-    let readCount = 0;
-    const session = new KnowledgeSession(
-      {
-        authorizeObservation: async () => {
-          throw new Error("observation denied");
-        },
-        submitAction: async () => {},
-      },
-      {
-        list: async () => ({ok: true as const, value: {items: [], nextCursor: null}}),
-        search: async () => ({ok: true as const, value: {items: [], nextCursor: null}}),
-        read: async () => {
-          readCount += 1;
-          return {
-            ok: true as const,
-            value: {
-              revisionId: VALID_REVISION_ID,
-              documentKey: "manager-principles",
-              contentHash: VALID_CONTENT_HASH,
-              content: "# Must not escape",
-            },
-          };
-        },
-        assertBoundTo: async () => {},
-        applyProposal: async () => ({ok: false as const, error: {code: "not_used"}}),
-        cancelProposal: async () => ({ok: true as const, value: null}),
-      },
+  it.each([
+    ["extra key", { cursor: "ok", extra: true }],
+    ["empty cursor", { cursor: "" }],
+    ["bad cursor", { cursor: "!" }],
+    ["oversized cursor", { cursor: "a".repeat(257) }],
+    ["fractional limit", { limit: 1.5 }],
+    ["zero limit", { limit: 0 }],
+    ["oversized limit", { limit: 51 }],
+  ])("rejects %s before the capability call", async (_name, input) => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    await expect(
+      newSession(queue, access).list(input as unknown as ListInput),
+    ).rejects.toThrow(/invalid_input/);
+    expect(access.listInputs).toHaveLength(0);
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it("enforces requested/default/max page sizes and exact summary shape", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    access.listResult = {
+      _tag: "page",
+      items: [
+        summary(),
+        summary({
+          knowledgeId: OTHER_KNOWLEDGE_ID,
+          displayName: "Additional Knowledge",
+          role: "additional",
+          state: "blocked",
+        }),
+      ],
+      nextCursor: "next",
+    };
+    const result = await newSession(queue, access).list({ limit: 2 });
+    expect(result.nextCursor).toBe("next");
+    expect(result.items[0]).toMatchObject({ knowledgeId: KNOWLEDGE_ID });
+    expect(result.items[0]).toHaveProperty("access");
+    expect(result.items[1]).toEqual(
+      summary({
+        knowledgeId: OTHER_KNOWLEDGE_ID,
+        displayName: "Additional Knowledge",
+        role: "additional",
+        state: "blocked",
+      }),
     );
+    expect(Object.keys(result.items[0] ?? {}).toSorted()).toEqual([
+      "access",
+      "createdAt",
+      "displayName",
+      "generation",
+      "knowledgeId",
+      "role",
+      "state",
+      "updatedAt",
+    ]);
 
-    await expect(session.read(VALID_REVISION_ID)).rejects.toThrow("observation denied");
-    expect(readCount).toBe(1);
+    access.listResult = {
+      _tag: "page",
+      items: Array.from({ length: 3 }, () => summary()),
+    };
+    await expect(newSession(new FakeQueue(), access).list({ limit: 2 })).rejects.toThrow(
+      /integrity_failure/,
+    );
   });
+
+  it.each([null, "next"])("accepts a strict nextCursor %s", async (nextCursor) => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    access.listResult = { _tag: "page", items: [], nextCursor };
+    const result = await newSession(queue, access).list();
+    expect(result.nextCursor).toBe(nextCursor);
+  });
+
+  it("rejects an explicit undefined nextCursor key", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    access.listResult = { _tag: "page", items: [], nextCursor: undefined };
+    await expect(newSession(queue, access).list()).rejects.toThrow(/integrity_failure/);
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it("does not expose handles for provisioning or blocked summaries", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    access.listResult = {
+      _tag: "page",
+      items: [summary({ state: "provisioning" }), summary({ state: "blocked" })],
+    };
+    const result = await newSession(queue, access).list();
+    expect(result.items.every((item) => !Object.hasOwn(item, "access"))).toBe(true);
+    expect(queue.duplicateCount).toBe(0);
+  });
+
+  it("rejects untrimmed display names before authorizing the list", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    access.listResult = { _tag: "page", items: [summary({ displayName: " Initial Knowledge" })] };
+    await expect(newSession(queue, access).list()).rejects.toThrow(/integrity_failure/);
+    expect(queue.observations).toHaveLength(0);
+  });
+});
+
+describe("S14 Bronze handle and strict result projection", () => {
+  it("captures the validated locator and supports current and historical reads", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    access.bronzeResult = { _tag: "found", revision: revision() };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).resolves.toMatchObject({
+      knowledgeId: KNOWLEDGE_ID,
+      sourceId: SOURCE_ID,
+    });
+    access.bronzeResult = {
+      _tag: "found",
+      revision: revision({
+        revisionId: REVISION_ID,
+        document: "# historical",
+        contentHash:
+          "baddadc05c983f0496ebc443f13428501c639a05583577f118e0f7bcdbd705b5",
+      }),
+    };
+    const historical = await handle.readBronze({
+      sourceId: SOURCE_ID,
+      revisionId: REVISION_ID,
+    });
+    expect(historical?.revisionId).toBe(REVISION_ID);
+    expect(access.bronzeInputs).toEqual([
+      { knowledgeId: KNOWLEDGE_ID, generation: 1, sourceId: SOURCE_ID },
+      {
+        knowledgeId: KNOWLEDGE_ID,
+        generation: 1,
+        sourceId: SOURCE_ID,
+        revisionId: REVISION_ID,
+      },
+    ]);
+  });
+
+  it("returns null only for exact not_found", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).resolves.toBeNull();
+    expect(queue.observations).toHaveLength(2);
+    access.bronzeResult = { _tag: "not_found", extra: true };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      /integrity_failure/,
+    );
+    expect(queue.observations).toHaveLength(2);
+  });
+
+  it.each([
+    "forbidden",
+    "service_not_ready",
+    "invalid_input",
+    "integrity_failure",
+    "deadline_exceeded",
+    "provisioning",
+    "blocked",
+  ] as const)("authorizes then returns safe %s failure", async (tag) => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    access.bronzeResult = { _tag: tag };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(tag);
+    expect(queue.observations).toHaveLength(2);
+  });
+
+  it("decodes dependency failures strictly and rejects unknown tags without observing", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    access.bronzeResult = {
+      _tag: "dependency_unavailable",
+      dependency: "knowledge-read",
+    };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      /dependency_unavailable/,
+    );
+    expect(queue.observations).toHaveLength(2);
+    access.bronzeResult = { _tag: "dependency_unavailable", dependency: "unknown" };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      /integrity_failure/,
+    );
+    access.bronzeResult = { _tag: "future_failure" };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      /integrity_failure/,
+    );
+    expect(queue.observations).toHaveLength(2);
+  });
+
+  it.each([
+    ["extra revision key", revision({ extra: true })],
+    ["correlation mismatch", revision({ knowledgeId: OTHER_KNOWLEDGE_ID })],
+    ["hash mismatch", revision({ contentHash: "0".repeat(64) })],
+    ["unpaired surrogate", revision({ document: "\uD800" })],
+  ] as const)("rejects malformed %s before authorization", async (_name, value) => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    access.bronzeResult = { _tag: "found", revision: value };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      /integrity_failure/,
+    );
+    expect(queue.observations).toHaveLength(1);
+  });
+
+  it("accepts upstream projection text with whitespace and line controls", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    access.bronzeResult = {
+      _tag: "found",
+      revision: revision({
+        title: "Title line 1\n\tTitle line 2\r\n",
+        description: "Description line 1\r\n\tDescription line 2",
+      }),
+    };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).resolves.toMatchObject({
+      title: "Title line 1\n\tTitle line 2\r\n",
+      description: "Description line 1\r\n\tDescription line 2",
+      contentHash:
+        "896969cf655830641e58e58c011508ac9d3e7ff9cfbd87d3152a41347949b582",
+    });
+    expect(queue.observations).toHaveLength(2);
+  });
+
+  it("rejects untrimmed provenance references before authorization", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    access.bronzeResult = {
+      _tag: "found",
+      revision: revision({
+        provenance: {
+          sourceKind: "explicit_user_input",
+          reference: " fixture",
+          capturedAt: NOW,
+        },
+      }),
+    };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      /integrity_failure/,
+    );
+    expect(queue.observations).toHaveLength(1);
+  });
+
+  it("validates input keys and canonical timestamps/UTF-8 bounds", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const handle = await newHandle(queue, access);
+    await expect(
+      handle.readBronze({ sourceId: SOURCE_ID, extra: true } as unknown as BronzeInput),
+    ).rejects.toThrow(/invalid_input/);
+    access.bronzeResult = {
+      _tag: "found",
+      revision: revision({ committedAt: "2026-02-30T00:00:00.000Z" }),
+    };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      /integrity_failure/,
+    );
+    access.bronzeResult = {
+      _tag: "found",
+      revision: revision({ document: "a".repeat(65_537) }),
+    };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      /integrity_failure/,
+    );
+  });
+});
+
+describe("S14 observation and capability lifecycle", () => {
+  it("awaits authorization and returns no page/data when authorization rejects", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    access.listResult = { _tag: "page", items: [summary()] };
+    queue.reject = true;
+    await expect(newSession(queue, access).list()).rejects.toThrow("observation denied");
+    expect(queue.duplicateCount).toBe(1);
+    expect(queue.disposeCount).toBe(1);
+
+    const readQueue = new FakeQueue();
+    const readAccess = new FakeAccessImpl();
+    const handle = await newHandle(readQueue, readAccess);
+    readQueue.reject = true;
+    readAccess.bronzeResult = { _tag: "found", revision: revision() };
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      "observation denied",
+    );
+  });
+
+  it("duplicates once per ready handle and disposes handles/session exactly once", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    access.listResult = {
+      _tag: "page",
+      items: [summary(), summary({ knowledgeId: OTHER_KNOWLEDGE_ID })],
+    };
+    const session = newSession(queue, access);
+    const page = await session.list();
+    expect(page.items.filter((item) => item.access !== undefined)).toHaveLength(2);
+    expect(queue.duplicateCount).toBe(2);
+    const first = page.items[0]?.access;
+    first?.[Symbol.dispose]?.();
+    first?.[Symbol.dispose]?.();
+    session[Symbol.dispose]();
+    session[Symbol.dispose]();
+    expect(queue.disposeCount).toBe(3);
+  });
+
+  it("maps capability RPC failures without authorizing", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    access.listError = new Error("remote unavailable");
+    await expect(newSession(queue, access).list()).rejects.toThrow(
+      /dependency_unavailable/,
+    );
+    expect(queue.observations).toHaveLength(0);
+    const readQueue = new FakeQueue();
+    const readAccess = new FakeAccessImpl();
+    const handle = await newHandle(readQueue, readAccess);
+    readAccess.bronzeError = new Error("remote unavailable");
+    await expect(handle.readBronze({ sourceId: SOURCE_ID })).rejects.toThrow(
+      /dependency_unavailable/,
+    );
+    expect(readQueue.observations).toHaveLength(1);
+  });
+});
+
+describe("S14 actual Worker/DO/RPC integration", () => {
+  type TestFactory = {
+    runRead(options?: {
+      listMode?: "valid" | "empty" | "failure" | "malformed" | "extra" | "rpc_failure";
+      bronzeMode?:
+        | "current"
+        | "historical"
+        | "not_found"
+        | "failure"
+        | "unknown_tag"
+        | "malformed"
+        | "extra"
+        | "hash_mismatch"
+        | "correlation_mismatch"
+        | "rpc_failure";
+      states?: Array<"provisioning" | "ready" | "blocked">;
+      nextCursor?: "omit" | "null" | "string";
+      listOptions?: { cursor?: string; limit?: number };
+      rejectObservationAt?: number | null;
+    }): Promise<{
+      page: Array<Record<string, unknown>> | null;
+      nextCursor: string | null;
+      read: unknown;
+      error: string | null;
+      observations: ObservationDescription[];
+      readInputs: unknown[];
+      queueDisposals: number;
+    }>;
+    runAccount(managerId?: string): Promise<{
+      description: { displayName?: string; singleton?: { tsType: string } };
+      binding: "legacy" | "bound";
+      page: Array<Record<string, unknown>>;
+      observations: ObservationDescription[];
+      boundInputs: string[];
+    }>;
+    runAccountError(options?: {
+      requestedManagerId?: string;
+      capabilityManagerId?: string;
+      assertMode?: "ok" | "wrong_manager" | "rpc_failure";
+      extraProps?: boolean;
+    }): Promise<string | null>;
+    runLegacyAccount(): Promise<{ binding: string | null; error: string | null }>;
+    runCatalog(limit: number): Promise<{
+      catalog: { entries: Array<Record<string, unknown>>; truncated?: boolean };
+      observations: ObservationDescription[];
+    }>;
+    runObserverRejection(): Promise<string | null>;
+    runMalformedSession(): Promise<{ duplicateCount: number; error: string | null }>;
+  };
+
+  const testEnv = env as unknown as { TEST_FACTORY: DurableObjectNamespace<TestFactory> };
+  const factory = (): DurableObjectStub<TestFactory> =>
+    testEnv.TEST_FACTORY.getByName("s14-" + crypto.randomUUID());
+
+  it("executes the real WorkerEntrypoint -> DO -> RpcTarget read path", async () => {
+    const result = await factory().runRead({ nextCursor: "string" });
+    expect(result.page).toHaveLength(3);
+    expect(result.page?.map((item) => item.hasAccess)).toEqual([true, false, false]);
+    expect(result.nextCursor).toBe("next-page");
+    expect(result.read).toMatchObject({
+      knowledgeId: "44444444-4444-4444-8444-444444444444",
+      sourceId: "74444444-4444-4444-8444-444444444444",
+    });
+    expect(result.readInputs).toEqual([
+      {
+        knowledgeId: "44444444-4444-4444-8444-444444444444",
+        generation: 1,
+        sourceId: "74444444-4444-4444-8444-444444444444",
+      },
+    ]);
+    expect(result.observations).toHaveLength(2);
+    expect(result.observations.every((observation) => observation.prohibitAllSharing)).toBe(
+      true,
+    );
+  });
+
+  it("exercises account install/binding through the real vendor and singleton DO", async () => {
+    const result = await factory().runAccount();
+    expect(result.binding).toBe("bound");
+    expect(result.description).toMatchObject({
+      displayName: "Knowledge Base",
+      singleton: { tsType: "KnowledgeBase" },
+    });
+    expect(result.page[0]).toMatchObject({ hasAccess: true, state: "ready" });
+    expect(result.boundInputs).toEqual([
+      "44444444-4444-4444-8444-444444444444",
+      "44444444-4444-4444-8444-444444444444",
+    ]);
+  });
+
+  it("rejects wrong manager, capability RPC failure, and malformed account props", async () => {
+    const wrongManager = await factory().runAccountError({
+      requestedManagerId: "54444444-4444-4444-8444-444444444444",
+    });
+    expect(wrongManager).toMatch(/another Manager|wrong manager/i);
+    const rpcFailure = await factory().runAccountError({ assertMode: "rpc_failure" });
+    expect(rpcFailure).toMatch(/RPC failure|unavailable/i);
+    const extraProps = await factory().runAccountError({ extraProps: true });
+    expect(extraProps).toMatch(/only access|props/i);
+    expect(await factory().runLegacyAccount()).toEqual({ binding: "legacy", error: null });
+  });
+
+  it("bounds catalog limits and keeps observer registration private", async () => {
+    const zero = await factory().runCatalog(0);
+    expect(zero.catalog.entries).toEqual([]);
+    expect(zero.observations).toHaveLength(1);
+    const one = await factory().runCatalog(1);
+    expect(one.catalog.entries).toHaveLength(1);
+    expect(one.catalog.entries[0]).toEqual({
+      id: "knowledge-base",
+      title: "Knowledge Base",
+      description: "Available. Use list to inspect current Knowledge summaries.",
+    });
+    expect(await factory().runObserverRejection()).toMatch(/private/i);
+  });
+
+  it("proves malformed and authorization-failed integration paths leak no page/data", async () => {
+    const malformedList = await factory().runRead({ listMode: "malformed" });
+    expect(malformedList.page).toBeNull();
+    expect(malformedList.error).toMatch(/integrity_failure/);
+    expect(malformedList.observations).toHaveLength(0);
+    const deniedList = await factory().runRead({ rejectObservationAt: 1 });
+    expect(deniedList.page).toBeNull();
+    expect(deniedList.read).toBeNull();
+    expect(deniedList.error).toMatch(/observation denied/);
+    const deniedRead = await factory().runRead({ rejectObservationAt: 2 });
+    expect(deniedRead.page).not.toBeNull();
+    expect(deniedRead.read).toBeNull();
+    expect(deniedRead.error).toMatch(/observation denied/);
+  });
+
+  it("checks malformed DO props before duplicating the approval queue", async () => {
+    const result = await factory().runMalformedSession();
+    expect(result.error).toMatch(/only access|props/);
+    expect(result.duplicateCount).toBe(0);
+  });
+
 });
