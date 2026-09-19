@@ -8,6 +8,7 @@ import { skipRpcValidation, validateRpc, validateStub } from "capnweb-validate";
 import { boundAgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
 import type {
   AccountDescription,
+  ActionDescription,
   AgentCatalog,
   AgentCatalogRequest,
   ApprovalQueue,
@@ -37,13 +38,20 @@ const MAX_DOC = 65536;
 const MAX_PAGE = 50;
 type ListInput = { cursor?: string; limit?: number };
 type BronzeInput = { sourceId: string; revisionId?: string };
-type Access = {
+export type KnowledgeAccess = {
   assertBoundTo(managerId: string): Promise<void>;
   list(input?: ListInput): Promise<unknown>;
   readBronze(
     input: { knowledgeId: string; generation: 1 } & BronzeInput,
   ): Promise<unknown>;
+  createKnowledge(input: {
+    operationId: string;
+    actionRef: string;
+    displayName: string;
+  }): Promise<unknown>;
+  readCreationOutcome(input: { operationId: string }): Promise<unknown>;
 };
+type Access = KnowledgeAccess;
 type Summary = {
   knowledgeId: string;
   generation: 1;
@@ -76,7 +84,7 @@ type Revision = {
   };
   committedAt: string;
 };
-export type KnowledgeAccountProps = { access: Access };
+export type KnowledgeAccountProps = { access: KnowledgeAccess };
 const err = (tag: string) => new Error("Knowledge Base " + tag + ".");
 const rec = (v: unknown): v is Record<string, unknown> => {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
@@ -101,6 +109,7 @@ const text = (v: unknown, max: number, nonEmpty = true): v is string => {
   for (let i = 0; i < v.length; i++) {
     const c = v.charCodeAt(i);
     if (c >= 55296 && c <= 56319) {
+      if (i + 1 >= v.length) return false;
       const n = v.charCodeAt(++i);
       if (n < 56320 || n > 57343) return false;
     } else if (c >= 56320 && c <= 57343) return false;
@@ -112,6 +121,13 @@ const visible = (v: unknown, max: number): v is string =>
   v.trim() === v &&
   v.trim().length > 0 &&
   !/[\u0000-\u001F\u007F-\u009F\u2028\u2029\uFEFF]/u.test(v);
+const boundedInvalidInputIssues = (value: unknown): boolean =>
+  Array.isArray(value) &&
+  value.length <= 16 &&
+  value.every((issue) => text(issue, 128));
+const validInvalidInputResult = (value: Record<string, unknown>): boolean =>
+  exact(value, ["_tag"]) ||
+  (exact(value, ["_tag", "issues"]) && boundedInvalidInputIssues(value.issues));
 const projectionText = (v: unknown, max: number): v is string =>
   text(v, max) && v.trim().length > 0;
 const documentText = (v: unknown, max: number): v is string => {
@@ -178,6 +194,196 @@ const observation = (title: string, description: string) => ({
   description,
   prohibitAllSharing: true,
 });
+const MAX_PENDING_PROPOSALS = 64;
+const ACTION_KIND = "knowledge.create";
+type ProposalResult = { operationId: string; status: "pending_approval" };
+type CreationStatus =
+  | "pending_approval"
+  | "applying"
+  | "applied"
+  | "outcome_unknown"
+  | "failed";
+type CreationOutcome = {
+  operationId: string;
+  status: CreationStatus;
+  outcome?: "ready" | "already_ready" | "provisioning" | "blocked";
+  knowledge?: Summary;
+  reason?: CreationTerminalFailure | "outcome_unknown";
+};
+type ProposalPort = {
+  propose(displayName: string, queue: RpcStub<ApprovalQueue>): Promise<ProposalResult>;
+  readOutcome(
+    operationId: string,
+    queue: RpcStub<ApprovalQueue>,
+  ): Promise<CreationOutcome | null>;
+};
+type StoredAction = {
+  local_action_id: number;
+  operation_id: string;
+  action_ref: string;
+  kind: string;
+  display_name: string;
+  status: "pending_approval" | "applying" | "applied" | "failed";
+  payload_fingerprint: string;
+  outcome_json: string | null;
+};
+const creationFailureTags = [
+  "service_not_ready",
+  "capacity_exceeded",
+  "forbidden",
+  "invalid_input",
+  "operation_conflict",
+  "integrity_failure",
+  "deadline_exceeded",
+  "outcome_unknown",
+  "dependency_unavailable",
+] as const;
+type CreationFailure = (typeof creationFailureTags)[number];
+const creationTerminalFailureTags = [
+  "service_not_ready",
+  "capacity_exceeded",
+  "forbidden",
+  "invalid_input",
+  "operation_conflict",
+  "integrity_failure",
+] as const;
+type CreationTerminalFailure = (typeof creationTerminalFailureTags)[number];
+const creationStateForTag = (tag: "ready" | "provisioning" | "blocked"): Summary["state"] =>
+  tag === "ready" ? "ready" : tag;
+const creationSummary = (
+  value: unknown,
+  displayName: string,
+  expectedState: Summary["state"],
+): Summary | undefined => {
+  const candidate = summary(value);
+  return candidate !== undefined &&
+    candidate.role === "additional" &&
+    candidate.displayName === displayName &&
+    candidate.state === expectedState
+    ? candidate
+    : undefined;
+};
+const creationResult = (
+  value: unknown,
+  operationId: string,
+  displayName: string,
+): { outcome: CreationOutcome } | { failure: CreationFailure } | undefined => {
+  if (!rec(value) || typeof value._tag !== "string") return;
+  if (value._tag === "ready") {
+    if (
+      !exact(value, ["_tag", "outcome", "operationId", "knowledge"]) ||
+      value.operationId !== operationId ||
+      !(value.outcome === "ready" || value.outcome === "already_ready")
+    )
+      return;
+    const knowledge = creationSummary(value.knowledge, displayName, "ready");
+    return knowledge
+      ? { outcome: { operationId, status: "applied", outcome: value.outcome, knowledge } }
+      : undefined;
+  }
+  if (value._tag === "provisioning" || value._tag === "blocked") {
+    if (!exact(value, ["_tag", "outcome", "operationId", "knowledge"]) || value.operationId !== operationId || value.outcome !== value._tag)
+      return;
+    const knowledge = creationSummary(value.knowledge, displayName, creationStateForTag(value._tag));
+    return knowledge
+      ? { outcome: { operationId, status: "applied", outcome: value._tag, knowledge } }
+      : undefined;
+  }
+  if (value._tag === "invalid_input") {
+    return validInvalidInputResult(value) ? { failure: "invalid_input" } : undefined;
+  }
+  if (value._tag === "dependency_unavailable") {
+    return exact(value, ["_tag", "dependency"]) && value.dependency === "knowledge-agent"
+      ? { failure: "dependency_unavailable" }
+      : undefined;
+  }
+  if (creationFailureTags.includes(value._tag as CreationFailure)) {
+    return exact(value, ["_tag"]) ? { failure: value._tag as CreationFailure } : undefined;
+  }
+  return undefined;
+};
+const outcomeResult = (
+  value: unknown,
+  operationId: string,
+  displayName: string,
+): { outcome: CreationOutcome } | { failure: CreationFailure } | undefined => {
+  if (!rec(value) || typeof value._tag !== "string") return;
+  if (value._tag === "unobserved") {
+    return exact(value, ["_tag", "operationId"]) && value.operationId === operationId
+      ? { outcome: { operationId, status: "outcome_unknown", reason: "outcome_unknown" } }
+      : undefined;
+  }
+  if (value._tag === "ready" || value._tag === "provisioning" || value._tag === "blocked") {
+    if (!exact(value, ["_tag", "operationId", "knowledge"]) || value.operationId !== operationId)
+      return;
+    const knowledge = creationSummary(value.knowledge, displayName, creationStateForTag(value._tag));
+    return knowledge
+      ? { outcome: { operationId, status: "applied", outcome: value._tag, knowledge } }
+      : undefined;
+  }
+  if (value._tag === "invalid_input") {
+    return validInvalidInputResult(value) ? { failure: "invalid_input" } : undefined;
+  }
+  if (value._tag === "dependency_unavailable") {
+    return exact(value, ["_tag", "dependency"]) && value.dependency === "knowledge-agent"
+      ? { failure: "dependency_unavailable" }
+      : undefined;
+  }
+  return creationFailureTags.includes(value._tag as CreationFailure) && exact(value, ["_tag"])
+    ? { failure: value._tag as CreationFailure }
+    : undefined;
+};
+const toFailureOutcome = (operationId: string, reason: CreationTerminalFailure): CreationOutcome => ({
+  operationId,
+  status: "failed",
+  reason,
+});
+const storedOutcome = (
+  value: string | null,
+  operationId: string,
+  displayName: string,
+): CreationOutcome | undefined => {
+  if (value === null) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return;
+  }
+  if (!rec(parsed) || parsed.operationId !== operationId || typeof parsed.status !== "string") return;
+  if (parsed.status === "failed") {
+    return exact(parsed, ["operationId", "status", "reason"]) &&
+      creationTerminalFailureTags.includes(parsed.reason as CreationTerminalFailure)
+      ? { operationId, status: "failed", reason: parsed.reason as CreationTerminalFailure }
+      : undefined;
+  }
+  if (parsed.status !== "applied" || !exact(parsed, ["operationId", "status", "outcome", "knowledge"])) return;
+  if (!(parsed.outcome === "ready" || parsed.outcome === "already_ready" || parsed.outcome === "provisioning" || parsed.outcome === "blocked")) return;
+  const knowledge = creationSummary(
+    parsed.knowledge,
+    displayName,
+    parsed.outcome === "ready" || parsed.outcome === "already_ready" ? "ready" : parsed.outcome,
+  );
+  return knowledge ? { operationId, status: "applied", outcome: parsed.outcome, knowledge } : undefined;
+};
+const payloadHash = async (
+  operationId: string,
+  actionRef: string,
+  displayName: string,
+): Promise<string> => {
+  const value = JSON.stringify([1, ACTION_KIND, operationId, actionRef, displayName]);
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+};
+const validStoredAction = (row: StoredAction): boolean =>
+  Number.isSafeInteger(row.local_action_id) &&
+  row.local_action_id >= 1 &&
+  uuid(row.operation_id) &&
+  uuid(row.action_ref) &&
+  row.kind === ACTION_KIND &&
+  visible(row.display_name, 120) &&
+  ["pending_approval", "applying", "applied", "failed"].includes(row.status) &&
+  /^[0-9a-f]{64}$/u.test(row.payload_fingerprint);
 function summary(v: unknown): Summary | undefined {
   if (
     !rec(v) ||
@@ -375,12 +581,26 @@ export class Knowledge extends RpcTarget {
 export class KnowledgeSession extends RpcTarget {
   readonly #q: RpcStub<ApprovalQueue>;
   readonly #a: Access;
+  readonly #port: ProposalPort | undefined;
   readonly #h = new Set<Knowledge>();
   #disposed = false;
-  constructor(q: RpcStub<ApprovalQueue>, a: Access) {
+  constructor(q: RpcStub<ApprovalQueue>, a: Access, port?: ProposalPort) {
     super();
     this.#q = q;
     this.#a = a;
+    this.#port = port;
+  }
+  async proposeKnowledgeCreate(i: unknown): Promise<ProposalResult> {
+    if (!rec(i) || !exact(i, ["displayName"]) || !visible(i.displayName, 120))
+      throw err("invalid_input");
+    if (!this.#port) throw err("dependency_unavailable");
+    return this.#port.propose(i.displayName, this.#q);
+  }
+  async readCreationOutcome(i: unknown): Promise<CreationOutcome | null> {
+    if (!rec(i) || !exact(i, ["operationId"]) || !uuid(i.operationId))
+      throw err("invalid_input");
+    if (!this.#port) throw err("dependency_unavailable");
+    return this.#port.readOutcome(i.operationId, this.#q);
   }
   async list(o?: ListInput): Promise<Page> {
     if (
@@ -501,6 +721,28 @@ export class CustomGatekeeper
   extends DurableObject<Cloudflare.Env, Props>
   implements Gatekeeper<KnowledgeBase>
 {
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+    super(ctx, env);
+    ctx.blockConcurrencyWhile(async () => {
+      this.ctx.storage.sql.exec(`
+        CREATE TABLE IF NOT EXISTS custom_gatekeeper_action_sequence (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          next_id INTEGER NOT NULL
+        );
+        INSERT OR IGNORE INTO custom_gatekeeper_action_sequence (id, next_id) VALUES (1, 1);
+        CREATE TABLE IF NOT EXISTS custom_gatekeeper_staged_actions (
+          local_action_id INTEGER PRIMARY KEY,
+          operation_id TEXT NOT NULL UNIQUE,
+          action_ref TEXT NOT NULL UNIQUE,
+          kind TEXT NOT NULL,
+          display_name TEXT NOT NULL,
+          status TEXT NOT NULL,
+          payload_fingerprint TEXT NOT NULL,
+          outcome_json TEXT
+        );
+      `);
+    });
+  }
   #access() {
     const p = this.ctx.props as unknown;
     if (!rec(p) || !exact(p, ["access"]) || !p.access)
@@ -526,7 +768,11 @@ export class CustomGatekeeper
     const access = this.#access();
     const queue = q.dup();
     try {
-      return new KnowledgeSession(queue, access);
+      const port: ProposalPort = {
+        propose: (displayName, approvalQueue) => this.#propose(displayName, approvalQueue),
+        readOutcome: (operationId, approvalQueue) => this.#readOutcome(operationId, approvalQueue),
+      };
+      return new KnowledgeSession(queue, access, port);
     } catch (cause) {
       try {
         queue[Symbol.dispose]?.();
@@ -535,6 +781,233 @@ export class CustomGatekeeper
       }
       throw cause;
     }
+  }
+  async #propose(displayName: string, queue: RpcStub<ApprovalQueue>): Promise<ProposalResult> {
+    const operationId = crypto.randomUUID();
+    const actionRef = crypto.randomUUID();
+    const fingerprint = await payloadHash(operationId, actionRef, displayName);
+    const pending = this.ctx.storage.sql
+      .exec<{ count: number }>("SELECT COUNT(*) AS count FROM custom_gatekeeper_staged_actions WHERE status IN ('pending_approval', 'applying')")
+      .one().count;
+    if (pending >= MAX_PENDING_PROPOSALS) throw err("capacity_exceeded");
+    const next = this.ctx.storage.sql
+      .exec<{ next_id: number }>("SELECT next_id FROM custom_gatekeeper_action_sequence WHERE id = 1")
+      .one().next_id;
+    this.ctx.storage.sql.exec("UPDATE custom_gatekeeper_action_sequence SET next_id = next_id + 1 WHERE id = 1");
+    this.ctx.storage.sql.exec(
+      "INSERT INTO custom_gatekeeper_staged_actions (local_action_id, operation_id, action_ref, kind, display_name, status, payload_fingerprint, outcome_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      next,
+      operationId,
+      actionRef,
+      ACTION_KIND,
+      displayName,
+      "pending_approval",
+      fingerprint,
+      null,
+    );
+    const description: ActionDescription = {
+      title: `Create Knowledge "${displayName}"`,
+      description: `Create one additional Knowledge named "${displayName}".`,
+      implementsRevert: false,
+      awaitDecision: true,
+    };
+    try {
+      await queue.submitAction(next, description);
+    } catch {
+      this.ctx.storage.sql.exec("DELETE FROM custom_gatekeeper_staged_actions WHERE local_action_id = ? AND operation_id = ?", next, operationId);
+      throw err("dependency_unavailable");
+    }
+    return { operationId, status: "pending_approval" };
+  }
+  async #readOutcome(operationId: string, queue: RpcStub<ApprovalQueue>): Promise<CreationOutcome | null> {
+    const readRow = (): StoredAction | undefined => this.ctx.storage.sql
+      .exec<StoredAction>("SELECT local_action_id, operation_id, action_ref, kind, display_name, status, payload_fingerprint, outcome_json FROM custom_gatekeeper_staged_actions WHERE operation_id = ?", operationId)
+      .toArray()[0];
+    const unknown = (): CreationOutcome => ({ operationId, status: "outcome_unknown", reason: "outcome_unknown" });
+    let row = readRow();
+    if (!row) return null;
+    if (!validStoredAction(row)) throw err("integrity_failure");
+    const expectedFingerprint = await payloadHash(row.operation_id, row.action_ref, row.display_name);
+    row = readRow();
+    if (!row) return null;
+    if (!validStoredAction(row) || row.payload_fingerprint !== expectedFingerprint)
+      throw err("integrity_failure");
+    if (row.status === "pending_approval") {
+      const result: CreationOutcome = { operationId, status: "pending_approval" };
+      await queue.authorizeObservation(observation("Knowledge creation outcome", "Read a bounded Knowledge creation outcome."));
+      return result;
+    }
+    if (row.status === "failed") {
+      const result = storedOutcome(row.outcome_json, operationId, row.display_name);
+      if (!result || result.status !== "failed") throw err("integrity_failure");
+      await queue.authorizeObservation(observation("Knowledge creation outcome", "Read a bounded Knowledge creation outcome."));
+      return result;
+    }
+    if (row.status !== "applying" && row.status !== "applied") throw err("integrity_failure");
+    if (row.status === "applied" && !storedOutcome(row.outcome_json, operationId, row.display_name))
+      throw err("integrity_failure");
+
+    let raw: unknown;
+    try {
+      const access = this.#access();
+      raw = await access.readCreationOutcome({ operationId });
+    } catch (cause) {
+      if (row.status === "applying") {
+        const result = unknown();
+        await queue.authorizeObservation(observation("Knowledge creation outcome", "Read a bounded Knowledge creation outcome."));
+        return result;
+      }
+      throw err("dependency_unavailable");
+    }
+    const decoded = outcomeResult(raw, operationId, row.display_name);
+    if (!decoded) throw err("integrity_failure");
+    if ("outcome" in decoded) {
+      if (decoded.outcome.status === "outcome_unknown") {
+        if (row.status === "applying") {
+          await queue.authorizeObservation(observation("Knowledge creation outcome", "Read a bounded Knowledge creation outcome."));
+          return decoded.outcome;
+        }
+        throw err("outcome_unknown");
+      }
+      if (row.status === "applying") {
+        this.ctx.storage.sql.exec(
+          "UPDATE custom_gatekeeper_staged_actions SET status = 'applied', outcome_json = ? WHERE local_action_id = ? AND status = 'applying'",
+          JSON.stringify(decoded.outcome),
+          row.local_action_id,
+        );
+      }
+      await queue.authorizeObservation(observation("Knowledge creation outcome", "Read a bounded Knowledge creation outcome."));
+      return decoded.outcome;
+    }
+    if (row.status === "applying") {
+      const result = unknown();
+      await queue.authorizeObservation(observation("Knowledge creation outcome", "Read a bounded Knowledge creation outcome."));
+      return result;
+    }
+    throw err(decoded.failure);
+  }
+  async applyAction(actionId: number): Promise<void> {
+    if (!Number.isSafeInteger(actionId) || actionId < 1) throw err("invalid_input");
+    const readRow = (): StoredAction | undefined => this.ctx.storage.sql
+      .exec<StoredAction>("SELECT local_action_id, operation_id, action_ref, kind, display_name, status, payload_fingerprint, outcome_json FROM custom_gatekeeper_staged_actions WHERE local_action_id = ?", actionId)
+      .toArray()[0];
+    const readApplyingOutcome = async (current: StoredAction): Promise<"applied" | "outcome_unknown"> => {
+      let raw: unknown;
+      try {
+        const access = this.#access();
+        raw = await access.readCreationOutcome({ operationId: current.operation_id });
+      } catch {
+        return "outcome_unknown";
+      }
+      const decoded = outcomeResult(raw, current.operation_id, current.display_name);
+      if (!decoded) throw err("integrity_failure");
+      if (!("outcome" in decoded) || decoded.outcome.status === "outcome_unknown") return "outcome_unknown";
+      this.ctx.storage.sql.exec(
+        "UPDATE custom_gatekeeper_staged_actions SET status = 'applied', outcome_json = ? WHERE local_action_id = ? AND status = 'applying'",
+        JSON.stringify(decoded.outcome),
+        current.local_action_id,
+      );
+      return "applied";
+    };
+    let row = readRow();
+    if (!row) throw err("invalid_input");
+    if (!validStoredAction(row)) throw err("integrity_failure");
+    const expectedFingerprint = await payloadHash(row.operation_id, row.action_ref, row.display_name);
+    row = readRow();
+    if (!row) throw err("invalid_input");
+    if (!validStoredAction(row) || row.payload_fingerprint !== expectedFingerprint)
+      throw err("integrity_failure");
+    if (row.status === "applied") {
+      if (!storedOutcome(row.outcome_json, row.operation_id, row.display_name)) throw err("integrity_failure");
+      return;
+    }
+    if (row.status === "failed") {
+      const result = storedOutcome(row.outcome_json, row.operation_id, row.display_name);
+      if (!result || result.status !== "failed") throw err("integrity_failure");
+      throw err(result.reason ?? "integrity_failure");
+    }
+    if (row.status === "applying") {
+      const observed = await readApplyingOutcome(row);
+      if (observed === "applied") return;
+      throw err("outcome_unknown");
+    }
+    if (row.status !== "pending_approval") throw err("integrity_failure");
+
+    // Only the callback that wins this synchronous CAS may issue the create RPC.
+    const transition = this.ctx.storage.sql.exec(
+      "UPDATE custom_gatekeeper_staged_actions SET status = 'applying' WHERE local_action_id = ? AND status = 'pending_approval'",
+      actionId,
+    );
+    row = readRow();
+    if (!row) throw err("invalid_input");
+    if (!validStoredAction(row) || row.payload_fingerprint !== expectedFingerprint)
+      throw err("integrity_failure");
+    if (transition.rowsWritten !== 1) {
+      if (row.status === "applied") {
+        if (!storedOutcome(row.outcome_json, row.operation_id, row.display_name)) throw err("integrity_failure");
+        return;
+      }
+      if (row.status === "failed") {
+        const result = storedOutcome(row.outcome_json, row.operation_id, row.display_name);
+        if (!result || result.status !== "failed") throw err("integrity_failure");
+        throw err(result.reason ?? "integrity_failure");
+      }
+      if (row.status !== "applying") throw err("integrity_failure");
+      const observed = await readApplyingOutcome(row);
+      if (observed === "applied") return;
+      throw err("outcome_unknown");
+    }
+    if (row.status !== "applying") throw err("integrity_failure");
+
+    const rollbackApplying = () => {
+      this.ctx.storage.sql.exec(
+        "UPDATE custom_gatekeeper_staged_actions SET status = 'pending_approval' WHERE local_action_id = ? AND status = 'applying'",
+        actionId,
+      );
+    };
+    let access: Access;
+    try {
+      access = this.#access();
+    } catch {
+      rollbackApplying();
+      throw err("dependency_unavailable");
+    }
+    let call: Promise<unknown>;
+    try {
+      call = access.createKnowledge({
+        operationId: row.operation_id,
+        actionRef: row.action_ref,
+        displayName: row.display_name,
+      });
+    } catch {
+      rollbackApplying();
+      throw err("dependency_unavailable");
+    }
+    let raw: unknown;
+    try {
+      raw = await call;
+    } catch {
+      // The mutation may have committed even though its response was lost.
+      throw err("outcome_unknown");
+    }
+    const decoded = creationResult(raw, row.operation_id, row.display_name);
+    if (!decoded) throw err("integrity_failure");
+    if ("failure" in decoded) {
+      if (
+        decoded.failure === "outcome_unknown" ||
+        decoded.failure === "dependency_unavailable" ||
+        decoded.failure === "deadline_exceeded"
+      )
+        throw err(decoded.failure);
+      const outcome = toFailureOutcome(row.operation_id, decoded.failure);
+      this.ctx.storage.sql.exec("UPDATE custom_gatekeeper_staged_actions SET status = 'failed', outcome_json = ? WHERE local_action_id = ? AND status = 'applying'", JSON.stringify(outcome), actionId);
+      throw err(decoded.failure);
+    }
+    this.ctx.storage.sql.exec("UPDATE custom_gatekeeper_staged_actions SET status = 'applied', outcome_json = ? WHERE local_action_id = ? AND status = 'applying'", JSON.stringify(decoded.outcome), actionId);
+  }
+  async rejectAction(actionId: number): Promise<void> {
+    if (!Number.isSafeInteger(actionId) || actionId < 1) return;
+    this.ctx.storage.sql.exec("DELETE FROM custom_gatekeeper_staged_actions WHERE local_action_id = ? AND status = 'pending_approval'", actionId);
   }
   async getAgentCatalog(
     r: AgentCatalogRequest,
@@ -566,12 +1039,6 @@ export class CustomGatekeeper
     throw new Error("Knowledge Base is private to its Manager.");
   }
   async removeObserver() {}
-  async applyAction() {
-    throw err("invalid_input");
-  }
-  async rejectAction() {
-    throw err("invalid_input");
-  }
   async revertAction() {
     throw err("invalid_input");
   }
@@ -665,4 +1132,6 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
 }
 export type KnowledgeBase = {
   list(options?: { cursor?: string; limit?: number }): Promise<Page>;
+  proposeKnowledgeCreate(input: { displayName: string }): Promise<ProposalResult>;
+  readCreationOutcome(input: { operationId: string }): Promise<CreationOutcome | null>;
 };

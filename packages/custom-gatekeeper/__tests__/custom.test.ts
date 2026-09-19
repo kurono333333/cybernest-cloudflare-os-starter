@@ -122,6 +122,31 @@ const newHandle = async (
   return handle;
 };
 
+describe("S15 generated type contract", () => {
+  it("keeps creation outcome summaries capability-free and failure reasons closed", () => {
+    const creationSummary = TYPES_CODE.match(/interface KnowledgeCreationSummary \{[^}]*\}/u)?.[0] ?? "";
+    expect(creationSummary).toContain("interface KnowledgeCreationSummary");
+    expect(creationSummary).not.toContain("access?:");
+    expect(creationSummary).toContain('role: "additional";');
+    expect(TYPES_CODE).toContain("knowledge: KnowledgeCreationSummary;");
+    expect(TYPES_CODE).toContain('status: "outcome_unknown"; reason: "outcome_unknown";');
+    expect(TYPES_CODE).toContain('status: "failed"; reason: CreationTerminalFailure;');
+    expect(TYPES_CODE).toContain('status: "applied"; outcome: "ready" | "already_ready" | "provisioning" | "blocked"; knowledge: KnowledgeCreationSummary;');
+    expect(TYPES_CODE).not.toContain('status: "pending_approval" | "applying" | "applied" | "outcome_unknown" | "failed";');
+    expect(TYPES_CODE).toContain('readCreationOutcome(input: { operationId: string }): Promise<KnowledgeCreationOutcome | null>;');
+    expect(TYPES_CODE).not.toContain('Promise<{ operationId: string; KnowledgeCreationOutcome; } | null>');
+    expect(TYPES_CODE).toContain(
+      'type CreationFailure = "service_not_ready" | "capacity_exceeded" | "forbidden" | "invalid_input" | "operation_conflict" | "integrity_failure" | "deadline_exceeded" | "outcome_unknown" | "dependency_unavailable";',
+    );
+    expect(TYPES_CODE).toContain(
+      'type CreationTerminalFailure = "service_not_ready" | "capacity_exceeded" | "forbidden" | "invalid_input" | "operation_conflict" | "integrity_failure";',
+    );
+    expect(TYPES_CODE).not.toContain(
+      'type CreationTerminalFailure = "service_not_ready" | "capacity_exceeded" | "forbidden" | "invalid_input" | "operation_conflict" | "integrity_failure" | "deadline_exceeded" | "dependency_unavailable";',
+    );
+  });
+});
+
 describe("S14 public surface and descriptions", () => {
   it("publishes a private Knowledge Base singleton with exact metadata", () => {
     expect(describeCustomAccount()).toEqual({
@@ -630,4 +655,372 @@ describe("S14 actual Worker/DO/RPC integration", () => {
     expect(result.duplicateCount).toBe(0);
   });
 
+});
+describe("S15 native approved Knowledge create (test-first)", () => {
+  it("fails closed when the direct unit seam has no durable proposal owner", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const session = newSession(queue, access) as unknown as {
+      proposeKnowledgeCreate(input: unknown): Promise<unknown>;
+    };
+
+    await expect(
+      Promise.resolve().then(() => session.proposeKnowledgeCreate({ displayName: "Team Notes" })),
+    ).rejects.toThrow(/dependency_unavailable/);
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it("fails closed for a direct outcome read without the durable proposal owner", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const session = newSession(queue, access) as unknown as {
+      readCreationOutcome(input: unknown): Promise<unknown>;
+    };
+
+    await expect(
+      Promise.resolve().then(() =>
+        session.readCreationOutcome({ operationId: KNOWLEDGE_ID }),
+      ),
+    ).rejects.toThrow(/dependency_unavailable/);
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it("rejects manager/target/action injection before any staged or capability mutation", async () => {
+    const queue = new FakeQueue();
+    const access = new FakeAccessImpl();
+    const session = newSession(queue, access) as unknown as {
+      proposeKnowledgeCreate(input: unknown): Promise<unknown>;
+    };
+
+    await expect(
+      Promise.resolve().then(() =>
+        session.proposeKnowledgeCreate({
+          displayName: "Team Notes",
+          managerId: KNOWLEDGE_ID,
+          targetName: "manager-root",
+          actionRef: KNOWLEDGE_ID,
+          approved: true,
+          rawCapability: {},
+        }),
+      ),
+    ).rejects.toThrow(/invalid_input/);
+    expect(access.listInputs).toHaveLength(0);
+    expect(access.bronzeInputs).toHaveLength(0);
+    expect(queue.observations).toHaveLength(0);
+  });
+});
+
+
+
+describe("S15 native approval integration", () => {
+  type InvalidInputMode =
+    | "invalid_input_bare"
+    | "invalid_input"
+    | "invalid_input_many"
+    | "invalid_input_large"
+    | "invalid_input_extra";
+  type TestFactory = {
+    runProposal(options?: {
+      input?: unknown;
+      createMode?: "ready" | "malformed" | "throw" | "throw_once" | "delay" | "initial" | "blocked" | "wrong_display" | "dependency_unavailable" | "deadline_exceeded" | InvalidInputMode;
+      outcomeMode?: "ready" | "malformed" | "throw" | "failure" | "unobserved" | "initial" | "blocked" | "wrong_display" | "dependency_unavailable" | "deadline_exceeded" | InvalidInputMode;
+      submitFailure?: boolean;
+      decision?: "none" | "approve" | "retry" | "reject";
+    }): Promise<{
+      proposal: unknown | null;
+      outcome: unknown | null;
+      error: string | null;
+      submissions: Array<{ action: number; description: Record<string, unknown> }>;
+      createInputs: unknown[];
+      outcomeInputs: unknown[];
+      observations: ObservationDescription[];
+      queueDisposals: number;
+      autoApprovable: unknown;
+    }>;
+    runCreateFailureRecovery(
+      createMode: "dependency_unavailable" | "deadline_exceeded",
+      outcomeMode: "ready" | "failure" | "unobserved",
+    ): Promise<{
+      createInputs: unknown[];
+      outcomeInputs: unknown[];
+      outcome: unknown | null;
+      status: string;
+      errors: string[];
+    }>;
+    runSynchronousCreateFailureRecovery(): Promise<{
+      createInputs: unknown[];
+      outcomeInputs: unknown[];
+      outcome: unknown | null;
+      status: string;
+      errors: string[];
+    }>;
+    runInvalidCreate(mode: InvalidInputMode): Promise<{
+      error: string | null;
+      outcome: unknown | null;
+      createInputs: unknown[];
+    }>;
+    runConcurrentProposals(count: number): Promise<{
+      successes: number;
+      capacityFailures: number;
+      submissions: number;
+    }>;
+    runConcurrentApply(): Promise<{
+      createInputs: unknown[];
+      outcomeInputs: unknown[];
+      errors: string[];
+    }>;
+    runApplyRejectRace(): Promise<{ createInputs: unknown[]; errors: string[] }>;
+    runResponseLoss(): Promise<{
+      createInputs: unknown[];
+      outcomeInputs: unknown[];
+      status: string;
+      errors: string[];
+    }>;
+    runActionRefFingerprintMismatch(): Promise<{ observations: number; error: string | null }>;
+    runStoredOutcomeUnknown(): Promise<{ observations: number; error: string | null }>;
+    runOutcomeFailureRecovery(outcomeMode?: "failure" | InvalidInputMode): Promise<{
+      createInputs: unknown[];
+      outcomeInputs: unknown[];
+      outcome: unknown | null;
+      errors: string[];
+    }>;
+  };
+  const testEnv = env as unknown as { TEST_FACTORY: DurableObjectNamespace<TestFactory> };
+  const factory = (): DurableObjectStub<TestFactory> =>
+    testEnv.TEST_FACTORY.getByName("s15-" + crypto.randomUUID());
+
+  it.each([
+    ["extra", { displayName: "Team Notes", approved: true }],
+    ["blank", { displayName: "   " }],
+    ["trim", { displayName: " Team Notes" }],
+    ["control", { displayName: "Team\nNotes" }],
+    ["utf8", { displayName: "\u{1F4DA}".repeat(31) }],
+    ["surrogate", { displayName: "\ud800" }],
+    ["manager", { displayName: "Team Notes", managerId: "44444444-4444-4444-8444-444444444444" }],
+    ["target", { displayName: "Team Notes", targetName: "manager-root" }],
+    ["action", { displayName: "Team Notes", actionRef: "44444444-4444-4444-8444-444444444444" }],
+    ["approved", { displayName: "Team Notes", approved: true }],
+  ])("rejects %s input at the actual session boundary", async (_label, input) => {
+    const result = await factory().runProposal({ input });
+    expect(result.proposal).toBeNull();
+    expect(result.error).toMatch(/invalid_input/);
+    expect(result.submissions).toHaveLength(0);
+    expect(result.createInputs).toHaveLength(0);
+  });
+
+  it("stages one exact action and requires native manual approval", async () => {
+    const result = await factory().runProposal();
+    expect(result.proposal).toMatchObject({ status: "pending_approval" });
+    expect(result.submissions).toHaveLength(1);
+    expect(result.submissions[0]?.action).toBe(1);
+    expect(result.submissions[0]?.description).toMatchObject({
+      implementsRevert: false,
+      awaitDecision: true,
+    });
+    expect(result.submissions[0]?.description).not.toHaveProperty("autoApprovable");
+    expect(result.submissions[0]?.description.description).toContain("Team Notes");
+    expect(result.autoApprovable).toEqual([]);
+    expect(result.createInputs).toHaveLength(0);
+    expect(result.outcome).toMatchObject({ status: "pending_approval" });
+  });
+
+  it("applies stored payload only after approval and keeps a compact same-operation result", async () => {
+    const result = await factory().runProposal({ decision: "approve" });
+    expect(result.error).toBeNull();
+    expect(result.proposal).toMatchObject({ status: "pending_approval" });
+    expect(result.createInputs).toEqual([
+      expect.objectContaining({ displayName: "Team Notes" }),
+    ]);
+    expect(result.createInputs[0]).not.toHaveProperty("managerId");
+    expect(result.createInputs[0]).not.toHaveProperty("targetName");
+    expect(result.outcome).toMatchObject({ status: "applied", outcome: "ready" });
+    expect(result.outcomeInputs).toHaveLength(1);
+  });
+
+  it("retries response loss with the same operation/action/payload", async () => {
+    const result = await factory().runProposal({ createMode: "throw_once", decision: "retry" });
+    expect(result.error).toBeNull();
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcome).toMatchObject({ status: "applied", outcome: "ready" });
+  });
+
+  it("recovers a commit-then-throw response with one create and one authority read", async () => {
+    const result = await factory().runResponseLoss();
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcomeInputs).toHaveLength(1);
+    expect(result.status).toBe("applied");
+    expect(result.errors).toEqual(["Knowledge Base outcome_unknown."]);
+  });
+
+  it("rejects by deleting the staged row without invoking the installed capability", async () => {
+    const result = await factory().runProposal({ decision: "reject" });
+    expect(result.error).toBeNull();
+    expect(result.createInputs).toHaveLength(0);
+    expect(result.outcome).toBeNull();
+  });
+
+  it("rolls back the row when native submit fails", async () => {
+    const result = await factory().runProposal({ submitFailure: true });
+    expect(result.proposal).toBeNull();
+    expect(result.error).toMatch(/dependency_unavailable/);
+    expect(result.submissions).toHaveLength(0);
+    expect(result.createInputs).toHaveLength(0);
+  });
+
+  it.each([
+    "dependency_unavailable",
+    "deadline_exceeded",
+  ] as const)("keeps %s create recoverable until the same operation outcome is ready", async (createMode) => {
+    const result = await factory().runCreateFailureRecovery(createMode, "ready");
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.errors).toEqual([`Knowledge Base ${createMode}.`]);
+    expect(result.status).toBe("applied");
+    expect(result.outcome).toMatchObject({ status: "applied", outcome: "ready" });
+  });
+
+  it.each([
+    ["dependency_unavailable", "failure"],
+    ["dependency_unavailable", "unobserved"],
+    ["deadline_exceeded", "failure"],
+    ["deadline_exceeded", "unobserved"],
+  ] as const)("returns outcome_unknown for a recoverable %s when the later outcome is %s", async (createMode, outcomeMode) => {
+    const result = await factory().runCreateFailureRecovery(createMode, outcomeMode);
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.errors).toEqual([
+      `Knowledge Base ${createMode}.`,
+      "Knowledge Base outcome_unknown.",
+    ]);
+    expect(result.status).toBe("applying");
+    expect(result.outcome).toMatchObject({ status: "outcome_unknown" });
+  });
+
+  it("rolls back applying when access resolution throws synchronously before create", async () => {
+    const result = await factory().runSynchronousCreateFailureRecovery();
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.errors).toEqual(["Knowledge Base dependency_unavailable."]);
+    expect(result.status).toBe("applied");
+    expect(result.outcome).toMatchObject({ status: "applied", outcome: "ready" });
+  });
+
+  it.each([
+    ["bare tag", "invalid_input_bare"],
+    ["bounded issues", "invalid_input"],
+  ] as const)("stores valid invalid_input create as terminal failure: %s", async (_label, mode) => {
+    const result = await factory().runInvalidCreate(mode);
+    expect(result.error).toMatch(/invalid_input/);
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcome).toMatchObject({ status: "failed", reason: "invalid_input" });
+  });
+
+  it.each([
+    "invalid_input_many",
+    "invalid_input_large",
+    "invalid_input_extra",
+  ] as const)("rejects malformed invalid_input create as integrity failure: %s", async (createMode) => {
+    const result = await factory().runProposal({ createMode, decision: "approve" });
+    expect(result.error).toMatch(/integrity_failure/);
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcome).toBeNull();
+  });
+
+  it.each([
+    ["initial role", "initial"],
+    ["ready tag with blocked state", "blocked"],
+    ["stored display name mismatch", "wrong_display"],
+  ] as const)("rejects strict create correlation: %s", async (_label, createMode) => {
+    const result = await factory().runProposal({
+      createMode,
+      decision: "approve",
+    });
+    expect(result.error).toMatch(/integrity_failure/);
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcome).toBeNull();
+    expect(result.observations).toHaveLength(0);
+  });
+
+  it.each([
+    ["initial role", "initial"],
+    ["ready tag with blocked state", "blocked"],
+    ["stored display name mismatch", "wrong_display"],
+  ] as const)("rejects strict outcome correlation: %s", async (_label, outcomeMode) => {
+    const result = await factory().runProposal({
+      decision: "retry",
+      createMode: "throw_once",
+      outcomeMode,
+    });
+    expect(result.error).toMatch(/integrity_failure/);
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcome).toBeNull();
+    expect(result.observations).toHaveLength(0);
+  });
+
+  it("admits exactly 64 of 65 concurrent proposals at the native DO boundary", async () => {
+    const result = await factory().runConcurrentProposals(65);
+    expect(result.successes).toBe(64);
+    expect(result.capacityFailures).toBe(1);
+    expect(result.submissions).toBe(64);
+  });
+
+  it("lets concurrent native apply callbacks issue one create and recover applying through one outcome read", async () => {
+    const result = await factory().runConcurrentApply();
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcomeInputs).toHaveLength(1);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("does not create from a stale row deleted by reject during fingerprint hashing", async () => {
+    const result = await factory().runApplyRejectRace();
+    expect(result.createInputs).toHaveLength(0);
+    expect(result.errors).toEqual([expect.stringMatching(/invalid_input/)]);
+  });
+
+  it("revalidates actionRef in the staged fingerprint before readOutcome", async () => {
+    const result = await factory().runActionRefFingerprintMismatch();
+    expect(result.error).toMatch(/integrity_failure/);
+    expect(result.observations).toBe(0);
+  });
+
+  it("keeps applying after an outcome read failure and never retries create", async () => {
+    const result = await factory().runOutcomeFailureRecovery();
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcomeInputs).toHaveLength(2);
+    expect(result.errors).toEqual(["Knowledge Base outcome_unknown.", "Knowledge Base outcome_unknown."]);
+    expect(result.outcome).toMatchObject({ status: "outcome_unknown" });
+  });
+
+  it("keeps applying when an outcome read returns valid invalid_input", async () => {
+    const result = await factory().runOutcomeFailureRecovery("invalid_input");
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcomeInputs).toHaveLength(2);
+    expect(result.errors).toEqual(["Knowledge Base outcome_unknown.", "Knowledge Base outcome_unknown."]);
+    expect(result.outcome).toMatchObject({ status: "outcome_unknown" });
+  });
+
+  it.each([
+    "invalid_input_many",
+    "invalid_input_large",
+    "invalid_input_extra",
+  ] as const)("rejects malformed invalid_input outcome as integrity failure: %s", async (outcomeMode) => {
+    const result = await factory().runProposal({
+      createMode: "throw_once",
+      outcomeMode,
+      decision: "retry",
+    });
+    expect(result.error).toMatch(/integrity_failure/);
+    expect(result.createInputs).toHaveLength(1);
+    expect(result.outcome).toBeNull();
+  });
+
+  it("rejects a legacy stored outcome_unknown instead of exposing it as terminal failure", async () => {
+    const result = await factory().runStoredOutcomeUnknown();
+    expect(result.error).toMatch(/integrity_failure/);
+    expect(result.observations).toBe(0);
+  });
+
+  it("does not authorize or expose malformed installed outcomes", async () => {
+    const result = await factory().runProposal({ decision: "approve", outcomeMode: "malformed" });
+    expect(result.error).toMatch(/integrity_failure/);
+    expect(result.outcome).toBeNull();
+    expect(result.observations).toHaveLength(0);
+  });
 });
