@@ -7,7 +7,8 @@
   "scripts": {
     "build": "tsc",
     "types:check": "tsc --noEmit",
-    "test": "vitest run"
+    "types:test": "tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution bundler --lib ESNext --types ./worker-configuration.d.ts --skipLibCheck __tests__/worker.ts src/env.d.ts",
+    "test": "pnpm run types:test && vitest run && pnpm exec capnweb-validate build --out .wrangler/validate && node --test __tests__/cross-worker-facet.test.mjs"
   },
   "dependencies": {
     "@gadgets/workshop-shared": "workspace:*",

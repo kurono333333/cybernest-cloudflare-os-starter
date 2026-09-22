@@ -132,7 +132,7 @@ type Revision = {
   };
   committedAt: string;
 };
-export type KnowledgeAccountProps = { access: KnowledgeAccess };
+export type KnowledgeAccountProps = { managerId: string };
 const err = (tag: string) => new Error("Knowledge Base " + tag + ".");
 const rec = (v: unknown): v is Record<string, unknown> => {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
@@ -1105,9 +1105,28 @@ function legacyProps(v: unknown): boolean {
   return v === undefined || (rec(v) && Object.keys(v).length === 0);
 }
 function validateProps(v: unknown): Props {
-  if (!rec(v) || !exact(v, ["access"]) || !v.access)
-    throw new TypeError("Knowledge Account props must contain only access.");
-  return { access: validateStub<Access>(v.access as object) };
+  if (!rec(v) || !exact(v, ["managerId"]) || !isManagerId(v.managerId))
+    throw new TypeError("Knowledge Account props must contain only a valid managerId.");
+  return { managerId: v.managerId };
+}
+
+// Facet class props cannot contain capabilities on the deployed platform.
+// This namespace is Worker-private and never handed to an Agent or HTTP caller.
+export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
+  async bind(managerId: string, capability: Access): Promise<void> {
+    if (!isManagerId(managerId) ||
+        !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId)))
+      throw new TypeError("Knowledge access store is bound to another Manager.");
+    await validateStub<Access>(capability as object).assertBoundTo(managerId);
+    // Persist the native stub, not its validation Proxy.
+    await this.ctx.storage.put("access", capability);
+  }
+
+  async getAccess(): Promise<Access> {
+    const access = await this.ctx.storage.get<Access>("access");
+    if (!access) throw new Error("Knowledge Account access is not initialized.");
+    return access;
+  }
 }
 
 @validateRpc()
@@ -1155,11 +1174,10 @@ export class CustomGatekeeper
       `);
     });
   }
-  #access() {
-    const p = this.ctx.props as unknown;
-    if (!rec(p) || !exact(p, ["access"]) || !p.access)
-      throw new TypeError("Knowledge Account props must contain only access.");
-    return validateStub<Access>(p.access as object);
+  async #access(): Promise<Access> {
+    const p = validateProps(this.ctx.props);
+    const access = await this.ctx.exports.KnowledgeAccountAccess.getByName(p.managerId).getAccess();
+    return validateStub<Access>(access);
   }
   async describe(): Promise<ResourceDescription> {
     return {
@@ -1177,7 +1195,7 @@ export class CustomGatekeeper
     return [];
   }
   async startSession(q: RpcStub<ApprovalQueue>) {
-    const access = this.#access();
+    const access = await this.#access();
     const queue = q.dup();
     try {
       const port: ProposalPort = {
@@ -1381,7 +1399,7 @@ export class CustomGatekeeper
         throw err("integrity_failure");
       let raw: unknown;
       try {
-        raw = await this.#access().readAdoptionOutcome({
+        raw = await (await this.#access()).readAdoptionOutcome({
           operationId: row.operation_id,
           knowledgeId: row.knowledge_id,
           generation: row.generation,
@@ -1437,7 +1455,7 @@ export class CustomGatekeeper
 
     let raw: unknown;
     try {
-      const access = this.#access();
+      const access = await this.#access();
       raw = await access.readAdoptionOutcome({
         operationId: row.operation_id,
         knowledgeId: row.knowledge_id,
@@ -1524,7 +1542,7 @@ export class CustomGatekeeper
 
     let raw: unknown;
     try {
-      const access = this.#access();
+      const access = await this.#access();
       raw = await access.readCreationOutcome({ operationId });
     } catch (cause) {
       if (row.status === "applying") {
@@ -1595,7 +1613,7 @@ export class CustomGatekeeper
     ): Promise<"applied" | "outcome_unknown"> => {
       let raw: unknown;
       try {
-        raw = await this.#access().readAdoptionOutcome({
+        raw = await (await this.#access()).readAdoptionOutcome({
           operationId: current.operation_id,
           knowledgeId: current.knowledge_id,
           generation: current.generation,
@@ -1692,7 +1710,7 @@ export class CustomGatekeeper
     };
     let call: Promise<unknown>;
     try {
-      call = this.#access().adoptBronze({
+      call = (await this.#access()).adoptBronze({
         operationId: row.operation_id,
         actionRef: row.action_ref,
         knowledgeId: row.knowledge_id,
@@ -1743,7 +1761,7 @@ export class CustomGatekeeper
     const readApplyingOutcome = async (current: StoredAction): Promise<"applied" | "outcome_unknown"> => {
       let raw: unknown;
       try {
-        const access = this.#access();
+        const access = await this.#access();
         raw = await access.readCreationOutcome({ operationId: current.operation_id });
       } catch {
         return "outcome_unknown";
@@ -1816,7 +1834,7 @@ export class CustomGatekeeper
     };
     let access: Access;
     try {
-      access = this.#access();
+      access = await this.#access();
     } catch {
       rollbackApplying();
       throw err("dependency_unavailable");
@@ -1931,16 +1949,23 @@ export class CustomAccount
     if (!isManagerId(managerIdValue))
       throw new TypeError("Manager ID must be a UUID.");
     if (legacyProps(this.ctx.props)) return "legacy";
+    const previous = this.ctx.props;
+    if (rec(previous) && exact(previous, ["access"]) && previous.access) {
+      // The OS atomically replaces legacy accounts. Validate the old binding first.
+      await validateStub<Access>(previous.access as object).assertBoundTo(managerIdValue);
+      return "legacy";
+    }
     const p = validateProps(this.ctx.props);
-    await p.access.assertBoundTo(managerIdValue);
+    if (p.managerId !== managerIdValue)
+      throw new TypeError("Knowledge Account is bound to another Manager.");
+    const access = await this.ctx.exports.KnowledgeAccountAccess.getByName(p.managerId).getAccess();
+    await access.assertBoundTo(managerIdValue);
     return "bound";
   }
   async getSingletonGatekeeperClass(): Promise<
     DurableObjectClass<Gatekeeper<KnowledgeBase>>
   > {
-    const p = this.ctx.props as unknown;
-    validateProps(p);
-    return this.ctx.exports.CustomGatekeeper({ props: p as Props });
+    return this.ctx.exports.CustomGatekeeper({ props: validateProps(this.ctx.props) });
   }
   async getSupportedResources(): Promise<SupportedResource[]> {
     return [];
@@ -1985,9 +2010,8 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
   ): Promise<Fetcher<GatekeeperUser>> {
     if (!isManagerId(managerId))
       throw new TypeError("Manager ID must be a UUID.");
-    const a = validateStub<Access>(capability as object);
-    await a.assertBoundTo(managerId);
-    return this.ctx.exports.CustomAccount({ props: { access: capability } });
+    await this.ctx.exports.KnowledgeAccountAccess.getByName(managerId).bind(managerId, capability);
+    return this.ctx.exports.CustomAccount({ props: { managerId } });
   }
   connectAccount(
     _c: Fetcher<GatekeeperConnectCallback>,

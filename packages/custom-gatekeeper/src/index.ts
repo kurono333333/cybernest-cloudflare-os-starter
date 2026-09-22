@@ -1,5 +1,6 @@
 export {
   CustomAccount,
+  KnowledgeAccountAccess,
   CustomGatekeeper,
   CustomVerifier,
   GatekeeperVendor,

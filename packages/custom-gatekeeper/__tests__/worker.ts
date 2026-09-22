@@ -216,13 +216,13 @@ type FixtureGatekeeperProbe = {
 type FixtureAccount = {
   describe(): Promise<AccountDescription>;
   inspectManagerBinding(managerId: string): Promise<"legacy" | "bound">;
-  getSingletonGatekeeperClass(): Promise<unknown>;
+  getSingletonGatekeeperClass(): Promise<DurableObjectClass<CustomGatekeeper>>;
 };
 
 type WorkerExports = {
-  TestKnowledgeAccess(options: { props: FixtureAccessProps }): unknown;
-  CustomGatekeeper(options: { props: { access: unknown } }): unknown;
-  InspectableCustomGatekeeper(options: { props: { access: unknown } }): unknown;
+  TestKnowledgeAccess(options: { props: FixtureAccessProps }): FixtureAccessInspector & { managerIdForTest(): Promise<string> };
+  CustomGatekeeper(options: { props: { managerId: string } }): DurableObjectClass<CustomGatekeeper>;
+  InspectableCustomGatekeeper(options: { props: { managerId: string } }): DurableObjectClass<InspectableCustomGatekeeper>;
   CustomAccount(options: { props?: unknown }): FixtureAccount;
   GatekeeperVendor(options: { props?: unknown }): {
     createManagerAccount(managerId: string, capability: unknown): Promise<FixtureAccount>;
@@ -316,6 +316,9 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
 > {
   #adoptionOutcomeMode: AdoptionOutcomeMode | undefined;
 
+  async managerIdForTest(): Promise<string> {
+    return this.ctx.props.managerId;
+  }
   async assertBoundTo(managerId: string): Promise<void> {
     accessLog(this.ctx.props).boundInputs.push(managerId);
     if (this.ctx.props.assertMode === "rpc_failure") {
@@ -586,6 +589,10 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
     this.submissions.push({ action, description: structuredClone(description) });
   }
 
+  async bindHook(): Promise<void> {
+    throw new Error("Unexpected hook in Knowledge fixture.");
+  }
+
   snapshot(): {
     calls: number;
     observations: ObservationDescription[];
@@ -610,7 +617,7 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
 
 export class InspectableCustomGatekeeper extends DurableObject {
   readonly #gatekeeper: CustomGatekeeper;
-  readonly #access: FixtureAccessInspector;
+  readonly #managerId: string;
 
   constructor(
     state: ConstructorParameters<typeof CustomGatekeeper>[0],
@@ -618,11 +625,15 @@ export class InspectableCustomGatekeeper extends DurableObject {
   ) {
     super(state, env);
     this.#gatekeeper = new CustomGatekeeper(state, env);
-    this.#access = (state.props as unknown as { access: FixtureAccessInspector }).access;
+    this.#managerId = (state.props as unknown as { managerId: string }).managerId;
+  }
+  async #access(): Promise<FixtureAccessInspector> {
+    return await this.ctx.exports.KnowledgeAccountAccess.getByName(this.#managerId)
+      .getAccess() as unknown as FixtureAccessInspector;
   }
   async inspectBronzeRow(operationId: string): Promise<Record<string, unknown> | null> {
     const row = this.ctx.storage.sql
-      .exec<Record<string, unknown>>(
+      .exec<Record<string, SqlStorageValue>>(
         "SELECT * FROM custom_gatekeeper_bronze_adoptions WHERE operation_id = ?",
         operationId,
       )
@@ -791,8 +802,8 @@ export class InspectableCustomGatekeeper extends DurableObject {
         )
         .one();
       return {
-        createInputs: await this.#access.createInputLog(),
-        outcomeInputs: await this.#access.outcomeInputLog(),
+        createInputs: await (await this.#access()).createInputLog(),
+        outcomeInputs: await (await this.#access()).outcomeInputLog(),
         outcome,
         status: row.status,
         errors,
@@ -821,15 +832,15 @@ export class InspectableCustomGatekeeper extends DurableObject {
       operationId = proposal.operationId;
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native submission");
-      const props = this.ctx.props as unknown as { access?: unknown };
-      const access = props.access;
-      props.access = undefined;
+      const props = this.ctx.props as unknown as { managerId?: string };
+      const managerId = props.managerId;
+      props.managerId = undefined;
       try {
         await this.#gatekeeper.applyAction(submission.action);
       } catch (cause) {
         errors.push(messageOf(cause));
       } finally {
-        props.access = access;
+        props.managerId = managerId;
       }
       try {
         await this.#gatekeeper.applyAction(submission.action);
@@ -844,8 +855,8 @@ export class InspectableCustomGatekeeper extends DurableObject {
         )
         .one();
       return {
-        createInputs: await this.#access.createInputLog(),
-        outcomeInputs: await this.#access.outcomeInputLog(),
+        createInputs: await (await this.#access()).createInputLog(),
+        outcomeInputs: await (await this.#access()).outcomeInputLog(),
         outcome,
         status: row.status,
         errors,
@@ -885,15 +896,15 @@ export class InspectableCustomGatekeeper extends DurableObject {
       operationId = proposal.operationId;
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native Bronze submission");
-      const props = this.ctx.props as unknown as { access?: unknown };
-      const access = props.access;
-      props.access = undefined;
+      const props = this.ctx.props as unknown as { managerId?: string };
+      const managerId = props.managerId;
+      props.managerId = undefined;
       try {
         await this.#gatekeeper.applyAction(submission.action);
       } catch (cause) {
         errors.push(messageOf(cause));
       } finally {
-        props.access = access;
+        props.managerId = managerId;
       }
       try {
         await this.#gatekeeper.applyAction(submission.action);
@@ -902,15 +913,15 @@ export class InspectableCustomGatekeeper extends DurableObject {
       }
       outcome = await handle.readAdoptionOutcome({ operationId });
       const row = this.ctx.storage.sql
-        .exec<Record<string, unknown>>(
+        .exec<Record<string, SqlStorageValue>>(
           "SELECT * FROM custom_gatekeeper_bronze_adoptions WHERE operation_id = ?",
           operationId,
         )
         .toArray()[0];
       bronzeRow = row === undefined ? null : structuredClone(row);
       return {
-        adoptionInputs: await this.#access.adoptionInputLog(),
-        adoptionOutcomeInputs: await this.#access.adoptionOutcomeInputLog(),
+        adoptionInputs: await (await this.#access()).adoptionInputLog(),
+        adoptionOutcomeInputs: await (await this.#access()).adoptionOutcomeInputLog(),
         outcome,
         bronzeRow,
         errors,
@@ -966,7 +977,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
       for (const result of results) {
         if (result.status === "rejected") errors.push(messageOf(result.reason));
       }
-      return { createInputs: await this.#access.createInputLog(), errors };
+      return { createInputs: await (await this.#access()).createInputLog(), errors };
     } finally {
       session[Symbol.dispose]();
       queue[Symbol.dispose]();
@@ -1005,8 +1016,8 @@ export class InspectableCustomGatekeeper extends DurableObject {
         )
         .one();
       return {
-        createInputs: await this.#access.createInputLog(),
-        outcomeInputs: await this.#access.outcomeInputLog(),
+        createInputs: await (await this.#access()).createInputLog(),
+        outcomeInputs: await (await this.#access()).outcomeInputLog(),
         status: row.status,
         errors,
       };
@@ -1059,14 +1070,20 @@ export class TestGatekeeperFactory extends DurableObject {
     return this.ctx.exports as unknown as WorkerExports;
   }
 
-  #newBinding(props: FixtureAccessProps): {
+  async #props(access: unknown): Promise<{ managerId: string }> {
+    const managerId = await (access as { managerIdForTest(): Promise<string> }).managerIdForTest();
+    await this.#exports().GatekeeperVendor({}).createManagerAccount(managerId, access);
+    return { managerId };
+  }
+
+  async #newBinding(props: FixtureAccessProps): Promise<{
     gatekeeper: FixtureGatekeeper;
     access: FixtureAccessInspector;
-  } {
+  }> {
     const workerExports = this.#exports();
     const accessProps = { ...props, token: crypto.randomUUID() };
     const access = workerExports.TestKnowledgeAccess({ props: accessProps });
-    const gatekeeperClass = workerExports.CustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.CustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-knowledge-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1081,10 +1098,10 @@ export class TestGatekeeperFactory extends DurableObject {
   async runMalformedSession(): Promise<{ duplicateCount: number; error: string | null }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
     const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
-      props: { access, unexpected: true } as unknown as { access: unknown },
+      props: { ...(await this.#props(access)), unexpected: true } as { managerId: string },
     });
     const facetName = "fixture-malformed-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
@@ -1097,9 +1114,9 @@ export class TestGatekeeperFactory extends DurableObject {
   async runStoredOutcomeUnknown(): Promise<{ observations: number; error: string | null }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-stored-outcome-unknown-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1125,13 +1142,13 @@ export class TestGatekeeperFactory extends DurableObject {
     queueDisposals: number;
   }> {
     const props: FixtureAccessProps = {
-      managerId: MANAGER_ID,
+      managerId: crypto.randomUUID(),
       listMode: options.listMode,
       bronzeMode: options.bronzeMode,
       states: options.states,
       nextCursor: options.nextCursor,
     };
-    const { gatekeeper, access } = this.#newBinding(props);
+    const { gatekeeper, access } = await this.#newBinding(props);
     const target = new TestApprovalQueue(options.rejectObservationAt ?? null);
     const queue = new RpcStub<ApprovalQueue>(target);
     let page: Array<Record<string, unknown>> | null = null;
@@ -1190,8 +1207,8 @@ export class TestGatekeeperFactory extends DurableObject {
     queueDisposals: number;
     autoApprovable: unknown;
   }> {
-    const { gatekeeper, access } = this.#newBinding({
-      managerId: MANAGER_ID,
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
       createMode: options.createMode,
       outcomeMode: options.outcomeMode,
     });
@@ -1263,7 +1280,7 @@ export class TestGatekeeperFactory extends DurableObject {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: {
-        managerId: MANAGER_ID,
+        managerId: crypto.randomUUID(),
         states: options.wrongHandle ? ["ready", "ready"] : ["ready"],
         adoptionMode: options.adoptionMode,
         adoptionOutcomeMode: options.outcomeMode,
@@ -1271,7 +1288,7 @@ export class TestGatekeeperFactory extends DurableObject {
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-bronze-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1396,9 +1413,9 @@ export class TestGatekeeperFactory extends DurableObject {
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-access-failure-recovery-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1416,12 +1433,12 @@ export class TestGatekeeperFactory extends DurableObject {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: {
-        managerId: MANAGER_ID,
+        managerId: crypto.randomUUID(),
         states: ["ready"],
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-combined-capacity-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1472,9 +1489,9 @@ export class TestGatekeeperFactory extends DurableObject {
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-action-collision-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1492,12 +1509,12 @@ export class TestGatekeeperFactory extends DurableObject {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: {
-        managerId: MANAGER_ID,
+        managerId: crypto.randomUUID(),
         states: ["ready"],
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-capacity-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1543,8 +1560,8 @@ export class TestGatekeeperFactory extends DurableObject {
     outcome: unknown | null;
     createInputs: unknown[];
   }> {
-    const { gatekeeper, access } = this.#newBinding({
-      managerId: MANAGER_ID,
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
       createMode: mode,
     });
     const target = new TestApprovalQueue();
@@ -1582,7 +1599,7 @@ export class TestGatekeeperFactory extends DurableObject {
     capacityFailures: number;
     submissions: number;
   }> {
-    const { gatekeeper } = this.#newBinding({ managerId: MANAGER_ID });
+    const { gatekeeper } = await this.#newBinding({ managerId: crypto.randomUUID() });
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
     const session = await gatekeeper.startSession(queue);
@@ -1610,8 +1627,8 @@ export class TestGatekeeperFactory extends DurableObject {
     outcomeInputs: unknown[];
     errors: string[];
   }> {
-    const { gatekeeper, access } = this.#newBinding({
-      managerId: MANAGER_ID,
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
       createMode: "delay",
     });
     const target = new TestApprovalQueue();
@@ -1643,9 +1660,9 @@ export class TestGatekeeperFactory extends DurableObject {
   async runApplyRejectRace(): Promise<{ createInputs: unknown[]; errors: string[] }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-apply-reject-race-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1662,9 +1679,9 @@ export class TestGatekeeperFactory extends DurableObject {
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, createMode: "throw_once", token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), createMode: "throw_once", token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-response-loss-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1686,13 +1703,13 @@ export class TestGatekeeperFactory extends DurableObject {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: {
-        managerId: MANAGER_ID,
+        managerId: crypto.randomUUID(),
         createMode,
         outcomeMode,
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-create-failure-recovery-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1710,9 +1727,9 @@ export class TestGatekeeperFactory extends DurableObject {
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-access-failure-recovery-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1724,9 +1741,9 @@ export class TestGatekeeperFactory extends DurableObject {
   async runActionRefFingerprintMismatch(): Promise<{ observations: number; error: string | null }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-action-ref-fingerprint-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1743,8 +1760,8 @@ export class TestGatekeeperFactory extends DurableObject {
     outcome: unknown | null;
     errors: string[];
   }> {
-    const { gatekeeper, access } = this.#newBinding({
-      managerId: MANAGER_ID,
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
       createMode: "throw_once",
       outcomeMode,
     });
@@ -1871,7 +1888,7 @@ export class TestGatekeeperFactory extends DurableObject {
     catalog: AgentCatalog;
     observations: ObservationDescription[];
   }> {
-    const { gatekeeper } = this.#newBinding({ managerId: MANAGER_ID });
+    const { gatekeeper } = await this.#newBinding({ managerId: crypto.randomUUID() });
     const target = new TestObservationAuthorizer();
     const authorizer = new RpcStub<ObservationAuthorizer>(target);
     try {
@@ -1885,7 +1902,7 @@ export class TestGatekeeperFactory extends DurableObject {
   }
 
   async runObserverRejection(): Promise<string | null> {
-    const { gatekeeper } = this.#newBinding({ managerId: MANAGER_ID });
+    const { gatekeeper } = await this.#newBinding({ managerId: crypto.randomUUID() });
     const verifier = new RpcStub(new TestVerifier());
     try {
       await gatekeeper.addObserver("observer", verifier);

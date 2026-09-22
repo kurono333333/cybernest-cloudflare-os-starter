@@ -11,6 +11,7 @@ export default defineConfig({
         compatibilityDate: "2026-08-04",
         compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_compat"],
         durableObjects: {
+          KNOWLEDGE_ACCOUNT_ACCESS: { className: "KnowledgeAccountAccess", useSQLite: true },
           CUSTOM_GATEKEEPER: { className: "CustomGatekeeper", useSQLite: true },
           INSPECTABLE_CUSTOM_GATEKEEPER: {
             className: "InspectableCustomGatekeeper",
