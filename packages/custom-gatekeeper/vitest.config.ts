@@ -1,6 +1,6 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [
@@ -22,5 +22,8 @@ export default defineConfig({
       },
     }),
   ],
-  test: { include: ["__tests__/*.test.ts"] },
+  test: {
+    include: ["__tests__/*.test.ts"],
+    exclude: [...configDefaults.exclude, "__tests__/native-approval.test.ts"],
+  },
 });

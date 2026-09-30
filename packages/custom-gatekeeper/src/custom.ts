@@ -38,6 +38,63 @@ const MAX_DOC = 65536;
 const MAX_PAGE = 50;
 type ListInput = { cursor?: string; limit?: number };
 type BronzeInput = { sourceId: string; revisionId?: string };
+type ArticleMeaning = "proposal" | "inference" | "explicit_decision" | "observed_result";
+type ArticleSourceKind =
+  | "conversation"
+  | "tool_result"
+  | "explicit_user_input"
+  | "user_document"
+  | "artifact";
+type ArticleActorKind = "user" | "assistant" | "tool" | "system";
+type ArticleSection = { text: string; meaning: ArticleMeaning; sourceIds: string[] };
+type ArticleSource = {
+  sourceId: string;
+  kind: ArticleSourceKind;
+  reference: string;
+  version?: string;
+  contentHash?: string;
+  actor: { kind: ArticleActorKind; reference?: string };
+  recordedAt: string;
+  eventAt?: string;
+  excerpt?: string;
+};
+type Article = { sections: ArticleSection[]; sources: ArticleSource[] };
+type ArticleCommand = {
+  protocolVersion: "activity-article/1";
+  operationId: string;
+  actionRef: string;
+  article: Article;
+};
+type ArticleReceipt = {
+  receiptId: string;
+  knowledgeId: string;
+  generation: 1;
+  operationId: string;
+  actionRef: string;
+  payloadHash: string;
+  articleId: string;
+  revisionId: string;
+  revisionNumber: 1;
+  committedAt: string;
+};
+type ArticleTerminalFailure =
+  | "service_not_ready"
+  | "capacity_exceeded"
+  | "forbidden"
+  | "invalid_input"
+  | "article_too_large"
+  | "operation_conflict"
+  | "integrity_failure";
+type ArticleOutcome =
+  | { operationId: string; status: "pending_approval" }
+  | { operationId: string; status: "outcome_unknown"; reason: "outcome_unknown" }
+  | { operationId: string; status: "failed"; reason: ArticleTerminalFailure }
+  | {
+      operationId: string;
+      status: "applied";
+      outcome: "committed" | "already_committed";
+      receipt: ArticleReceipt;
+    };
 type BronzeProvenance = {
   sourceKind: "conversation" | "user_document" | "explicit_user_input";
   reference: string;
@@ -98,6 +155,8 @@ export type KnowledgeAccess = {
     knowledgeId: string;
     generation: 1;
   }): Promise<unknown>;
+  saveArticle(input: { commandJson: string; payloadHash: string }): Promise<unknown>;
+  readArticle(input: { articleId: string; revisionId: string }): Promise<unknown>;
 };
 type Access = KnowledgeAccess;
 type Summary = {
@@ -243,6 +302,9 @@ const observation = (title: string, description: string) => ({
   prohibitAllSharing: true,
 });
 const MAX_PENDING_PROPOSALS = 64;
+const MAX_ARTICLE_BYTES = 65536;
+const MAX_ARTICLE_COMMAND_BYTES = 1048576;
+const ARTICLE_ACTION_KIND = "knowledge.activity-article";
 const ACTION_KIND = "knowledge.create";
 const BRONZE_ACTION_KIND = "knowledge.bronze.adopt";
 const BRONZE_ADOPTION_FAILURE_TAGS = [
@@ -302,6 +364,11 @@ type ProposalPort = {
     identity: BronzeIdentity,
     queue: RpcStub<ApprovalQueue>,
   ): Promise<KnowledgeAdoptionOutcome | null>;
+  proposeArticle(article: Article, queue: RpcStub<ApprovalQueue>): Promise<ProposalResult>;
+  readArticleOutcome(
+    operationId: string,
+    queue: RpcStub<ApprovalQueue>,
+  ): Promise<ArticleOutcome | null>;
 };
 type StoredAction = {
   local_action_id: number;
@@ -311,6 +378,16 @@ type StoredAction = {
   display_name: string;
   status: "pending_approval" | "applying" | "applied" | "failed";
   payload_fingerprint: string;
+  outcome_json: string | null;
+};
+type StoredArticleAction = {
+  local_action_id: number;
+  operation_id: string;
+  action_ref: string;
+  kind: string;
+  command_json: string;
+  payload_hash: string;
+  status: "pending_approval" | "applying" | "applied" | "failed";
   outcome_json: string | null;
 };
 type StoredBronzeAction = {
@@ -531,6 +608,166 @@ const validBronzeInput = (value: unknown): value is BronzeAdoptionInput =>
   documentText(value.document, MAX_DOC) &&
   validBronzeProvenance(value.provenance);
 
+const ARTICLE_MEANINGS = [
+  "proposal",
+  "inference",
+  "explicit_decision",
+  "observed_result",
+] as const;
+const ARTICLE_SOURCE_KINDS = [
+  "conversation",
+  "tool_result",
+  "explicit_user_input",
+  "user_document",
+  "artifact",
+] as const;
+const ARTICLE_TRANSIENT_SOURCE_KINDS = [
+  "conversation",
+  "tool_result",
+  "explicit_user_input",
+] as const;
+const ARTICLE_ACTOR_KINDS = ["user", "assistant", "tool", "system"] as const;
+const hasOnlyRequiredAndOptional = (
+  value: Record<string, unknown>,
+  required: readonly string[],
+  optional: readonly string[],
+): boolean =>
+  required.every((key) => Object.prototype.hasOwnProperty.call(value, key)) &&
+  Object.keys(value).every((key) => required.includes(key) || optional.includes(key));
+const articleSourceId = (value: unknown): value is string =>
+  typeof value === "string" && /^[A-Za-z0-9_-]{1,64}$/u.test(value);
+const articleContentText = (value: unknown): value is string =>
+  text(value, MAX_ARTICLE_COMMAND_BYTES);
+const validArticleSection = (value: unknown): value is ArticleSection =>
+  rec(value) &&
+  exact(value, ["text", "meaning", "sourceIds"]) &&
+  articleContentText(value.text) &&
+  (ARTICLE_MEANINGS as readonly unknown[]).includes(value.meaning) &&
+  Array.isArray(value.sourceIds) &&
+  value.sourceIds.length > 0 &&
+  value.sourceIds.length <= 64 &&
+  value.sourceIds.every(articleSourceId) &&
+  new Set(value.sourceIds).size === value.sourceIds.length;
+const validArticleSource = (value: unknown): value is ArticleSource => {
+  if (
+    !rec(value) ||
+    !hasOnlyRequiredAndOptional(
+      value,
+      ["sourceId", "kind", "reference", "actor", "recordedAt"],
+      ["version", "contentHash", "eventAt", "excerpt"],
+    ) ||
+    !articleSourceId(value.sourceId) ||
+    !(ARTICLE_SOURCE_KINDS as readonly unknown[]).includes(value.kind) ||
+    !visible(value.reference, 512) ||
+    !rec(value.actor) ||
+    !hasOnlyRequiredAndOptional(value.actor, ["kind"], ["reference"]) ||
+    !(ARTICLE_ACTOR_KINDS as readonly unknown[]).includes(value.actor.kind) ||
+    (Object.prototype.hasOwnProperty.call(value.actor, "reference") &&
+      !visible(value.actor.reference, 256)) ||
+    !time(value.recordedAt) ||
+    (Object.prototype.hasOwnProperty.call(value, "eventAt") && !time(value.eventAt)) ||
+    (Object.prototype.hasOwnProperty.call(value, "version") && !visible(value.version, 128)) ||
+    (Object.prototype.hasOwnProperty.call(value, "contentHash") &&
+      (typeof value.contentHash !== "string" || !/^[0-9a-f]{64}$/u.test(value.contentHash))) ||
+    (Object.prototype.hasOwnProperty.call(value, "excerpt") && !articleContentText(value.excerpt))
+  )
+    return false;
+  if (
+    (ARTICLE_TRANSIENT_SOURCE_KINDS as readonly unknown[]).includes(value.kind)
+      ? !Object.prototype.hasOwnProperty.call(value, "excerpt")
+      : !Object.prototype.hasOwnProperty.call(value, "version") &&
+        !Object.prototype.hasOwnProperty.call(value, "contentHash")
+  )
+    return false;
+  return true;
+};
+const articleContentByteLength = (value: unknown): number | undefined => {
+  if (!rec(value) || !Array.isArray(value.sections) || !Array.isArray(value.sources)) return;
+  let bytes = 0;
+  for (const section of value.sections) {
+    if (!rec(section) || typeof section.text !== "string") return;
+    bytes += new TextEncoder().encode(section.text).byteLength;
+  }
+  for (const source of value.sources) {
+    if (!rec(source)) return;
+    if (source.excerpt !== undefined) {
+      if (typeof source.excerpt !== "string") return;
+      bytes += new TextEncoder().encode(source.excerpt).byteLength;
+    }
+  }
+  return bytes;
+};
+const validArticleShape = (value: unknown): value is Article => {
+  if (
+    !rec(value) ||
+    !exact(value, ["sections", "sources"]) ||
+    !Array.isArray(value.sections) ||
+    value.sections.length === 0 ||
+    value.sections.length > 64 ||
+    !value.sections.every(validArticleSection) ||
+    !Array.isArray(value.sources) ||
+    value.sources.length === 0 ||
+    value.sources.length > 64 ||
+    !value.sources.every(validArticleSource)
+  )
+    return false;
+  const sourceIds = new Set(value.sources.map((source) => source.sourceId));
+  if (sourceIds.size !== value.sources.length) return false;
+  const usedSourceIds = new Set(value.sections.flatMap((section) => section.sourceIds));
+  if (
+    usedSourceIds.size !== sourceIds.size ||
+    [...usedSourceIds].some((sourceId) => !sourceIds.has(sourceId))
+  )
+    return false;
+  return true;
+};
+const validArticle = (value: unknown): value is Article =>
+  validArticleShape(value) &&
+  (articleContentByteLength(value) ?? MAX_ARTICLE_BYTES + 1) <= MAX_ARTICLE_BYTES;
+const articleBody = (article: Article): string =>
+  article.sections.map((section) => section.text).join("");
+const validArticleCommand = (value: unknown): value is ArticleCommand =>
+  rec(value) &&
+  exact(value, ["protocolVersion", "operationId", "actionRef", "article"]) &&
+  value.protocolVersion === "activity-article/1" &&
+  uuid(value.operationId) &&
+  uuid(value.actionRef) &&
+  validArticle(value.article);
+const decodeArticleCommand = (commandJson: string): ArticleCommand | undefined => {
+  if (new TextEncoder().encode(commandJson).byteLength > MAX_ARTICLE_COMMAND_BYTES) return;
+  try {
+    const parsed: unknown = JSON.parse(commandJson);
+    return validArticleCommand(parsed) ? parsed : undefined;
+  } catch {
+    return;
+  }
+};
+const sameArticle = (left: Article, right: Article): boolean =>
+  left.sections.length === right.sections.length &&
+  left.sources.length === right.sources.length &&
+  left.sections.every((section, index) => {
+    const other = right.sections[index];
+    return other !== undefined &&
+      section.text === other.text &&
+      section.meaning === other.meaning &&
+      section.sourceIds.length === other.sourceIds.length &&
+      section.sourceIds.every((sourceId, sourceIndex) => sourceId === other.sourceIds[sourceIndex]);
+  }) &&
+  left.sources.every((source, index) => {
+    const other = right.sources[index];
+    return other !== undefined &&
+      source.sourceId === other.sourceId &&
+      source.kind === other.kind &&
+      source.reference === other.reference &&
+      source.version === other.version &&
+      source.contentHash === other.contentHash &&
+      source.actor.kind === other.actor.kind &&
+      source.actor.reference === other.actor.reference &&
+      source.recordedAt === other.recordedAt &&
+      source.eventAt === other.eventAt &&
+      source.excerpt === other.excerpt;
+  });
+
 const maxFenceRun = (value: string, character: string): number => {
   let max = 0;
   const pattern = new RegExp(
@@ -541,6 +778,75 @@ const maxFenceRun = (value: string, character: string): number => {
   );
   for (const match of value.matchAll(pattern)) max = Math.max(max, match[0].length);
   return max;
+};
+
+const articleReviewDescription = (commandJson: string): string => {
+  const command = decodeArticleCommand(commandJson);
+  if (command === undefined) throw err("integrity_failure");
+  const body = articleBody(command.article);
+  const values = [
+    body,
+    ...command.article.sections.map((section) => section.text),
+    ...command.article.sources.flatMap((source) => [
+      source.reference,
+      source.version ?? "",
+      source.contentHash ?? "",
+      source.actor.reference ?? "",
+      source.excerpt ?? "",
+    ]),
+  ];
+  const backticks = Math.max(
+    ...values.map((value) => maxFenceRun(value, String.fromCharCode(96))),
+    0,
+  );
+  const tildes = Math.max(...values.map((value) => maxFenceRun(value, "~")), 0);
+  const backtickLength = Math.max(backticks, 2) + 1;
+  const tildeLength = Math.max(tildes, 2) + 1;
+  const fenceCharacter = backtickLength <= tildeLength ? String.fromCharCode(96) : "~";
+  const fenceLength = fenceCharacter === String.fromCharCode(96) ? backtickLength : tildeLength;
+  const fence = fenceCharacter.repeat(fenceLength);
+  const lines = [
+    "Review the complete Activity Article before saving it to Personal Knowledge.",
+    "body (section text concatenated in order):",
+    fence,
+    body,
+    fence,
+    "sections:",
+  ];
+  command.article.sections.forEach((section, index) => {
+    lines.push(
+      `${index + 1}. meaning=${section.meaning}`,
+      `sourceIds=${section.sourceIds.join(", ")}`,
+      "text:",
+      fence,
+      section.text,
+      fence,
+    );
+  });
+  lines.push("sources:");
+  command.article.sources.forEach((source, index) => {
+    lines.push(
+      `source ${index + 1} metadata:`,
+      fence,
+      `sourceId=${source.sourceId}`,
+      `kind=${source.kind}`,
+      `reference=${source.reference}`,
+      `version=${source.version ?? "(not provided)"}`,
+      `contentHash=${source.contentHash ?? "(not provided)"}`,
+      `actor.kind=${source.actor.kind}`,
+      `actor.reference=${source.actor.reference ?? "(not provided)"}`,
+      `recordedAt=${source.recordedAt}`,
+      `eventAt=${source.eventAt ?? "(not provided)"}`,
+      fence,
+    );
+    if (source.excerpt !== undefined) {
+      lines.push("source excerpt:", fence, source.excerpt, fence);
+    } else {
+      lines.push("source excerpt: (not provided)");
+    }
+    lines.push("");
+  });
+  return lines.join("\n");
 };
 
 const bronzeReviewDescription = (input: {
@@ -590,6 +896,178 @@ const validStoredAction = (row: StoredAction): boolean =>
   visible(row.display_name, 120) &&
   ["pending_approval", "applying", "applied", "failed"].includes(row.status) &&
   /^[0-9a-f]{64}$/u.test(row.payload_fingerprint);
+
+const validStoredArticleAction = (row: StoredArticleAction): boolean =>
+  Number.isSafeInteger(row.local_action_id) &&
+  row.local_action_id >= 1 &&
+  uuid(row.operation_id) &&
+  uuid(row.action_ref) &&
+  row.kind === ARTICLE_ACTION_KIND &&
+  typeof row.command_json === "string" &&
+  new TextEncoder().encode(row.command_json).byteLength <= MAX_ARTICLE_COMMAND_BYTES &&
+  /^[0-9a-f]{64}$/u.test(row.payload_hash) &&
+  ["pending_approval", "applying", "applied", "failed"].includes(row.status);
+
+const articleReceipt = (
+  value: unknown,
+  row: StoredArticleAction,
+  command: ArticleCommand,
+): ArticleReceipt | undefined => {
+  if (
+    !rec(value) ||
+    !exact(value, [
+      "receiptId",
+      "knowledgeId",
+      "generation",
+      "operationId",
+      "actionRef",
+      "payloadHash",
+      "articleId",
+      "revisionId",
+      "revisionNumber",
+      "committedAt",
+    ]) ||
+    !uuid(value.receiptId) ||
+    !uuid(value.knowledgeId) ||
+    value.generation !== 1 ||
+    value.operationId !== row.operation_id ||
+    value.operationId !== command.operationId ||
+    value.actionRef !== row.action_ref ||
+    value.actionRef !== command.actionRef ||
+    value.payloadHash !== row.payload_hash ||
+    !/^[0-9a-f]{64}$/u.test(String(value.payloadHash)) ||
+    !uuid(value.articleId) ||
+    !uuid(value.revisionId) ||
+    value.revisionNumber !== 1 ||
+    !time(value.committedAt)
+  )
+    return;
+  return value as ArticleReceipt;
+};
+
+const storedArticleOutcome = (
+  value: string | null,
+  row: StoredArticleAction,
+  command: ArticleCommand,
+): ArticleOutcome | undefined => {
+  if (value === null) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return;
+  }
+  if (!rec(parsed) || parsed.operationId !== row.operation_id) return;
+  if (parsed.status === "failed") {
+    return exact(parsed, ["operationId", "status", "reason"]) &&
+      ARTICLE_TERMINAL_FAILURES.includes(parsed.reason as ArticleTerminalFailure)
+      ? (parsed as ArticleOutcome)
+      : undefined;
+  }
+  if (
+    parsed.status !== "applied" ||
+    !exact(parsed, ["operationId", "status", "outcome", "receipt"]) ||
+    (parsed.outcome !== "committed" && parsed.outcome !== "already_committed")
+  )
+    return;
+  const receipt = articleReceipt(parsed.receipt, row, command);
+  return receipt === undefined ? undefined : (parsed as ArticleOutcome);
+};
+
+const ARTICLE_TERMINAL_FAILURES: readonly ArticleTerminalFailure[] = [
+  "service_not_ready",
+  "capacity_exceeded",
+  "forbidden",
+  "invalid_input",
+  "article_too_large",
+  "operation_conflict",
+  "integrity_failure",
+];
+const articleSaveResult = (
+  value: unknown,
+  row: StoredArticleAction,
+  command: ArticleCommand,
+):
+  | { outcome: "committed" | "already_committed"; receipt: ArticleReceipt }
+  | { failure: ArticleTerminalFailure }
+  | { uncertain: true }
+  | undefined => {
+  if (!rec(value) || typeof value._tag !== "string") return;
+  if (value._tag === "committed" || value._tag === "already_committed") {
+    if (!exact(value, ["_tag", "receipt"])) return;
+    const receipt = articleReceipt(value.receipt, row, command);
+    return receipt === undefined
+      ? undefined
+      : { outcome: value._tag, receipt };
+  }
+  if (value._tag === "dependency_unavailable") {
+    return exact(value, ["_tag", "dependency"]) &&
+      (value.dependency === "knowledge-control" || value.dependency === "knowledge-agent")
+      ? { uncertain: true }
+      : undefined;
+  }
+  if (
+    value._tag === "deadline_exceeded" ||
+    value._tag === "outcome_unknown" ||
+    value._tag === "not_found"
+  )
+    return exact(value, ["_tag"]) ? { uncertain: true } : undefined;
+  return ARTICLE_TERMINAL_FAILURES.includes(value._tag as ArticleTerminalFailure) &&
+    exact(value, ["_tag"])
+    ? { failure: value._tag as ArticleTerminalFailure }
+    : undefined;
+};
+
+const exactArticleReadMatches = (
+  value: unknown,
+  row: StoredArticleAction,
+  command: ArticleCommand,
+  receipt: ArticleReceipt,
+): boolean =>
+  rec(value) &&
+  exact(value, [
+    "_tag",
+    "knowledgeId",
+    "generation",
+    "articleId",
+    "revisionId",
+    "revisionNumber",
+    "committedAt",
+    "operationId",
+    "actionRef",
+    "payloadHash",
+    "article",
+    "body",
+  ]) &&
+  value._tag === "found" &&
+  value.knowledgeId === receipt.knowledgeId &&
+  value.generation === receipt.generation &&
+  value.articleId === receipt.articleId &&
+  value.revisionId === receipt.revisionId &&
+  value.revisionNumber === receipt.revisionNumber &&
+  value.committedAt === receipt.committedAt &&
+  value.operationId === row.operation_id &&
+  value.operationId === command.operationId &&
+  value.actionRef === row.action_ref &&
+  value.actionRef === command.actionRef &&
+  value.payloadHash === row.payload_hash &&
+  validArticle(value.article) &&
+  sameArticle(value.article, command.article) &&
+  typeof value.body === "string" &&
+  value.body === articleBody(command.article);
+
+const validStoredArticleCommand = (
+  row: StoredArticleAction,
+): ArticleCommand | undefined => {
+  const command = decodeArticleCommand(row.command_json);
+  if (
+    command === undefined ||
+    command.operationId !== row.operation_id ||
+    command.actionRef !== row.action_ref
+  )
+    return;
+  return command;
+};
 
 const validStoredBronzeAction = (row: StoredBronzeAction): boolean =>
   Number.isSafeInteger(row.local_action_id) &&
@@ -994,6 +1472,20 @@ export class KnowledgeSession extends RpcTarget {
     if (!this.#port) throw err("dependency_unavailable");
     return this.#port.readOutcome(i.operationId, this.#q);
   }
+  async proposeArticle(i: unknown): Promise<ProposalResult> {
+    if (!rec(i) || !exact(i, ["article"])) throw err("invalid_input");
+    if (!validArticleShape(i.article)) throw err("invalid_input");
+    if ((articleContentByteLength(i.article) ?? MAX_ARTICLE_BYTES + 1) > MAX_ARTICLE_BYTES)
+      throw err("article_too_large");
+    if (!this.#port) throw err("dependency_unavailable");
+    return this.#port.proposeArticle(i.article, this.#q);
+  }
+  async readArticleOutcome(i: unknown): Promise<ArticleOutcome | null> {
+    if (!rec(i) || !exact(i, ["operationId"]) || !uuid(i.operationId))
+      throw err("invalid_input");
+    if (!this.#port) throw err("dependency_unavailable");
+    return this.#port.readArticleOutcome(i.operationId, this.#q);
+  }
   async list(o?: ListInput): Promise<Page> {
     if (
       o !== undefined &&
@@ -1134,6 +1626,8 @@ export class CustomGatekeeper
   extends DurableObject<Cloudflare.Env, Props>
   implements Gatekeeper<KnowledgeBase>
 {
+  #articleApplyInFlight = new Map<number, Promise<void>>();
+
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
@@ -1151,6 +1645,16 @@ export class CustomGatekeeper
           display_name TEXT NOT NULL,
           status TEXT NOT NULL,
           payload_fingerprint TEXT NOT NULL,
+          outcome_json TEXT
+        );
+        CREATE TABLE IF NOT EXISTS custom_gatekeeper_article_actions (
+          local_action_id INTEGER PRIMARY KEY,
+          operation_id TEXT NOT NULL UNIQUE,
+          action_ref TEXT NOT NULL UNIQUE,
+          kind TEXT NOT NULL,
+          command_json TEXT NOT NULL,
+          payload_hash TEXT NOT NULL,
+          status TEXT NOT NULL,
           outcome_json TEXT
         );
         CREATE TABLE IF NOT EXISTS custom_gatekeeper_bronze_adoptions (
@@ -1205,6 +1709,10 @@ export class CustomGatekeeper
           this.#proposeBronze(input, identity, displayName, approvalQueue),
         readBronzeOutcome: (operationId, identity, approvalQueue) =>
           this.#readBronzeOutcome(operationId, identity, approvalQueue),
+        proposeArticle: (article, approvalQueue) =>
+          this.#proposeArticle(article, approvalQueue),
+        readArticleOutcome: (operationId, approvalQueue) =>
+          this.#readArticleOutcome(operationId, approvalQueue),
       };
       return new KnowledgeSession(queue, access, port);
     } catch (cause) {
@@ -1222,7 +1730,7 @@ export class CustomGatekeeper
     const fingerprint = await payloadHash(operationId, actionRef, displayName);
     const pending = this.ctx.storage.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) AS count FROM (SELECT status FROM custom_gatekeeper_staged_actions UNION ALL SELECT status FROM custom_gatekeeper_bronze_adoptions) WHERE status IN ('pending_approval', 'applying')",
+        "SELECT COUNT(*) AS count FROM (SELECT status FROM custom_gatekeeper_staged_actions UNION ALL SELECT status FROM custom_gatekeeper_bronze_adoptions UNION ALL SELECT status FROM custom_gatekeeper_article_actions) WHERE status IN ('pending_approval', 'applying')",
       )
       .one().count;
     if (pending >= MAX_PENDING_PROPOSALS) throw err("capacity_exceeded");
@@ -1275,7 +1783,7 @@ export class CustomGatekeeper
     });
     const pending = this.ctx.storage.sql
       .exec<{ count: number }>(
-        "SELECT COUNT(*) AS count FROM (SELECT status FROM custom_gatekeeper_staged_actions UNION ALL SELECT status FROM custom_gatekeeper_bronze_adoptions) WHERE status IN ('pending_approval', 'applying')",
+        "SELECT COUNT(*) AS count FROM (SELECT status FROM custom_gatekeeper_staged_actions UNION ALL SELECT status FROM custom_gatekeeper_bronze_adoptions UNION ALL SELECT status FROM custom_gatekeeper_article_actions) WHERE status IN ('pending_approval', 'applying')",
       )
       .one().count;
     if (pending >= MAX_PENDING_PROPOSALS) throw err("capacity_exceeded");
@@ -1328,6 +1836,135 @@ export class CustomGatekeeper
       throw err("dependency_unavailable");
     }
     return { operationId, status: "pending_approval" };
+  }
+
+  async #proposeArticle(
+    article: Article,
+    queue: RpcStub<ApprovalQueue>,
+  ): Promise<ProposalResult> {
+    if (!validArticleShape(article)) throw err("invalid_input");
+    if ((articleContentByteLength(article) ?? MAX_ARTICLE_BYTES + 1) > MAX_ARTICLE_BYTES)
+      throw err("article_too_large");
+    const operationId = crypto.randomUUID();
+    const actionRef = crypto.randomUUID();
+    const command: ArticleCommand = {
+      protocolVersion: "activity-article/1",
+      operationId,
+      actionRef,
+      article: structuredClone(article),
+    };
+    let commandJson: string;
+    try {
+      commandJson = JSON.stringify(command);
+    } catch {
+      throw err("invalid_input");
+    }
+    if (new TextEncoder().encode(commandJson).byteLength > MAX_ARTICLE_COMMAND_BYTES)
+      throw err("article_too_large");
+    const payloadHash = await documentHash(commandJson);
+    const pending = this.ctx.storage.sql
+      .exec<{ count: number }>(
+        "SELECT COUNT(*) AS count FROM (SELECT status FROM custom_gatekeeper_staged_actions UNION ALL SELECT status FROM custom_gatekeeper_bronze_adoptions UNION ALL SELECT status FROM custom_gatekeeper_article_actions) WHERE status IN ('pending_approval', 'applying')",
+      )
+      .one().count;
+    if (pending >= MAX_PENDING_PROPOSALS) throw err("capacity_exceeded");
+    const next = this.ctx.storage.sql
+      .exec<{ next_id: number }>(
+        "SELECT next_id FROM custom_gatekeeper_action_sequence WHERE id = 1",
+      )
+      .one().next_id;
+    this.ctx.storage.sql.exec(
+      "UPDATE custom_gatekeeper_action_sequence SET next_id = next_id + 1 WHERE id = 1",
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT INTO custom_gatekeeper_article_actions (local_action_id, operation_id, action_ref, kind, command_json, payload_hash, status, outcome_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+      next,
+      operationId,
+      actionRef,
+      ARTICLE_ACTION_KIND,
+      commandJson,
+      payloadHash,
+      "pending_approval",
+      null,
+    );
+    const description: ActionDescription = {
+      title: "Review Article for Personal Knowledge",
+      description: articleReviewDescription(commandJson),
+      implementsRevert: false,
+      awaitDecision: true,
+      autoApprovable: false,
+    };
+    try {
+      await queue.submitAction(next, description);
+    } catch {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM custom_gatekeeper_article_actions WHERE local_action_id = ? AND operation_id = ?",
+        next,
+        operationId,
+      );
+      throw err("dependency_unavailable");
+    }
+    return { operationId, status: "pending_approval" };
+  }
+
+  async #readArticleOutcome(
+    operationId: string,
+    queue: RpcStub<ApprovalQueue>,
+  ): Promise<ArticleOutcome | null> {
+    const readRow = (): StoredArticleAction | undefined =>
+      this.ctx.storage.sql
+        .exec<StoredArticleAction>(
+          "SELECT local_action_id, operation_id, action_ref, kind, command_json, payload_hash, status, outcome_json FROM custom_gatekeeper_article_actions WHERE operation_id = ?",
+          operationId,
+        )
+        .toArray()[0];
+    const observe = () =>
+      queue.authorizeObservation(
+        observation(
+          "Activity Article approval outcome",
+          "Read the approval and verified save receipt for one Activity Article.",
+        ),
+      );
+    let row = readRow();
+    if (row === undefined) return null;
+    if (!validStoredArticleAction(row)) throw err("integrity_failure");
+    const command = validStoredArticleCommand(row);
+    const expectedHash = await documentHash(row.command_json);
+    row = readRow();
+    if (
+      row === undefined ||
+      !validStoredArticleAction(row) ||
+      row.payload_hash !== expectedHash ||
+      row.operation_id !== operationId
+    )
+      throw err("integrity_failure");
+    const checkedCommand = validStoredArticleCommand(row);
+    if (checkedCommand === undefined || command === undefined ||
+        checkedCommand.actionRef !== command.actionRef)
+      throw err("integrity_failure");
+    if (row.status === "pending_approval") {
+      await observe();
+      return { operationId, status: "pending_approval" };
+    }
+    if (row.status === "applying") {
+      await observe();
+      return { operationId, status: "outcome_unknown", reason: "outcome_unknown" };
+    }
+    if (row.status === "failed") {
+      const result = storedArticleOutcome(row.outcome_json, row, checkedCommand);
+      if (result === undefined || result.status !== "failed")
+        throw err("integrity_failure");
+      await observe();
+      return result;
+    }
+    if (row.status === "applied") {
+      const result = storedArticleOutcome(row.outcome_json, row, checkedCommand);
+      if (result === undefined || result.status !== "applied")
+        throw err("integrity_failure");
+      await observe();
+      return result;
+    }
+    throw err("integrity_failure");
   }
 
   async #readBronzeOutcome(
@@ -1594,10 +2231,170 @@ export class CustomGatekeeper
         actionId,
       )
       .toArray();
-    if (createRows.length > 0 && bronzeRows.length > 0) throw err("integrity_failure");
+    const articleRows = this.ctx.storage.sql
+      .exec<{ local_action_id: number }>(
+        "SELECT local_action_id FROM custom_gatekeeper_article_actions WHERE local_action_id = ?",
+        actionId,
+      )
+      .toArray();
+    if ([createRows, bronzeRows, articleRows].filter((rows) => rows.length > 0).length > 1)
+      throw err("integrity_failure");
     if (createRows.length > 0) return this.#applyCreationAction(actionId);
     if (bronzeRows.length > 0) return this.#applyBronzeAction(actionId);
+    if (articleRows.length > 0) return this.#applyArticleAction(actionId);
     throw err("invalid_input");
+  }
+
+  async #applyArticleAction(actionId: number): Promise<void> {
+    const inFlight = this.#articleApplyInFlight.get(actionId);
+    if (inFlight !== undefined) return inFlight;
+
+    const applying = this.#applyArticleActionOnce(actionId);
+    this.#articleApplyInFlight.set(actionId, applying);
+    try {
+      await applying;
+    } finally {
+      if (this.#articleApplyInFlight.get(actionId) === applying)
+        this.#articleApplyInFlight.delete(actionId);
+    }
+  }
+
+  async #applyArticleActionOnce(actionId: number): Promise<void> {
+    const readRow = (): StoredArticleAction | undefined =>
+      this.ctx.storage.sql
+        .exec<StoredArticleAction>(
+          "SELECT local_action_id, operation_id, action_ref, kind, command_json, payload_hash, status, outcome_json FROM custom_gatekeeper_article_actions WHERE local_action_id = ?",
+          actionId,
+        )
+        .toArray()[0];
+    let row = readRow();
+    if (row === undefined) throw err("invalid_input");
+    if (!validStoredArticleAction(row)) throw err("integrity_failure");
+    const expectedPayloadHash = await documentHash(row.command_json);
+    let command = validStoredArticleCommand(row);
+    row = readRow();
+    if (
+      row === undefined ||
+      !validStoredArticleAction(row) ||
+      row.payload_hash !== expectedPayloadHash ||
+      (command = validStoredArticleCommand(row)) === undefined
+    )
+      throw err(row === undefined ? "invalid_input" : "integrity_failure");
+    if (row.status === "applied") {
+      const result = storedArticleOutcome(row.outcome_json, row, command);
+      if (result === undefined || result.status !== "applied") throw err("integrity_failure");
+      return;
+    }
+    if (row.status === "failed") {
+      const result = storedArticleOutcome(row.outcome_json, row, command);
+      if (result === undefined || result.status !== "failed") throw err("integrity_failure");
+      throw err(result.reason);
+    }
+    if (row.status !== "pending_approval" && row.status !== "applying")
+      throw err("integrity_failure");
+    let outcomeMayAlreadyExist = row.status === "applying";
+
+    let access: Access;
+    try {
+      access = await this.#access();
+    } catch {
+      if (row.status === "applying") throw err("outcome_unknown");
+      throw err("dependency_unavailable");
+    }
+    if (row.status === "pending_approval") {
+      const transition = this.ctx.storage.sql.exec(
+        "UPDATE custom_gatekeeper_article_actions SET status = 'applying' WHERE local_action_id = ? AND status = 'pending_approval'",
+        actionId,
+      );
+      row = readRow();
+      if (
+        row === undefined ||
+        !validStoredArticleAction(row) ||
+        row.payload_hash !== expectedPayloadHash ||
+        (command = validStoredArticleCommand(row)) === undefined
+      )
+        throw err(row === undefined ? "invalid_input" : "integrity_failure");
+      if (row.status !== "applying") {
+        if (row.status === "applied") {
+          const result = storedArticleOutcome(row.outcome_json, row, command);
+          if (result === undefined || result.status !== "applied") throw err("integrity_failure");
+          return;
+        }
+        if (row.status === "failed") {
+          const result = storedArticleOutcome(row.outcome_json, row, command);
+          if (result === undefined || result.status !== "failed") throw err("integrity_failure");
+          throw err(result.reason);
+        }
+        throw err("integrity_failure");
+      }
+      if (transition.rowsWritten !== 1) outcomeMayAlreadyExist = true;
+    }
+
+    let saveRaw: unknown;
+    try {
+      saveRaw = await access.saveArticle({
+        commandJson: row.command_json,
+        payloadHash: row.payload_hash,
+      });
+    } catch {
+      throw err("outcome_unknown");
+    }
+    const saved = articleSaveResult(saveRaw, row, command);
+    if (saved === undefined || "uncertain" in saved) throw err("outcome_unknown");
+    if ("failure" in saved) {
+      // Core can reject an unusable receipt after a commit. Preserve applying so reads/retries
+      // resolve the outcome instead of turning a possibly committed write into a rejection.
+      if (outcomeMayAlreadyExist) throw err("outcome_unknown");
+      if (saved.failure === "integrity_failure") throw err("integrity_failure");
+      const outcome: ArticleOutcome = {
+        operationId: row.operation_id,
+        status: "failed",
+        reason: saved.failure,
+      };
+      this.ctx.storage.sql.exec(
+        "UPDATE custom_gatekeeper_article_actions SET status = 'failed', outcome_json = ? WHERE local_action_id = ? AND status = 'applying'",
+        JSON.stringify(outcome),
+        actionId,
+      );
+      throw err(saved.failure);
+    }
+
+    let readRaw: unknown;
+    try {
+      readRaw = await access.readArticle({
+        articleId: saved.receipt.articleId,
+        revisionId: saved.receipt.revisionId,
+      });
+    } catch {
+      throw err("outcome_unknown");
+    }
+    if (!exactArticleReadMatches(readRaw, row, command, saved.receipt)) {
+      if (rec(readRaw) && readRaw._tag === "found") throw err("integrity_failure");
+      throw err("outcome_unknown");
+    }
+
+    const outcome: ArticleOutcome = {
+      operationId: row.operation_id,
+      status: "applied",
+      outcome: saved.outcome,
+      receipt: saved.receipt,
+    };
+    const transition = this.ctx.storage.sql.exec(
+      "UPDATE custom_gatekeeper_article_actions SET status = 'applied', outcome_json = ? WHERE local_action_id = ? AND status = 'applying'",
+      JSON.stringify(outcome),
+      actionId,
+    );
+    if (transition.rowsWritten !== 1) {
+      const current = readRow();
+      if (
+        current !== undefined &&
+        validStoredArticleAction(current) &&
+        current.status === "applied" &&
+        storedArticleOutcome(current.outcome_json, current, command)?.status === "applied"
+      )
+        return;
+      throw err("outcome_unknown");
+    }
   }
 
   async #applyBronzeAction(actionId: number): Promise<void> {
@@ -1886,7 +2683,14 @@ export class CustomGatekeeper
         actionId,
       )
       .toArray();
-    if (createRows.length > 0 && bronzeRows.length > 0) throw err("integrity_failure");
+    const articleRows = this.ctx.storage.sql
+      .exec<{ local_action_id: number }>(
+        "SELECT local_action_id FROM custom_gatekeeper_article_actions WHERE local_action_id = ?",
+        actionId,
+      )
+      .toArray();
+    if ([createRows, bronzeRows, articleRows].filter((rows) => rows.length > 0).length > 1)
+      throw err("integrity_failure");
     if (createRows.length > 0) {
       this.ctx.storage.sql.exec(
         "DELETE FROM custom_gatekeeper_staged_actions WHERE local_action_id = ? AND status = 'pending_approval'",
@@ -1899,6 +2703,27 @@ export class CustomGatekeeper
         "DELETE FROM custom_gatekeeper_bronze_adoptions WHERE local_action_id = ? AND status = 'pending_approval'",
         actionId,
       );
+      return;
+    }
+    if (articleRows.length > 0) {
+      const row = this.ctx.storage.sql
+        .exec<Pick<StoredArticleAction, "status">>(
+          "SELECT status FROM custom_gatekeeper_article_actions WHERE local_action_id = ?",
+          actionId,
+        )
+        .toArray()[0];
+      if (row?.status === "pending_approval") {
+        this.ctx.storage.sql.exec(
+          "DELETE FROM custom_gatekeeper_article_actions WHERE local_action_id = ? AND status = 'pending_approval'",
+          actionId,
+        );
+        return;
+      }
+      if (row?.status === "applying" || row?.status === "applied")
+        throw err("outcome_unknown");
+      if (row === undefined) throw err("invalid_input");
+      if (row.status === "failed") return;
+      throw err("integrity_failure");
     }
   }
   async getAgentCatalog(
@@ -2030,6 +2855,8 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
 }
 export type KnowledgeBase = {
   list(options?: { cursor?: string; limit?: number }): Promise<Page>;
+  proposeArticle(input: { article: Article }): Promise<ProposalResult>;
+  readArticleOutcome(input: { operationId: string }): Promise<ArticleOutcome | null>;
   proposeKnowledgeCreate(input: { displayName: string }): Promise<ProposalResult>;
   readCreationOutcome(input: { operationId: string }): Promise<CreationOutcome | null>;
 };
