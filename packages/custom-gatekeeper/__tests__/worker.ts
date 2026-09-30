@@ -8,6 +8,8 @@ import type {
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { CustomGatekeeper } from "../src/custom.js";
+import type { Overseer } from "@gadgets/workshop-shared/api";
+import type { RpcStub as CapnwebRpcStub } from "capnweb";
 
 export { default } from "../src/index.js";
 export * from "../src/index.js";
@@ -216,13 +218,13 @@ type FixtureGatekeeperProbe = {
 type FixtureAccount = {
   describe(): Promise<AccountDescription>;
   inspectManagerBinding(managerId: string): Promise<"legacy" | "bound">;
-  getSingletonGatekeeperClass(): Promise<unknown>;
+  getSingletonGatekeeperClass(): Promise<DurableObjectClass<CustomGatekeeper>>;
 };
 
 type WorkerExports = {
-  TestKnowledgeAccess(options: { props: FixtureAccessProps }): unknown;
-  CustomGatekeeper(options: { props: { access: unknown } }): unknown;
-  InspectableCustomGatekeeper(options: { props: { access: unknown } }): unknown;
+  TestKnowledgeAccess(options: { props: FixtureAccessProps }): FixtureAccessInspector & { managerIdForTest(): Promise<string> };
+  CustomGatekeeper(options: { props: { managerId: string } }): DurableObjectClass<CustomGatekeeper>;
+  InspectableCustomGatekeeper(options: { props: { managerId: string } }): DurableObjectClass<InspectableCustomGatekeeper>;
   CustomAccount(options: { props?: unknown }): FixtureAccount;
   GatekeeperVendor(options: { props?: unknown }): {
     createManagerAccount(managerId: string, capability: unknown): Promise<FixtureAccount>;
@@ -316,6 +318,9 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
 > {
   #adoptionOutcomeMode: AdoptionOutcomeMode | undefined;
 
+  async managerIdForTest(): Promise<string> {
+    return this.ctx.props.managerId;
+  }
   async assertBoundTo(managerId: string): Promise<void> {
     accessLog(this.ctx.props).boundInputs.push(managerId);
     if (this.ctx.props.assertMode === "rpc_failure") {
@@ -586,6 +591,10 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
     this.submissions.push({ action, description: structuredClone(description) });
   }
 
+  async bindHook(): Promise<void> {
+    throw new Error("Unexpected hook in Knowledge fixture.");
+  }
+
   snapshot(): {
     calls: number;
     observations: ObservationDescription[];
@@ -610,7 +619,7 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
 
 export class InspectableCustomGatekeeper extends DurableObject {
   readonly #gatekeeper: CustomGatekeeper;
-  readonly #access: FixtureAccessInspector;
+  readonly #managerId: string;
 
   constructor(
     state: ConstructorParameters<typeof CustomGatekeeper>[0],
@@ -618,16 +627,66 @@ export class InspectableCustomGatekeeper extends DurableObject {
   ) {
     super(state, env);
     this.#gatekeeper = new CustomGatekeeper(state, env);
-    this.#access = (state.props as unknown as { access: FixtureAccessInspector }).access;
+    this.#managerId = (state.props as unknown as { managerId: string }).managerId;
+  }
+  async describe(): Promise<unknown> {
+    return this.#gatekeeper.describe();
+  }
+  async getTypeScriptTypes(): Promise<string> {
+    return this.#gatekeeper.getTypeScriptTypes();
+  }
+  async addObserver(observerId: string, user: unknown): Promise<void> {
+    return this.#gatekeeper.addObserver(observerId, user as never);
+  }
+  async removeObserver(): Promise<void> {
+    return this.#gatekeeper.removeObserver();
+  }
+  async revertAction(): Promise<void> {
+    return this.#gatekeeper.revertAction();
+  }
+  async #access(): Promise<FixtureAccessInspector> {
+    return await this.ctx.exports.KnowledgeAccountAccess.getByName(this.#managerId)
+      .getAccess() as unknown as FixtureAccessInspector;
   }
   async inspectBronzeRow(operationId: string): Promise<Record<string, unknown> | null> {
     const row = this.ctx.storage.sql
-      .exec<Record<string, unknown>>(
+      .exec<Record<string, SqlStorageValue>>(
         "SELECT * FROM custom_gatekeeper_bronze_adoptions WHERE operation_id = ?",
         operationId,
       )
       .toArray()[0];
     return row === undefined ? null : structuredClone(row);
+  }
+
+  async inspectArticleRow(operationId: string): Promise<Record<string, unknown> | null> {
+    const row = this.ctx.storage.sql
+      .exec<Record<string, SqlStorageValue>>(
+        "SELECT * FROM custom_gatekeeper_article_actions WHERE operation_id = ?",
+        operationId,
+      )
+      .toArray()[0];
+    return row === undefined ? null : structuredClone(row);
+  }
+
+  async tamperArticleCommand(operationId: string): Promise<void> {
+    const row = this.ctx.storage.sql
+      .exec<{ command_json: string }>(
+        "SELECT command_json FROM custom_gatekeeper_article_actions WHERE operation_id = ?",
+        operationId,
+      )
+      .toArray()[0];
+    if (row === undefined) throw new Error("Missing staged Article row.");
+    const command = JSON.parse(row.command_json) as {
+      article?: { sections?: Array<{ text: string }> };
+    };
+    const firstSection = command.article?.sections?.[0];
+    if (firstSection === undefined) throw new Error("Missing staged Article section.");
+    firstSection.text += "[tampered]";
+    this.ctx.storage.sql.exec(
+      "UPDATE custom_gatekeeper_article_actions SET command_json = ? WHERE operation_id = ?",
+      JSON.stringify(command),
+      operationId,
+    );
   }
 
   async tamperBronzeRow(operationId: string, field: BronzeTamperField): Promise<void> {
@@ -791,8 +850,8 @@ export class InspectableCustomGatekeeper extends DurableObject {
         )
         .one();
       return {
-        createInputs: await this.#access.createInputLog(),
-        outcomeInputs: await this.#access.outcomeInputLog(),
+        createInputs: await (await this.#access()).createInputLog(),
+        outcomeInputs: await (await this.#access()).outcomeInputLog(),
         outcome,
         status: row.status,
         errors,
@@ -821,15 +880,15 @@ export class InspectableCustomGatekeeper extends DurableObject {
       operationId = proposal.operationId;
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native submission");
-      const props = this.ctx.props as unknown as { access?: unknown };
-      const access = props.access;
-      props.access = undefined;
+      const props = this.ctx.props as unknown as { managerId?: string };
+      const managerId = props.managerId;
+      props.managerId = undefined;
       try {
         await this.#gatekeeper.applyAction(submission.action);
       } catch (cause) {
         errors.push(messageOf(cause));
       } finally {
-        props.access = access;
+        props.managerId = managerId;
       }
       try {
         await this.#gatekeeper.applyAction(submission.action);
@@ -844,8 +903,8 @@ export class InspectableCustomGatekeeper extends DurableObject {
         )
         .one();
       return {
-        createInputs: await this.#access.createInputLog(),
-        outcomeInputs: await this.#access.outcomeInputLog(),
+        createInputs: await (await this.#access()).createInputLog(),
+        outcomeInputs: await (await this.#access()).outcomeInputLog(),
         outcome,
         status: row.status,
         errors,
@@ -885,15 +944,15 @@ export class InspectableCustomGatekeeper extends DurableObject {
       operationId = proposal.operationId;
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native Bronze submission");
-      const props = this.ctx.props as unknown as { access?: unknown };
-      const access = props.access;
-      props.access = undefined;
+      const props = this.ctx.props as unknown as { managerId?: string };
+      const managerId = props.managerId;
+      props.managerId = undefined;
       try {
         await this.#gatekeeper.applyAction(submission.action);
       } catch (cause) {
         errors.push(messageOf(cause));
       } finally {
-        props.access = access;
+        props.managerId = managerId;
       }
       try {
         await this.#gatekeeper.applyAction(submission.action);
@@ -902,15 +961,15 @@ export class InspectableCustomGatekeeper extends DurableObject {
       }
       outcome = await handle.readAdoptionOutcome({ operationId });
       const row = this.ctx.storage.sql
-        .exec<Record<string, unknown>>(
+        .exec<Record<string, SqlStorageValue>>(
           "SELECT * FROM custom_gatekeeper_bronze_adoptions WHERE operation_id = ?",
           operationId,
         )
         .toArray()[0];
       bronzeRow = row === undefined ? null : structuredClone(row);
       return {
-        adoptionInputs: await this.#access.adoptionInputLog(),
-        adoptionOutcomeInputs: await this.#access.adoptionOutcomeInputLog(),
+        adoptionInputs: await (await this.#access()).adoptionInputLog(),
+        adoptionOutcomeInputs: await (await this.#access()).adoptionOutcomeInputLog(),
         outcome,
         bronzeRow,
         errors,
@@ -966,7 +1025,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
       for (const result of results) {
         if (result.status === "rejected") errors.push(messageOf(result.reason));
       }
-      return { createInputs: await this.#access.createInputLog(), errors };
+      return { createInputs: await (await this.#access()).createInputLog(), errors };
     } finally {
       session[Symbol.dispose]();
       queue[Symbol.dispose]();
@@ -1005,8 +1064,8 @@ export class InspectableCustomGatekeeper extends DurableObject {
         )
         .one();
       return {
-        createInputs: await this.#access.createInputLog(),
-        outcomeInputs: await this.#access.outcomeInputLog(),
+        createInputs: await (await this.#access()).createInputLog(),
+        outcomeInputs: await (await this.#access()).outcomeInputLog(),
         status: row.status,
         errors,
       };
@@ -1059,14 +1118,20 @@ export class TestGatekeeperFactory extends DurableObject {
     return this.ctx.exports as unknown as WorkerExports;
   }
 
-  #newBinding(props: FixtureAccessProps): {
+  async #props(access: unknown): Promise<{ managerId: string }> {
+    const managerId = await (access as { managerIdForTest(): Promise<string> }).managerIdForTest();
+    await this.#exports().GatekeeperVendor({}).createManagerAccount(managerId, access);
+    return { managerId };
+  }
+
+  async #newBinding(props: FixtureAccessProps): Promise<{
     gatekeeper: FixtureGatekeeper;
     access: FixtureAccessInspector;
-  } {
+  }> {
     const workerExports = this.#exports();
     const accessProps = { ...props, token: crypto.randomUUID() };
     const access = workerExports.TestKnowledgeAccess({ props: accessProps });
-    const gatekeeperClass = workerExports.CustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.CustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-knowledge-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1081,10 +1146,10 @@ export class TestGatekeeperFactory extends DurableObject {
   async runMalformedSession(): Promise<{ duplicateCount: number; error: string | null }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
     const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
-      props: { access, unexpected: true } as unknown as { access: unknown },
+      props: { ...(await this.#props(access)), unexpected: true } as { managerId: string },
     });
     const facetName = "fixture-malformed-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
@@ -1097,9 +1162,9 @@ export class TestGatekeeperFactory extends DurableObject {
   async runStoredOutcomeUnknown(): Promise<{ observations: number; error: string | null }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-stored-outcome-unknown-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1125,13 +1190,13 @@ export class TestGatekeeperFactory extends DurableObject {
     queueDisposals: number;
   }> {
     const props: FixtureAccessProps = {
-      managerId: MANAGER_ID,
+      managerId: crypto.randomUUID(),
       listMode: options.listMode,
       bronzeMode: options.bronzeMode,
       states: options.states,
       nextCursor: options.nextCursor,
     };
-    const { gatekeeper, access } = this.#newBinding(props);
+    const { gatekeeper, access } = await this.#newBinding(props);
     const target = new TestApprovalQueue(options.rejectObservationAt ?? null);
     const queue = new RpcStub<ApprovalQueue>(target);
     let page: Array<Record<string, unknown>> | null = null;
@@ -1190,8 +1255,8 @@ export class TestGatekeeperFactory extends DurableObject {
     queueDisposals: number;
     autoApprovable: unknown;
   }> {
-    const { gatekeeper, access } = this.#newBinding({
-      managerId: MANAGER_ID,
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
       createMode: options.createMode,
       outcomeMode: options.outcomeMode,
     });
@@ -1263,7 +1328,7 @@ export class TestGatekeeperFactory extends DurableObject {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: {
-        managerId: MANAGER_ID,
+        managerId: crypto.randomUUID(),
         states: options.wrongHandle ? ["ready", "ready"] : ["ready"],
         adoptionMode: options.adoptionMode,
         adoptionOutcomeMode: options.outcomeMode,
@@ -1271,7 +1336,7 @@ export class TestGatekeeperFactory extends DurableObject {
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-bronze-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1396,9 +1461,9 @@ export class TestGatekeeperFactory extends DurableObject {
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-access-failure-recovery-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1416,12 +1481,12 @@ export class TestGatekeeperFactory extends DurableObject {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: {
-        managerId: MANAGER_ID,
+        managerId: crypto.randomUUID(),
         states: ["ready"],
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-combined-capacity-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1472,9 +1537,9 @@ export class TestGatekeeperFactory extends DurableObject {
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-action-collision-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1492,12 +1557,12 @@ export class TestGatekeeperFactory extends DurableObject {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: {
-        managerId: MANAGER_ID,
+        managerId: crypto.randomUUID(),
         states: ["ready"],
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-s16-capacity-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1543,8 +1608,8 @@ export class TestGatekeeperFactory extends DurableObject {
     outcome: unknown | null;
     createInputs: unknown[];
   }> {
-    const { gatekeeper, access } = this.#newBinding({
-      managerId: MANAGER_ID,
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
       createMode: mode,
     });
     const target = new TestApprovalQueue();
@@ -1582,7 +1647,7 @@ export class TestGatekeeperFactory extends DurableObject {
     capacityFailures: number;
     submissions: number;
   }> {
-    const { gatekeeper } = this.#newBinding({ managerId: MANAGER_ID });
+    const { gatekeeper } = await this.#newBinding({ managerId: crypto.randomUUID() });
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
     const session = await gatekeeper.startSession(queue);
@@ -1610,8 +1675,8 @@ export class TestGatekeeperFactory extends DurableObject {
     outcomeInputs: unknown[];
     errors: string[];
   }> {
-    const { gatekeeper, access } = this.#newBinding({
-      managerId: MANAGER_ID,
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
       createMode: "delay",
     });
     const target = new TestApprovalQueue();
@@ -1643,9 +1708,9 @@ export class TestGatekeeperFactory extends DurableObject {
   async runApplyRejectRace(): Promise<{ createInputs: unknown[]; errors: string[] }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-apply-reject-race-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1662,9 +1727,9 @@ export class TestGatekeeperFactory extends DurableObject {
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, createMode: "throw_once", token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), createMode: "throw_once", token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-response-loss-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1686,13 +1751,13 @@ export class TestGatekeeperFactory extends DurableObject {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: {
-        managerId: MANAGER_ID,
+        managerId: crypto.randomUUID(),
         createMode,
         outcomeMode,
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-create-failure-recovery-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1710,9 +1775,9 @@ export class TestGatekeeperFactory extends DurableObject {
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-access-failure-recovery-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1724,9 +1789,9 @@ export class TestGatekeeperFactory extends DurableObject {
   async runActionRefFingerprintMismatch(): Promise<{ observations: number; error: string | null }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: MANAGER_ID, token: crypto.randomUUID() },
+      props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { access } });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
     const facetName = "fixture-action-ref-fingerprint-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1743,8 +1808,8 @@ export class TestGatekeeperFactory extends DurableObject {
     outcome: unknown | null;
     errors: string[];
   }> {
-    const { gatekeeper, access } = this.#newBinding({
-      managerId: MANAGER_ID,
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
       createMode: "throw_once",
       outcomeMode,
     });
@@ -1871,7 +1936,7 @@ export class TestGatekeeperFactory extends DurableObject {
     catalog: AgentCatalog;
     observations: ObservationDescription[];
   }> {
-    const { gatekeeper } = this.#newBinding({ managerId: MANAGER_ID });
+    const { gatekeeper } = await this.#newBinding({ managerId: crypto.randomUUID() });
     const target = new TestObservationAuthorizer();
     const authorizer = new RpcStub<ObservationAuthorizer>(target);
     try {
@@ -1885,7 +1950,7 @@ export class TestGatekeeperFactory extends DurableObject {
   }
 
   async runObserverRejection(): Promise<string | null> {
-    const { gatekeeper } = this.#newBinding({ managerId: MANAGER_ID });
+    const { gatekeeper } = await this.#newBinding({ managerId: crypto.randomUUID() });
     const verifier = new RpcStub(new TestVerifier());
     try {
       await gatekeeper.addObserver("observer", verifier);
@@ -1895,5 +1960,349 @@ export class TestGatekeeperFactory extends DurableObject {
     } finally {
       verifier[Symbol.dispose]();
     }
+  }
+}
+
+
+type NativeArticleSaveMode = "normal" | "commit_then_throw_once" | "forbidden_once";
+type NativeArticleStored = {
+  commandJson: string;
+  payloadHash: string;
+  articleId: string;
+  revisionId: string;
+  receiptId: string;
+  committedAt: string;
+};
+type NativeArticleFixtureState = {
+  managerId: string | null;
+  saveMode: NativeArticleSaveMode;
+  saveInputs: Array<{ commandJson: string; payloadHash: string }>;
+  readInputs: Array<{ articleId: string; revisionId: string }>;
+  articles: Record<string, NativeArticleStored>;
+};
+
+const newNativeArticleFixtureState = (): NativeArticleFixtureState => ({
+  managerId: null,
+  saveMode: "normal",
+  saveInputs: [],
+  readInputs: [],
+  articles: {},
+});
+
+// Native approval tests use a Durable Object capability so a persisted Access stub has a stable
+// DO owner and expected Core errors cross a normal RPC boundary instead of a WorkerEntrypoint
+// callback wrapper.
+export class NativeArticleAccess extends DurableObject<Cloudflare.Env> {
+  async #readState(): Promise<NativeArticleFixtureState> {
+    return await this.ctx.storage.get<NativeArticleFixtureState>("article-fixture") ??
+      newNativeArticleFixtureState();
+  }
+
+  async #writeState(state: NativeArticleFixtureState): Promise<void> {
+    await this.ctx.storage.put("article-fixture", state);
+  }
+
+  async initialize(managerId: string): Promise<void> {
+    const state = await this.#readState();
+    if (state.managerId !== null && state.managerId !== managerId) {
+      throw new Error("Article fixture is already initialized for another Manager.");
+    }
+    state.managerId = managerId;
+    await this.#writeState(state);
+  }
+
+  async clearFixture(): Promise<void> {
+    await this.ctx.storage.deleteAll();
+  }
+
+  async assertBoundTo(managerId: string): Promise<void> {
+    const state = await this.#readState();
+    if (state.managerId !== managerId) {
+      throw new Error("Article fixture is bound to another Manager.");
+    }
+  }
+
+  async setArticleSaveMode(mode: NativeArticleSaveMode): Promise<void> {
+    const state = await this.#readState();
+    state.saveMode = mode;
+    await this.#writeState(state);
+  }
+
+  async articleSnapshot(): Promise<{
+    saveInputs: Array<{ commandJson: string; payloadHash: string }>;
+    readInputs: Array<{ articleId: string; revisionId: string }>;
+    articles: Array<NativeArticleStored & { operationId: string }>;
+  }> {
+    const state = await this.#readState();
+    return structuredClone({
+      saveInputs: state.saveInputs,
+      readInputs: state.readInputs,
+      articles: Object.entries(state.articles).map(([operationId, article]) => ({
+        operationId,
+        ...article,
+      })),
+    });
+  }
+
+  async saveArticle(input: unknown): Promise<unknown> {
+    if (!isRecord(input) || typeof input.commandJson !== "string" ||
+        typeof input.payloadHash !== "string") {
+      throw new TypeError("Invalid test Article save input.");
+    }
+    const state = await this.#readState();
+    state.saveInputs.push({ commandJson: input.commandJson, payloadHash: input.payloadHash });
+    let command: {
+      operationId: string;
+      actionRef: string;
+      article: { sections: Array<{ text: string }> };
+    };
+    try {
+      const parsed: unknown = JSON.parse(input.commandJson);
+      if (!isRecord(parsed) || typeof parsed.operationId !== "string" ||
+          typeof parsed.actionRef !== "string" || !isRecord(parsed.article) ||
+          !Array.isArray(parsed.article.sections)) {
+        throw new TypeError("Invalid Article command.");
+      }
+      command = parsed as typeof command;
+    } catch {
+      await this.#writeState(state);
+      return { _tag: "integrity_failure" };
+    }
+
+    if (state.saveMode === "forbidden_once") {
+      state.saveMode = "normal";
+      await this.#writeState(state);
+      return { _tag: "forbidden" };
+    }
+    const existing = state.articles[command.operationId];
+    if (existing !== undefined) {
+      await this.#writeState(state);
+      if (existing.payloadHash !== input.payloadHash) return { _tag: "operation_conflict" };
+      return {
+        _tag: "already_committed",
+        receipt: {
+          receiptId: existing.receiptId,
+          operationId: command.operationId,
+          actionRef: command.actionRef,
+          payloadHash: input.payloadHash,
+          articleId: existing.articleId,
+          revisionId: existing.revisionId,
+          revisionNumber: 1,
+          knowledgeId: KNOWLEDGE_IDS[0],
+          generation: 1,
+          committedAt: existing.committedAt,
+        },
+      };
+    }
+
+    const saved: NativeArticleStored = {
+      commandJson: input.commandJson,
+      payloadHash: input.payloadHash,
+      articleId: crypto.randomUUID(),
+      revisionId: crypto.randomUUID(),
+      receiptId: crypto.randomUUID(),
+      committedAt: new Date().toISOString(),
+    };
+    state.articles[command.operationId] = saved;
+    const result = {
+      _tag: "committed",
+      receipt: {
+        receiptId: saved.receiptId,
+        operationId: command.operationId,
+        actionRef: command.actionRef,
+        payloadHash: input.payloadHash,
+        articleId: saved.articleId,
+        revisionId: saved.revisionId,
+        revisionNumber: 1,
+        knowledgeId: KNOWLEDGE_IDS[0],
+        generation: 1,
+        committedAt: saved.committedAt,
+      },
+    };
+    const loseResponse = state.saveMode === "commit_then_throw_once";
+    if (loseResponse) state.saveMode = "normal";
+    await this.#writeState(state);
+    if (loseResponse) throw new Error("fixture response lost after Article commit");
+    return result;
+  }
+
+  async readArticle(input: unknown): Promise<unknown> {
+    if (!isRecord(input) || typeof input.articleId !== "string" ||
+        typeof input.revisionId !== "string") {
+      throw new TypeError("Invalid test Article read input.");
+    }
+    const state = await this.#readState();
+    state.readInputs.push({ articleId: input.articleId, revisionId: input.revisionId });
+    const saved = Object.values(state.articles).find(
+      (article) => article.articleId === input.articleId &&
+        article.revisionId === input.revisionId,
+    );
+    await this.#writeState(state);
+    if (saved === undefined) return { _tag: "not_found" };
+    const command = JSON.parse(saved.commandJson) as {
+      operationId: string;
+      actionRef: string;
+      article: { sections: Array<{ text: string }>; sources: unknown[] };
+    };
+    return {
+      _tag: "found",
+      articleId: saved.articleId,
+      revisionId: saved.revisionId,
+      revisionNumber: 1,
+      knowledgeId: KNOWLEDGE_IDS[0],
+      generation: 1,
+      committedAt: saved.committedAt,
+      operationId: command.operationId,
+      actionRef: command.actionRef,
+      payloadHash: saved.payloadHash,
+      article: command.article,
+      body: command.article.sections.map((section) => section.text).join(""),
+    };
+  }
+}
+
+type NativeOwnerExports = {
+  UserDurableObject: {
+    idFromName(name: string): { toString(): string };
+    get(id: unknown): {
+      newGadget(id: string, title: string): Promise<void>;
+      deleteGadget(id: string): Promise<void>;
+    };
+  };
+  OverseerDurableObject: {
+    newUniqueId(): { toString(): string };
+    idFromString(id: string): unknown;
+    get(id: unknown): {
+      open(
+        userId: string,
+        profileId: string,
+        notifyClosed: RpcStub<() => void>,
+      ): Promise<CapnwebRpcStub<Overseer>>;
+    };
+  };
+};
+
+type NativeOwnerGatekeeper = {
+  openSession(): Promise<{
+    proposeArticle(input: { article: unknown }): Promise<unknown>;
+    readArticleOutcome(input: { operationId: string }): Promise<unknown>;
+    [Symbol.dispose](): void;
+  }>;
+  [Symbol.dispose](): void;
+};
+
+// Every operation opens and closes a real pinned Overseer owner session inside this Durable
+// Object event. That keeps the native notifyClosed callback alive until its completion is observed.
+export class NativeApprovalOwner extends DurableObject<Cloudflare.Env> {
+  #exports(): NativeOwnerExports {
+    return this.ctx.exports as unknown as NativeOwnerExports;
+  }
+
+  async prepareWorkspace(managerId: string): Promise<string> {
+    const workerExports = this.#exports();
+    const userId = workerExports.UserDurableObject.idFromName(managerId);
+    const workspaceId = workerExports.OverseerDurableObject.newUniqueId().toString();
+    await workerExports.UserDurableObject.get(userId).newGadget(
+      workspaceId,
+      "A1 Article approval test",
+    );
+    await this.#withOwner(managerId, workspaceId, async () => {});
+    return workspaceId;
+  }
+
+  async cleanupWorkspace(managerId: string, workspaceId: string): Promise<void> {
+    const workerExports = this.#exports();
+    const userId = workerExports.UserDurableObject.idFromName(managerId);
+    await workerExports.UserDurableObject.get(userId).deleteGadget(workspaceId);
+  }
+
+  async #withOwner<T>(
+    managerId: string,
+    workspaceId: string,
+    callback: (owner: CapnwebRpcStub<Overseer>) => Promise<T>,
+  ): Promise<T> {
+    const workerExports = this.#exports();
+    const userId = workerExports.UserDurableObject.idFromName(managerId).toString();
+    const overseerId = workerExports.OverseerDurableObject.idFromString(workspaceId);
+    let resolveClosed: (() => void) | undefined;
+    const closed = new Promise<void>((resolve) => {
+      resolveClosed = resolve;
+    });
+    const notifyClosed = new RpcStub<() => void>(() => resolveClosed?.());
+    const owner = await workerExports.OverseerDurableObject.get(overseerId)
+      .open(userId, managerId, notifyClosed);
+    try {
+      return await callback(owner);
+    } finally {
+      try {
+        owner[Symbol.dispose]();
+        await closed;
+      } finally {
+        notifyClosed[Symbol.dispose]();
+      }
+    }
+  }
+
+  async listActions(managerId: string, workspaceId: string): Promise<unknown[]> {
+    return this.#withOwner(managerId, workspaceId, (owner) => owner.listActions());
+  }
+
+  async proposeArticle(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    article: unknown,
+  ): Promise<unknown> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      const gatekeeper = await owner.getGatekeeperById(gatekeeperId) as unknown as NativeOwnerGatekeeper;
+      try {
+        const session = await gatekeeper.openSession();
+        try {
+          return await session.proposeArticle({ article });
+        } finally {
+          session[Symbol.dispose]();
+        }
+      } finally {
+        gatekeeper[Symbol.dispose]();
+      }
+    });
+  }
+
+  async readArticleOutcome(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    operationId: string,
+  ): Promise<unknown> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      const gatekeeper = await owner.getGatekeeperById(gatekeeperId) as unknown as NativeOwnerGatekeeper;
+      try {
+        const session = await gatekeeper.openSession();
+        try {
+          return await session.readArticleOutcome({ operationId });
+        } finally {
+          session[Symbol.dispose]();
+        }
+      } finally {
+        gatekeeper[Symbol.dispose]();
+      }
+    });
+  }
+
+  async decideAction(
+    managerId: string,
+    workspaceId: string,
+    actionId: number,
+    decision: "approve" | "reject",
+  ): Promise<{ error: string | null }> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      try {
+        if (decision === "approve") await owner.approveAction(actionId);
+        else await owner.rejectAction(actionId);
+        return { error: null };
+      } catch (cause) {
+        return { error: messageOf(cause) };
+      }
+    });
   }
 }

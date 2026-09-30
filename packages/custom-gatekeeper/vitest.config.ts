@@ -1,6 +1,6 @@
 import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 import capnwebValidate from "capnweb-validate/vite";
-import { defineConfig } from "vitest/config";
+import { configDefaults, defineConfig } from "vitest/config";
 
 export default defineConfig({
   plugins: [
@@ -11,6 +11,7 @@ export default defineConfig({
         compatibilityDate: "2026-08-04",
         compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_compat"],
         durableObjects: {
+          KNOWLEDGE_ACCOUNT_ACCESS: { className: "KnowledgeAccountAccess", useSQLite: true },
           CUSTOM_GATEKEEPER: { className: "CustomGatekeeper", useSQLite: true },
           INSPECTABLE_CUSTOM_GATEKEEPER: {
             className: "InspectableCustomGatekeeper",
@@ -21,5 +22,8 @@ export default defineConfig({
       },
     }),
   ],
-  test: { include: ["__tests__/*.test.ts"] },
+  test: {
+    include: ["__tests__/*.test.ts"],
+    exclude: [...configDefaults.exclude, "__tests__/native-approval.test.ts"],
+  },
 });

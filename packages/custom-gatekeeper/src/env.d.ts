@@ -1,6 +1,6 @@
 declare namespace Cloudflare {
   interface GlobalProps {
     mainModule: typeof import("./index.js");
-    durableNamespaces: "CustomGatekeeper";
+    durableNamespaces: "CustomGatekeeper" | "KnowledgeAccountAccess";
   }
 }

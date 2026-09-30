@@ -12,6 +12,10 @@
     {
       "tag": "v0",
       "new_sqlite_classes": ["CustomGatekeeper"]
+    },
+    {
+      "tag": "v1-knowledge-account-access",
+      "new_sqlite_classes": ["KnowledgeAccountAccess"]
     }
   ],
   "vars": {

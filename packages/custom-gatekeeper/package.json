@@ -7,7 +7,10 @@
   "scripts": {
     "build": "tsc",
     "types:check": "tsc --noEmit",
-    "test": "vitest run"
+    "types:test": "tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution bundler --lib ESNext --types ./worker-configuration.d.ts,@cloudflare/vitest-pool-workers/types --skipLibCheck __tests__/worker.ts __tests__/native-approval.test.ts src/env.d.ts",
+    "test": "pnpm run types:test && vitest run && pnpm exec capnweb-validate build --out .wrangler/validate && pnpm run test:native && node --test __tests__/cross-worker-facet.test.mjs",
+    "test:native:prepare": "pnpm --dir ../../cloudflare-os --filter @gadgets/typed-storage build && pnpm --dir ../../cloudflare-os/packages/workshop-backend exec node build-browser-runtime.mjs && pnpm --dir ../../cloudflare-os/packages/workshop-backend run build:format-blueprints",
+    "test:native": "pnpm run test:native:prepare && vitest run --config vitest.native-approval.config.ts"
   },
   "dependencies": {
     "@gadgets/workshop-shared": "workspace:*",
