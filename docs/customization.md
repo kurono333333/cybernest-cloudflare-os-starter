@@ -115,7 +115,7 @@ The starter enables structured custom logs and a private console-backed Error Re
 
 ## Custom Gatekeepers
 
-Keep deployment-owned Gatekeepers under `packages/`, outside the `cloudflare-os` submodule. `scripts/deploy.mjs` binds this repository's example to the Workshop as `GATEKEEPER_CUSTOM` and Context as `GATEKEEPER_CONTEXT`.
+Keep deployment-owned Gatekeepers under `packages/`, outside the `cloudflare-os` submodule. `scripts/deploy.ts` binds this repository's example to the Workshop as `GATEKEEPER_CUSTOM` and Context as `GATEKEEPER_CONTEXT`.
 
 The minimal example flow is:
 

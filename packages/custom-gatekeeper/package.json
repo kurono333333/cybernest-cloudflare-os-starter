@@ -5,24 +5,24 @@
   "type": "module",
   "main": "./src/index.ts",
   "scripts": {
-    "build": "tsc",
     "types:check": "tsc --noEmit",
     "types:test": "tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution bundler --lib ESNext --types ./worker-configuration.d.ts,@cloudflare/vitest-pool-workers/types --skipLibCheck __tests__/worker.ts __tests__/native-approval.test.ts src/env.d.ts",
-    "test": "pnpm run types:test && vitest run && pnpm exec capnweb-validate build --out .wrangler/validate && pnpm run test:native && node --test __tests__/cross-worker-facet.test.mjs",
-    "test:native:prepare": "pnpm --dir ../../cloudflare-os --filter @gadgets/typed-storage build && pnpm --dir ../../cloudflare-os/packages/workshop-backend exec node build-browser-runtime.mjs && pnpm --dir ../../cloudflare-os/packages/workshop-backend run build:format-blueprints",
-    "test:native": "pnpm run test:native:prepare && vitest run --config vitest.native-approval.config.ts"
+    "test:native:prepare": "pnpm --dir ../../cloudflare-os exec vp run -F @gadgets/typed-storage --no-cache build && pnpm --dir ../../cloudflare-os/packages/workshop-backend exec node scripts/build-browser-runtime.ts && pnpm --dir ../../cloudflare-os/packages/workshop-backend exec node scripts/build-bundled-blueprints.ts",
+    "test:native": "pnpm run test:native:prepare && vitest run --config vitest.native-approval.config.ts",
+    "test:run": "vitest run",
+    "test:legacy": "pnpm run types:test && vitest run && pnpm exec capnweb-validate build --out .wrangler/validate && pnpm run test:native && node --test __tests__/cross-worker-facet.test.mjs"
   },
   "dependencies": {
     "@gadgets/workshop-shared": "workspace:*",
-    "capnweb": "^0.12.0",
-    "capnweb-validate": "0.3.0"
+    "capnweb": "catalog:",
+    "capnweb-validate": "catalog:"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.22.0",
-    "@types/node": "^26.1.0",
-    "typescript": "^5.9.3",
-    "vite": "^7.3.6",
-    "vitest": "^4.1.11",
-    "wrangler": "^4.126.0"
+    "@cloudflare/vitest-pool-workers": "catalog:",
+    "@types/node": "26.1.0",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vitest": "catalog:",
+    "wrangler": "catalog:"
   }
 }

@@ -10,14 +10,12 @@ import type {
   AccountDescription,
   ActionDescription,
   AgentCatalog,
-  AgentCatalogRequest,
   ApprovalQueue,
   Gatekeeper,
   GatekeeperConnectCallback,
   GatekeeperConnectOptions,
   GatekeeperUser,
   GatekeeperUserVerifier,
-  ObservationAuthorizer,
   ResourceConfiguratorFrame,
   SupportedResource,
   VendorDescription,
@@ -2726,28 +2724,17 @@ export class CustomGatekeeper
       throw err("integrity_failure");
     }
   }
-  async getAgentCatalog(
-    r: AgentCatalogRequest,
-    a: RpcStub<ObservationAuthorizer>,
-  ): Promise<AgentCatalog> {
-    const c = boundAgentCatalog(
-      [
-        {
-          id: "knowledge-base",
-          title: "Knowledge Base",
-          description:
-            "Available. Use list to inspect current Knowledge summaries.",
-        },
-      ],
-      r,
-    );
-    await a.authorizeObservation(
-      observation(
-        "Knowledge Base catalog",
-        "Listed " + c.entries.length + " Knowledge Base catalog entries.",
-      ),
-    );
-    return c;
+  async getAgentCatalog(): Promise<AgentCatalog> {
+    // Catalogs are included in every chat prompt and cannot carry manager-private metadata that
+    // would require observer authorization. The singleton name and generic list hint are safe;
+    // actual Knowledge summaries remain behind the session's authorized read operations.
+    return boundAgentCatalog([
+      {
+        id: "knowledge-base",
+        title: "Knowledge Base",
+        description: "Available. Use list to inspect current Knowledge summaries.",
+      },
+    ]);
   }
   async addObserver(
     _observerId: string,
@@ -2767,6 +2754,10 @@ export class CustomAccount
 {
   async describe(): Promise<AccountDescription> {
     return describeCustomAccount();
+  }
+
+  async commitReconnect(_stageId: string): Promise<void> {
+    throw new Error("Knowledge Base accounts do not have a reconnect flow.");
   }
   async inspectManagerBinding(
     managerIdValue: string,
