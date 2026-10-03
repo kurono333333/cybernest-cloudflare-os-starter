@@ -85,7 +85,7 @@ pnpm deploy
 
 With resource values left as `null`, Wrangler creates the three KV namespaces and R2 bucket automatically and reconnects them on later deploys. Set explicit IDs or a bucket name when the deployment must reuse existing resources.
 
-AI is disabled by default. The application can deploy without an AI Gateway or token; see [AI models](docs/customization.md#ai-models) to enable deployment-funded models.
+This deployment keeps its configured Workers AI direct mode. See [AI models](docs/customization.md#ai-models) before changing the provider or transport; AI-enabled deployment requires its configured token.
 
 Backend error reporting is enabled without a vendor account. Explicit upstream issue events become structured logs in the private Error Reporter Worker; see [Observability and error reporting](docs/observability.md).
 
