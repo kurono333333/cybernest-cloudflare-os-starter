@@ -225,6 +225,7 @@ const visible = (v: unknown, max: number): v is string =>
   text(v, max) &&
   v.trim() === v &&
   v.trim().length > 0 &&
+  // eslint-disable-next-line no-control-regex -- Visible text must reject control characters and line separators.
   !/[\u0000-\u001F\u007F-\u009F\u2028\u2029\uFEFF]/u.test(v);
 const boundedInvalidInputIssues = (value: unknown): boolean =>
   Array.isArray(value) &&
