@@ -15,8 +15,6 @@ const { parse } = wranglerRequire("jsonc-parser");
 const config = parse(await readFile(root + "wrangler.jsonc", "utf8"));
 const managerA = "44444444-4444-4444-8444-444444444444";
 const managerB = "54444444-4444-4444-8444-444444444444";
-const sourceId = "74444444-4444-4444-8444-444444444444";
-const revisionId = "84444444-4444-4444-8444-444444444444";
 const article = { sections: [{ text: "Cross-worker article.\n", meaning: "observed_result", sourceIds: ["fixture-source"] }], sources: [{ sourceId: "fixture-source", kind: "conversation", reference: "fixture/chat", actor: { kind: "user", reference: "fixture/user" }, recordedAt: "2026-09-27T00:00:00.000Z", excerpt: "Persist this only after explicit approval." }] };
 
 const custom = await build({
@@ -32,114 +30,48 @@ const custom = await build({
 });
 
 const articleState = `
-const articleCalls = new Map();
-const articleRecords = new Map();
-const articleLog = managerId => {
-  let log = articleCalls.get(managerId);
+const knowledgeReaderCalls = new Map();
+const knowledgeReaderLog = managerId => {
+  let log = knowledgeReaderCalls.get(managerId);
   if (!log) {
-    log = { saves: [], reads: [] };
-    articleCalls.set(managerId, log);
+    log = { list: [], search: [], read: [], readExpirySnapshots: [] };
+    knowledgeReaderCalls.set(managerId, log);
   }
   return log;
 };
 export class Probe extends WorkerEntrypoint {
-  async readArticleCalls(managerId) {
-    return structuredClone(articleLog(managerId));
+  async readKnowledgeCalls(managerId) {
+    return structuredClone(knowledgeReaderLog(managerId));
   }
 }
 `;
 
-const articleMethods = `
-  async saveArticle(input) {
+const knowledgeReaderMethods = label => `
+  async list(input) {
     const managerId = this.ctx.props.managerId;
-    articleLog(managerId).saves.push(structuredClone(input));
-    let command;
-    try { command = JSON.parse(input.commandJson); }
-    catch { return {_tag:'integrity_failure'}; }
-    if (command.protocolVersion !== 'activity-article/1' ||
-        typeof command.operationId !== 'string' || typeof command.actionRef !== 'string') {
-      return {_tag:'integrity_failure'};
-    }
-    const operationKey = managerId + '/' + command.operationId;
-    const existing = articleRecords.get(operationKey);
-    if (existing) {
-      if (existing.payloadHash !== input.payloadHash) return {_tag:'operation_conflict'};
-      return {_tag:'already_committed',receipt:structuredClone(existing.receipt)};
-    }
-    const record = {
-      managerId,
-      operationId: command.operationId,
-      actionRef: command.actionRef,
-      payloadHash: input.payloadHash,
-      articleId: crypto.randomUUID(),
-      revisionId: crypto.randomUUID(),
-      receiptId: crypto.randomUUID(),
-      committedAt: '2026-09-27T00:00:00.000Z',
-      article: command.article,
-      body: command.article.sections.map(section => section.text).join(''),
-    };
-    record.receipt = {
-      receiptId: record.receiptId,
-      knowledgeId: managerId,
-      generation: 1,
-      operationId: record.operationId,
-      actionRef: record.actionRef,
-      payloadHash: record.payloadHash,
-      articleId: record.articleId,
-      revisionId: record.revisionId,
-      revisionNumber: 1,
-      committedAt: record.committedAt,
-    };
-    articleRecords.set(operationKey, record);
-    return {_tag:'committed',receipt:structuredClone(record.receipt)};
+    knowledgeReaderLog(managerId).list.push(structuredClone(input));
+    return {ok:true,value:{value:{bundleId:'${'a'.repeat(64)}',versionId:'94444444-4444-4444-8444-444444444444',items:[{path:'index.md'}]},expiresAt:Date.now()+3600000}};
   }
-  async readArticle(input) {
+  async search(input) {
     const managerId = this.ctx.props.managerId;
-    articleLog(managerId).reads.push(structuredClone(input));
-    const saved = [...articleRecords.values()].find(value =>
-      value.managerId === managerId &&
-      value.articleId === input.articleId &&
-      value.revisionId === input.revisionId);
-    if (!saved) return {_tag:'not_found'};
-    return {
-      _tag:'found',
-      knowledgeId: managerId,
-      generation: 1,
-      articleId: saved.articleId,
-      revisionId: saved.revisionId,
-      revisionNumber: 1,
-      committedAt: saved.committedAt,
-      operationId: saved.operationId,
-      actionRef: saved.actionRef,
-      payloadHash: saved.payloadHash,
-      article: saved.article,
-      body: saved.body,
-    };
+    knowledgeReaderLog(managerId).search.push(structuredClone(input));
+    return {ok:true,value:{value:{bundleId:'${'a'.repeat(64)}',versionId:'94444444-4444-4444-8444-444444444444',hits:[{path:'index.md',line:1,snippet:'Private ${label} fixture.'}]},expiresAt:Date.now()+3600000}};
+  }
+  async read(input) {
+    const managerId = this.ctx.props.managerId;
+    const expiresAt = Date.now()+3600000;
+    knowledgeReaderLog(managerId).read.push(structuredClone(input));
+    knowledgeReaderLog(managerId).readExpirySnapshots.push(expiresAt);
+    return {ok:true,value:{value:{bundleId:'${'a'.repeat(64)}',versionId:'94444444-4444-4444-8444-444444444444',path:'index.md',sourceMarkdown:'# Private ${label} fixture\\n',metadata:{type:'Concept'}},expiresAt}};
   }
 `;
 
-const coreFixture = (withArticleMethods) => `
+const coreFixture = (label) => `
 import { WorkerEntrypoint } from 'cloudflare:workers';
 ${articleState}
 export class Access extends WorkerEntrypoint {
-  async assertBoundTo(id) { if (id !== this.ctx.props.managerId) throw Error('wrong manager'); }
-  async list() {
-    return {_tag:'page',items:[{knowledgeId:this.ctx.props.managerId,generation:1,
-      displayName:this.ctx.props.managerId,role:'initial',state:'ready',
-      createdAt:'2026-01-01T00:00:00.000Z',updatedAt:'2026-01-01T00:00:00.000Z'}]};
-  }
-  ${withArticleMethods ? articleMethods : ""}
-  async readBronze(input) {
-    if(input.knowledgeId !== this.ctx.props.managerId) throw Error('wrong knowledge');
-    const document='# '+this.ctx.props.managerId;
-    const digest=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(document));
-    return {_tag:'found',revision:{knowledgeId:input.knowledgeId,generation:1,
-      sourceId:input.sourceId,revisionId:'${revisionId}',revisionNumber:1,baseRevisionId:null,
-      document,contentHash:Array.from(new Uint8Array(digest),b=>b.toString(16).padStart(2,'0')).join(''),
-      type:'Source',title:'Fixture',description:'Local cross-worker fixture',
-      provenance:{sourceKind:'explicit_user_input',reference:'fixture',capturedAt:'2026-01-01T00:00:00.000Z'},
-      committedAt:'2026-01-01T00:00:00.000Z'}};
-  }
+  async assertBoundTo(id) { if (id !== this.ctx.props.managerId) throw Error('wrong manager'); return 'cybernest-knowledge-read-v1'; }
+  ${knowledgeReaderMethods(label)}
 }
 export default {async fetch(request,env,ctx) {
   const url=new URL(request.url);
@@ -150,12 +82,11 @@ export default {async fetch(request,env,ctx) {
 }};
 `;
 
-const legacyCore = coreFixture(false);
-const upgradedCore = coreFixture(true);
+const initialCore = coreFixture('initial');
+const updatedCore = coreFixture('updated');
 
 const consumer = `
 import { DurableObject, RpcTarget, RpcStub } from 'cloudflare:workers';
-const ARTICLE = ${JSON.stringify(article)};
 class Queue extends RpcTarget {
   observations=[];
   submissions=[];
@@ -189,32 +120,111 @@ export class Consumer extends DurableObject {
       catch(error) {return {rejected:error.message};}
       throw Error('wrong manager was accepted');
     }
-    if(mode==='/restart') this.ctx.facets.abort('knowledge',new Error('test restart'));
+    if(mode==='/restart' || mode==='/reader-restart') this.ctx.facets.abort('knowledge',new Error('test restart'));
     const cls=await account.getSingletonGatekeeperClass();
     const facet=this.ctx.facets.get('knowledge',()=>({class:cls,id:'knowledge'}));
     await facet.describe();
     const queue=new Queue();
     using stub=new RpcStub(queue);
     using session=await facet.startSession(stub);
-    if(mode==='/article') {
-      const proposal=await session.proposeArticle({article:ARTICLE});
-      const submission=queue.submissions.at(-1);
-      if(!submission) throw Error('article proposal did not submit an approval action');
-      await facet.applyAction(submission.action);
-      return {rebound,proposal,calls:await this.env.CORE_PROBE.readArticleCalls(managerId)};
+    if(mode==='/' || mode==='/restart' || mode==='/reader' || mode==='/reader-restart') {
+      const result={list:undefined,search:undefined,read:undefined,
+        errors:{list:null,search:null,read:null}};
+      try {result.list=await session.list({offset:0,limit:16});}
+      catch(error) {result.errors.list=error.message;}
+      try {result.search=await session.search({query:'private',offset:0,limit:16});}
+      catch(error) {result.errors.search=error.message;}
+      try {result.read=await session.read({path:'index.md'});}
+      catch(error) {result.errors.read=error.message;}
+      return {rebound,...result,observations:queue.observations,
+        calls:await this.env.CORE_PROBE.readKnowledgeCalls(managerId)};
     }
-    const page=await session.list({limit:1});
-    const item=page.items[0];
-    using handle=item.access;
-    const revision=await handle.readBronze({sourceId:'${sourceId}'});
-    return {knowledgeId:item.knowledgeId,document:revision.document,
-      privateObservations:queue.observations.map(o=>o.prohibitAllSharing)};
+    throw Error('unsupported fixture route');
   }
 }
 export default {fetch(){return new Response('fixture');}};
 `;
 
-test("persisted Core capability receives new article methods after Worker update without rebind or Manager crossover", async () => {
+test("persisted D04 reader capability stays Manager-scoped across Worker update and restart", async () => {
+  const common = {
+    modules: true, compatibilityDate: config.compatibility_date,
+    compatibilityFlags: config.compatibility_flags,
+    outboundService: () => new Response("Network forbidden in fixture", { status: 503 }),
+  };
+  const options = coreScript => convertV4MiniflareOptions({ workers: [
+    { ...common, name: "core", script: coreScript, durableObjects: {
+      CONSUMER: { className: "Consumer", scriptName: "consumer", useSQLite: true },
+    } },
+    { ...common, name: "custom", script: custom.outputFiles[0].text,
+      durableObjects: Object.fromEntries(config.migrations.flatMap(m=>m.new_sqlite_classes ?? [])
+        .map(className=>[className,{className,useSQLite:true}])) },
+    { ...common, name: "consumer", script: consumer,
+      durableObjects: { CONSUMER: { className: "Consumer", useSQLite: true } },
+      serviceBindings: {
+        VENDOR: { name: "custom", entrypoint: "GatekeeperVendor" },
+        LEGACY: { name: "custom", entrypoint: "LegacyFactory" },
+        CORE_PROBE: { name: "core", entrypoint: "Probe" },
+      } },
+  ] });
+  const mf = new Miniflare(options(initialCore));
+  const call = async (path, managerId = managerA) => {
+    const response = await mf.dispatchFetch('http://fixture' + path + '?manager=' + managerId);
+    const result = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(result));
+    return result;
+  };
+  try {
+    const beforeUpdate = await call('/reader');
+    assert.equal(beforeUpdate.rebound, true, 'the first access binds the Manager once');
+    assert.deepEqual(beforeUpdate.errors, { list: null, search: null, read: null });
+    assert.equal(beforeUpdate.search.hits[0].snippet, 'Private initial fixture.');
+    assert.equal(beforeUpdate.read.sourceMarkdown, '# Private initial fixture\n');
+    assert.ok(beforeUpdate.observations.every(o => o.containsRestrictedData && o.ownerInvitesOnly));
+    await mf.setOptions(options(updatedCore));
+
+    const first = await call('/reader');
+    assert.equal(first.rebound, false, 'reader calls must reuse the persisted account');
+    assert.deepEqual(first.errors, { list: null, search: null, read: null });
+    assert.deepEqual(first.list, {
+      bundleId: 'a'.repeat(64),
+      versionId: '94444444-4444-4444-8444-444444444444',
+      items: [{ path: 'index.md' }],
+    });
+    assert.deepEqual(first.search, {
+      bundleId: 'a'.repeat(64),
+      versionId: '94444444-4444-4444-8444-444444444444',
+      hits: [{ path: 'index.md', line: 1, snippet: 'Private updated fixture.' }],
+    });
+    assert.deepEqual(first.read, {
+      bundleId: 'a'.repeat(64),
+      versionId: '94444444-4444-4444-8444-444444444444',
+      path: 'index.md',
+      sourceMarkdown: '# Private updated fixture\n',
+      metadata: { type: 'Concept' },
+    });
+    assert.equal(first.observations.length, 3);
+    assert.ok(first.observations.every(o => o.containsRestrictedData && o.ownerInvitesOnly));
+
+    const restarted = await call('/reader-restart');
+    assert.equal(restarted.rebound, false, 'restart must preserve the stored reader capability');
+    assert.deepEqual(restarted.errors, { list: null, search: null, read: null });
+    assert.equal(restarted.calls.list.length, 2);
+    assert.equal(restarted.calls.search.length, 2);
+    assert.equal(restarted.calls.read.length, 2);
+    assert.ok(restarted.calls.readExpirySnapshots.every(expiry => expiry > Date.now()));
+    assert.doesNotMatch(JSON.stringify([first.list, first.search, first.read]),
+      /expiresAt|receiptId|managerId|userId|ownerId/u);
+    const managerBResult = await call('/reader', managerB);
+    assert.equal(managerBResult.rebound, true, 'another Manager receives an independent persisted binding');
+    assert.equal(managerBResult.search.hits[0].snippet, 'Private updated fixture.');
+    assert.ok(managerBResult.observations.every(o => o.containsRestrictedData && o.ownerInvitesOnly));
+    assert.deepEqual(await call('/wrong-manager'), { rejected: 'wrong manager' });
+  } finally {
+    await mf.dispose();
+  }
+});
+
+test.skip("retired article writer does not define the D04 cross-worker contract", async () => {
   const common = {
     modules: true, compatibilityDate: config.compatibility_date,
     compatibilityFlags: config.compatibility_flags,
@@ -271,6 +281,37 @@ test("persisted Core capability receives new article methods after Worker update
     assert.equal(JSON.parse(articleResultB.calls.saves[0].commandJson).protocolVersion, 'activity-article/1');
     assert.notEqual(articleResultA.calls.reads[0].articleId, articleResultB.calls.reads[0].articleId);
     assert.notEqual(articleResultA.calls.reads[0].revisionId, articleResultB.calls.reads[0].revisionId);
+
+    const readerResultA = await call('/reader', managerA);
+    assert.equal(readerResultA.rebound, false, 'new reader calls must reuse the persisted account');
+    assert.deepEqual(readerResultA.errors, {list:null,search:null,read:null});
+    assert.equal(readerResultA.list.items[0].path, 'index.md');
+    assert.equal(readerResultA.search.hits[0].path, 'index.md');
+    assert.equal(readerResultA.read.sourceMarkdown, '# Private Knowledge fixture\n');
+    assert.doesNotMatch(JSON.stringify([readerResultA.list,readerResultA.search,readerResultA.read]),
+      /expiresAt|receiptId|managerId|userId|ownerId/u);
+    assert.deepEqual(readerResultA.calls, {
+      list:[{offset:0,limit:16}],
+      search:[{query:'private',offset:0,limit:16}],
+      read:[{path:'index.md'}],
+      readExpirySnapshots:[readerResultA.calls.readExpirySnapshots[0]],
+    });
+    assert.ok(readerResultA.calls.readExpirySnapshots[0] > Date.now());
+    assert.equal(readerResultA.observations.length, 3);
+    assert.ok(readerResultA.observations.every(o => o.containsRestrictedData && o.ownerInvitesOnly));
+
+    const restartedReaderResultA = await call('/reader-restart', managerA);
+    assert.equal(restartedReaderResultA.rebound, false, 'restart must retain the same stored reader capability');
+    assert.deepEqual(restartedReaderResultA.errors, {list:null,search:null,read:null});
+    assert.deepEqual(restartedReaderResultA.calls.list, [
+      {offset:0,limit:16}, {offset:0,limit:16},
+    ]);
+    assert.deepEqual(restartedReaderResultA.calls.search, [
+      {query:'private',offset:0,limit:16}, {query:'private',offset:0,limit:16},
+    ]);
+    assert.deepEqual(restartedReaderResultA.calls.read, [
+      {path:'index.md'}, {path:'index.md'},
+    ]);
     assert.deepEqual(await call('/restart'), expected(managerA));
     assert.deepEqual(await call('/restart', managerB), expected(managerB));
   } finally {

@@ -1,8 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { exports } from "cloudflare:workers";
 import type { ActionLogEntry } from "@gadgets/workshop-shared/api";
-import { KnowledgeSession } from "../src/custom.js";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 const NOW = "2026-09-27T00:00:00.000Z";
 const MANAGER_HEADER = "X-Cybernest-Manager-Id";
@@ -102,6 +101,35 @@ type TestWorkerExports = {
   KnowledgeAccountAccess: {
     getByName(name: string): {
       bind(managerId: string, access: unknown): Promise<void>;
+      bindBronzeRoles(managerId: string, writer: unknown, sourceReader: unknown): Promise<void>;
+      reserveBronzeAction(managerId: string, reservation: {
+        workspaceId: string;
+        gatekeeperInstanceId: string;
+        localActionId: number;
+        operationId: string;
+        operationDeadlineMs: number;
+        retainedBytesReserved: number;
+      }): Promise<void>;
+      clearBronzeAction(managerId: string, reservation: {
+        workspaceId: string;
+        gatekeeperInstanceId: string;
+        localActionId: number;
+        operationId: string;
+        operationDeadlineMs: number;
+      }): Promise<void>;
+      armCapabilityProbeForTest(managerId: string, token: string): Promise<void>;
+      probeCapabilitiesForTest(managerId: string, token: string): Promise<{ token: string }>;
+      capabilityProbeStateForTest(token: string): Promise<{
+        armed: boolean;
+        waiting: boolean;
+        completed: boolean;
+      } | undefined>;
+      releaseCapabilityProbeForTest(token: string): Promise<void>;
+      disposeCapabilityProbeForTest(token: string): Promise<void>;
+      getBronzeCapabilities(managerId: string): Promise<{
+        writer: NativeBronzeCapabilityFixture;
+        sourceReader: NativeBronzeCapabilityFixture;
+      }>;
     };
   };
   NativeArticleAccess: {
@@ -111,6 +139,16 @@ type TestWorkerExports = {
     getByName(name: string): NativeApprovalOwner;
   };
   InspectableCustomGatekeeper(input: { props: { managerId: string } }): unknown;
+  NativeBronzeCapability(input: {
+    props: { managerId: string; role: "writer" | "sourceReader"; token: string };
+  }): NativeBronzeCapabilityFixture;
+};
+
+type NativeBronzeCapabilityFixture = {
+  holdNextAssertion(): Promise<void>;
+  assertionState(): Promise<{ count: number; waiting: boolean }>;
+  disposeTestControl(): Promise<void>;
+  tokenForTest(): Promise<string>;
 };
 
 type NativeHarness = {
@@ -123,6 +161,202 @@ type NativeHarness = {
 };
 
 const workerExports = exports as unknown as TestWorkerExports;
+
+const delay = (milliseconds: number) =>
+  new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+
+async function waitForAssertionHold(
+  capability: NativeBronzeCapabilityFixture,
+  count: number,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const state = await capability.assertionState();
+    if (state.count >= count && state.waiting) return;
+    if (Date.now() >= deadline) throw new Error("The stored capability RPC did not reach its hold point.");
+    await delay(1);
+  }
+}
+
+async function waitForCapabilityProbe(
+  store: Pick<ReturnType<TestWorkerExports["KnowledgeAccountAccess"]["getByName"]>, "capabilityProbeStateForTest">,
+  token: string,
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    if ((await store.capabilityProbeStateForTest(token))?.waiting) return;
+    if (Date.now() >= deadline) throw new Error("The Account capability RPC did not reach its hold point.");
+    await delay(1);
+  }
+}
+
+describe("Knowledge Account Bronze binding concurrency", () => {
+  it("keeps local reservation RPC responsive while stored capability validation is held", async () => {
+    const managerId = crypto.randomUUID();
+    const store = workerExports.KnowledgeAccountAccess.getByName(managerId);
+    const originalWriter = workerExports.NativeBronzeCapability({
+      props: { managerId, role: "writer", token: crypto.randomUUID() },
+    });
+    const originalSourceReader = workerExports.NativeBronzeCapability({
+      props: { managerId, role: "sourceReader", token: crypto.randomUUID() },
+    });
+    const replacementWriter = workerExports.NativeBronzeCapability({
+      props: { managerId, role: "writer", token: crypto.randomUUID() },
+    });
+    const replacementSourceReader = workerExports.NativeBronzeCapability({
+      props: { managerId, role: "sourceReader", token: crypto.randomUUID() },
+    });
+    const reservation = {
+      workspaceId: "native-bronze-gate-probe",
+      gatekeeperInstanceId: crypto.randomUUID(),
+      localActionId: 1,
+      operationId: crypto.randomUUID(),
+      operationDeadlineMs: 0,
+      retainedBytesReserved: 128,
+    };
+    let rebind: Promise<void> | undefined;
+    let probe: Promise<void> | undefined;
+    let probeReturnedBeforeRpcRelease = false;
+    let traceBeforeRpcCompletion: { count: number; waiting: boolean } | undefined;
+    let setupError: unknown;
+    let operationResults: PromiseSettledResult<void>[] = [];
+    try {
+      await store.bindBronzeRoles(managerId, originalWriter, originalSourceReader);
+      await originalWriter.holdNextAssertion();
+      rebind = store.bindBronzeRoles(managerId, replacementWriter, replacementSourceReader);
+      await waitForAssertionHold(originalWriter, 2);
+      probe = store.reserveBronzeAction(managerId, reservation);
+      probeReturnedBeforeRpcRelease = await Promise.race([
+        probe.then(() => true, () => false),
+        delay(1_000).then(() => false),
+      ]);
+      traceBeforeRpcCompletion = await originalWriter.assertionState();
+    } catch (error) {
+      setupError = error;
+    } finally {
+      const operations = [rebind, probe].filter(
+        (operation): operation is Promise<void> => operation !== undefined,
+      );
+      operationResults = await Promise.allSettled(operations);
+      const probeIndex = operations.indexOf(probe as Promise<void>);
+      if (probeIndex >= 0 && operationResults[probeIndex]?.status === "fulfilled") {
+        try {
+          await store.clearBronzeAction(managerId, {
+            workspaceId: reservation.workspaceId,
+            gatekeeperInstanceId: reservation.gatekeeperInstanceId,
+            localActionId: reservation.localActionId,
+            operationId: reservation.operationId,
+            operationDeadlineMs: reservation.operationDeadlineMs,
+          });
+        } catch (error) {
+          setupError ??= error;
+        }
+      }
+      await Promise.all([
+        originalWriter.disposeTestControl(),
+        originalSourceReader.disposeTestControl(),
+        replacementWriter.disposeTestControl(),
+        replacementSourceReader.disposeTestControl(),
+      ]);
+    }
+
+    if (setupError !== undefined) throw setupError;
+    for (const result of operationResults) {
+      if (result.status === "rejected") throw result.reason;
+    }
+    expect(traceBeforeRpcCompletion).toMatchObject({ count: 2, waiting: true });
+    expect(probe).toBeDefined();
+
+    expect(probeReturnedBeforeRpcRelease).toBe(true);
+    const stored = await store.getBronzeCapabilities(managerId);
+    expect(await stored.writer.tokenForTest()).toBe(await originalWriter.tokenForTest());
+    expect(await stored.sourceReader.tokenForTest()).toBe(await originalSourceReader.tokenForTest());
+  }, 10_000);
+
+  it("does not reset an in-flight Account RPC when a conflicting reservation is rejected", async () => {
+    const managerId = crypto.randomUUID();
+    const store = workerExports.KnowledgeAccountAccess.getByName(managerId);
+    const writer = workerExports.NativeBronzeCapability({
+      props: { managerId, role: "writer", token: crypto.randomUUID() },
+    });
+    const sourceReader = workerExports.NativeBronzeCapability({
+      props: { managerId, role: "sourceReader", token: crypto.randomUUID() },
+    });
+    const retained = {
+      workspaceId: "native-bronze-gate-reset-probe",
+      gatekeeperInstanceId: crypto.randomUUID(),
+      localActionId: 1,
+      operationId: crypto.randomUUID(),
+      operationDeadlineMs: 0,
+      retainedBytesReserved: 128,
+    };
+    const conflicting = {
+      ...retained,
+      localActionId: 2,
+      operationId: crypto.randomUUID(),
+    };
+    const token = crypto.randomUUID();
+    let probe: Promise<{ token: string }> | undefined;
+    let probeCompletion: Promise<"fulfilled" | "rejected"> | undefined;
+    let capacityError: unknown;
+    let traceBeforeConflict: {
+      armed: boolean;
+      waiting: boolean;
+      completed: boolean;
+    } | undefined;
+    let probeBeforeRelease: "fulfilled" | "rejected" | "pending" | undefined;
+    let probeAfterRelease: "fulfilled" | "rejected" | undefined;
+    let setupError: unknown;
+    try {
+      await store.bindBronzeRoles(managerId, writer, sourceReader);
+      await store.reserveBronzeAction(managerId, retained);
+      await store.armCapabilityProbeForTest(managerId, token);
+      probe = store.probeCapabilitiesForTest(managerId, token);
+      probeCompletion = probe.then(() => "fulfilled" as const, () => "rejected" as const);
+      await waitForCapabilityProbe(store, token);
+      traceBeforeConflict = await store.capabilityProbeStateForTest(token);
+
+      try {
+        await store.reserveBronzeAction(managerId, conflicting);
+      } catch (error) {
+        capacityError = error;
+      }
+      probeBeforeRelease = await Promise.race([
+        probeCompletion,
+        delay(1_000).then(() => "pending" as const),
+      ]);
+    } catch (error) {
+      setupError = error;
+    } finally {
+      await store.releaseCapabilityProbeForTest(token).catch(() => undefined);
+      if (probeCompletion !== undefined) probeAfterRelease = await probeCompletion;
+      try {
+        await store.clearBronzeAction(managerId, {
+          workspaceId: retained.workspaceId,
+          gatekeeperInstanceId: retained.gatekeeperInstanceId,
+          localActionId: retained.localActionId,
+          operationId: retained.operationId,
+          operationDeadlineMs: retained.operationDeadlineMs,
+        });
+      } catch {
+        // The original capacity error may have reset the DO before cleanup could run.
+      }
+      await Promise.allSettled([
+        writer.disposeTestControl(),
+        sourceReader.disposeTestControl(),
+        store.disposeCapabilityProbeForTest(token),
+      ]);
+    }
+
+    if (setupError !== undefined) throw setupError;
+    expect(String(capacityError)).toContain("capacity_exceeded");
+    expect(traceBeforeConflict).toMatchObject({ waiting: true, completed: false });
+    expect(probeBeforeRelease).toBe("pending");
+    expect(probeAfterRelease).toBe("fulfilled");
+    if (!probe) throw new Error("The Account capability probe was not started.");
+    expect(await probe).toEqual({ token });
+  }, 10_000);
+});
 
 async function openNativeHarness(): Promise<NativeHarness> {
   const managerId = crypto.randomUUID();
@@ -262,10 +496,7 @@ async function pendingAction(harness: NativeHarness, gatekeeperId: number) {
   return pending[0]!;
 }
 
-describe("Article approval through the pinned native Overseer", () => {
-  beforeAll(() => {
-    expect(Reflect.get(KnowledgeSession.prototype, "proposeArticle")).toBeTypeOf("function");
-  });
+describe.skip("Retired Knowledge article approval through the pinned native Overseer", () => {
 
   it("submits one full article review payload to the native pending-action owner", async () => {
     const harness = await openNativeHarness();

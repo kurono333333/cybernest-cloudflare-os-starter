@@ -4,10 +4,10 @@ import type {
   ApprovalQueue,
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
+import type { KnowledgeAccess } from "../src/custom.js";
 import { describe, expect, it } from "vitest";
 import TYPES_CODE from "../src/types-code.js";
 import {
-  Knowledge,
   KnowledgeSession,
   describeCustomAccount,
   describeCustomVendor,
@@ -147,40 +147,13 @@ const newSession = (
     access as unknown as never,
   );
 
-const newHandle = async (
-  queue: FakeQueue,
-  access: FakeAccessImpl,
-  item: Record<string, unknown> = summary(),
-): Promise<Knowledge> => {
-  access.listResult = { _tag: "page", items: [item] };
-  const result = await newSession(queue, access).list();
-  const handle = result.items[0]?.access;
-  if (handle === undefined) throw new Error("Expected a ready Knowledge handle.");
-  return handle;
-};
-
 describe("S15 generated type contract", () => {
-  it("keeps creation outcome summaries capability-free and failure reasons closed", () => {
-    const creationSummary = TYPES_CODE.match(/interface KnowledgeCreationSummary \{[^}]*\}/u)?.[0] ?? "";
-    expect(creationSummary).toContain("interface KnowledgeCreationSummary");
-    expect(creationSummary).not.toContain("access?:");
-    expect(creationSummary).toContain('role: "additional";');
-    expect(TYPES_CODE).toContain("knowledge: KnowledgeCreationSummary;");
-    expect(TYPES_CODE).toContain('status: "outcome_unknown"; reason: "outcome_unknown";');
-    expect(TYPES_CODE).toContain('status: "failed"; reason: CreationTerminalFailure;');
-    expect(TYPES_CODE).toContain('status: "applied"; outcome: "ready" | "already_ready" | "provisioning" | "blocked"; knowledge: KnowledgeCreationSummary;');
-    expect(TYPES_CODE).not.toContain('status: "pending_approval" | "applying" | "applied" | "outcome_unknown" | "failed";');
-    expect(TYPES_CODE).toContain('readCreationOutcome(input: { operationId: string }): Promise<KnowledgeCreationOutcome | null>;');
-    expect(TYPES_CODE).not.toContain('Promise<{ operationId: string; KnowledgeCreationOutcome; } | null>');
-    expect(TYPES_CODE).toContain(
-      'type CreationFailure = "service_not_ready" | "capacity_exceeded" | "forbidden" | "invalid_input" | "operation_conflict" | "integrity_failure" | "deadline_exceeded" | "outcome_unknown" | "dependency_unavailable";',
-    );
-    expect(TYPES_CODE).toContain(
-      'type CreationTerminalFailure = "service_not_ready" | "capacity_exceeded" | "forbidden" | "invalid_input" | "operation_conflict" | "integrity_failure";',
-    );
-    expect(TYPES_CODE).not.toContain(
-      'type CreationTerminalFailure = "service_not_ready" | "capacity_exceeded" | "forbidden" | "invalid_input" | "operation_conflict" | "integrity_failure" | "deadline_exceeded" | "dependency_unavailable";',
-    );
+  it("publishes only list/search/read DTO types, without authority or receipt fields", () => {
+    expect(TYPES_CODE).toContain("interface KnowledgeBase");
+    expect(TYPES_CODE).toContain("list(input: KnowledgeListInput)");
+    expect(TYPES_CODE).toContain("search(input: KnowledgeSearchInput)");
+    expect(TYPES_CODE).toContain("read(input: KnowledgeReadInput)");
+    expect(TYPES_CODE).not.toMatch(/proposal|propose|readBronze|readArticle|managerId|userId|ownerId|assertBoundTo|expiresAt|receiptId/u);
   });
 });
 
@@ -197,18 +170,16 @@ describe("S14 public surface and descriptions", () => {
     });
   });
 
-  it("keeps only list on KnowledgeBase and readBronze on Knowledge", () => {
+  it("keeps generated Agent types free of owner, receipt, and write APIs", () => {
     expect(TYPES_CODE).toContain("interface KnowledgeBase");
-    expect(TYPES_CODE).toContain("list(options?");
-    expect(TYPES_CODE).toContain("interface Knowledge");
-    expect(TYPES_CODE).toContain("readBronze(input");
-    expect(TYPES_CODE).not.toMatch(
-      /managerId|userId|targetName|raw|search\(|read\(|proposeUpdate\(/,
-    );
+    expect(TYPES_CODE).toMatch(/list\(/u);
+    expect(TYPES_CODE).toMatch(/search\(/u);
+    expect(TYPES_CODE).toMatch(/read\(/u);
+    expect(TYPES_CODE).not.toMatch(/managerId|userId|ownerId|assertBoundTo|expiresAt|receiptId|propose|readBronze|readArticle/u);
   });
 });
 
-describe("S14 list projection", () => {
+describe.skip("Retired catalog summary and child-handle API", () => {
   it.each([
     ["undefined", undefined],
     ["empty", {}],
@@ -329,7 +300,7 @@ describe("S14 list projection", () => {
   });
 });
 
-describe("S14 Bronze handle and strict result projection", () => {
+describe.skip("Retired Bronze read and adoption API", () => {
   it("captures the validated locator and supports current and historical reads", async () => {
     const queue = new FakeQueue();
     const access = new FakeAccessImpl();
@@ -497,7 +468,7 @@ describe("S14 Bronze handle and strict result projection", () => {
   });
 });
 
-describe("S14 observation and capability lifecycle", () => {
+describe.skip("Retired Bronze capability lifecycle", () => {
   it("awaits authorization and returns no page/data when authorization rejects", async () => {
     const queue = new FakeQueue();
     const access = new FakeAccessImpl();
@@ -586,9 +557,16 @@ describe("S14 actual Worker/DO/RPC integration", () => {
     runAccount(managerId?: string): Promise<{
       description: { displayName?: string; singleton?: { tsType: string } };
       binding: "legacy" | "bound";
-      page: Array<Record<string, unknown>>;
+      page: Record<string, unknown>;
       observations: ObservationDescription[];
       boundInputs: string[];
+    }>;
+    runConcurrentAccountBinding(): Promise<{
+      bindResults: Array<"fulfilled" | "rejected">;
+      firstStored: string;
+      afterRebind: string;
+      foreignError: string | null;
+      afterForeign: string;
     }>;
     runAccountError(options?: {
       requestedManagerId?: string;
@@ -609,26 +587,8 @@ describe("S14 actual Worker/DO/RPC integration", () => {
   const factory = (): DurableObjectStub<TestFactory> =>
     testEnv.TEST_FACTORY.getByName("s14-" + crypto.randomUUID());
 
-  it("executes the real WorkerEntrypoint -> DO -> RpcTarget read path", async () => {
-    const result = await factory().runRead({ nextCursor: "string" });
-    expect(result.page).toHaveLength(3);
-    expect(result.page?.map((item) => item.hasAccess)).toEqual([true, false, false]);
-    expect(result.nextCursor).toBe("next-page");
-    expect(result.read).toMatchObject({
-      knowledgeId: "44444444-4444-4444-8444-444444444444",
-      sourceId: "74444444-4444-4444-8444-444444444444",
-    });
-    expect(result.readInputs).toEqual([
-      {
-        knowledgeId: "44444444-4444-4444-8444-444444444444",
-        generation: 1,
-        sourceId: "74444444-4444-4444-8444-444444444444",
-      },
-    ]);
-    expect(result.observations).toHaveLength(2);
-    expect(result.observations.every((observation) => observation.prohibitAllSharing)).toBe(
-      true,
-    );
+  it.skip("executes the retired catalog-summary and Bronze-handle path", async () => {
+    await factory().runRead({ nextCursor: "string" });
   });
 
   it("exercises account install/binding through the real vendor and singleton DO", async () => {
@@ -638,7 +598,16 @@ describe("S14 actual Worker/DO/RPC integration", () => {
       displayName: "Knowledge Base",
       singleton: { tsType: "KnowledgeBase" },
     });
-    expect(result.page[0]).toMatchObject({ hasAccess: true, state: "ready" });
+    expect(result.page).toEqual({
+      bundleId: "a".repeat(64),
+      versionId: "94444444-4444-4444-8444-444444444444",
+      items: [{ path: "index.md" }],
+    });
+    expect(result.observations).toHaveLength(1);
+    expect(result.observations[0]).toMatchObject({
+      containsRestrictedData: true,
+      ownerInvitesOnly: true,
+    });
     expect(result.boundInputs).toEqual([
       "44444444-4444-4444-8444-444444444444",
       "44444444-4444-4444-8444-444444444444",
@@ -657,21 +626,30 @@ describe("S14 actual Worker/DO/RPC integration", () => {
     expect(await factory().runLegacyAccount()).toEqual({ binding: "legacy", error: null });
   });
 
-  it("bounds catalog limits and keeps observer registration private", async () => {
+  it("serializes first account binding and never replaces it with a later capability", async () => {
+    const result = await factory().runConcurrentAccountBinding();
+    expect(result.bindResults).toEqual(["fulfilled", "fulfilled"]);
+    expect(["parallel-bind-first", "parallel-bind-second"]).toContain(result.firstStored);
+    expect(result.afterRebind).toBe(result.firstStored);
+    expect(result.foreignError).toMatch(/another Manager/u);
+    expect(result.afterForeign).toBe(result.firstStored);
+  });
+
+  it("keeps the prompt catalog generic and observer registration private", async () => {
     const zero = await factory().runCatalog(0);
-    expect(zero.catalog.entries).toEqual([]);
-    expect(zero.observations).toHaveLength(1);
+    expect(zero.catalog.entries).toHaveLength(1);
+    expect(zero.observations).toHaveLength(0);
     const one = await factory().runCatalog(1);
     expect(one.catalog.entries).toHaveLength(1);
     expect(one.catalog.entries[0]).toEqual({
       id: "knowledge-base",
       title: "Knowledge Base",
-      description: "Available. Use list to inspect current Knowledge summaries.",
+      description: "Available. Use list, search, and read to inspect Knowledge pages.",
     });
     expect(await factory().runObserverRejection()).toMatch(/private/i);
   });
 
-  it("proves malformed and authorization-failed integration paths leak no page/data", async () => {
+  it.skip("proves the retired catalog and Bronze boundary rejects malformed legacy responses", async () => {
     const malformedList = await factory().runRead({ listMode: "malformed" });
     expect(malformedList.page).toBeNull();
     expect(malformedList.error).toMatch(/integrity_failure/);
@@ -693,7 +671,338 @@ describe("S14 actual Worker/DO/RPC integration", () => {
   });
 
 });
-describe("S15 native approved Knowledge create (test-first)", () => {
+
+describe("D04 private Knowledge reader integration (test-first)", () => {
+  type TestFactory = {
+    runD04ReaderSurface(): Promise<{
+      typesCode: string;
+      catalog: { entries: Array<Record<string, unknown>>; truncated?: boolean } | null;
+      list: unknown;
+      search: unknown;
+      read: unknown;
+      errors: { list: string | null; search: string | null; read: string | null };
+      observations: Array<Record<string, unknown>>;
+      readerSnapshot: {
+        listInputs: unknown[];
+        searchInputs: unknown[];
+        readInputs: unknown[];
+        readExpirySnapshots: number[];
+      };
+    }>;
+    runD04ObservationReject(): Promise<{
+      result: unknown;
+      error: string | null;
+      observationCount: number;
+    }>;
+    runD04ConcurrentReceiptExpiry(): Promise<{
+      first: { value?: unknown; error?: string };
+      second: unknown;
+      secondError: string | null;
+      firstExpiry: number | null;
+      secondExpiry: number | null;
+      firstObservationReached: boolean;
+    }>;
+    runObserverRejection(): Promise<string | null>;
+  };
+
+  const testEnv = env as unknown as { TEST_FACTORY: DurableObjectNamespace<TestFactory> };
+  const factory = (): DurableObjectStub<TestFactory> =>
+    testEnv.TEST_FACTORY.getByName("d04-reader-" + crypto.randomUUID());
+  const localSession = (queue: FakeQueue, access: KnowledgeAccess) =>
+    new KnowledgeSession(
+      queue as unknown as RpcStub<ApprovalQueue>,
+      access,
+    );
+
+  const expectedList = {
+    bundleId: "a".repeat(64),
+    versionId: "94444444-4444-4444-8444-444444444444",
+    items: [{ path: "index.md" }],
+  };
+  const expectedSearch = {
+    bundleId: "a".repeat(64),
+    versionId: "94444444-4444-4444-8444-444444444444",
+    hits: [{ path: "index.md", line: 1, snippet: "Private Knowledge fixture." }],
+  };
+  const expectedRead = {
+    bundleId: "a".repeat(64),
+    versionId: "94444444-4444-4444-8444-444444444444",
+    path: "index.md",
+    sourceMarkdown: "# Private Knowledge fixture\n",
+    metadata: { type: "Concept" },
+  };
+
+  it("exposes only list/search/read and strips receipt metadata before returning each DTO", async () => {
+    const result = await factory().runD04ReaderSurface();
+    const knowledgeBaseIndex = result.typesCode.indexOf("interface KnowledgeBase {");
+    const knowledgeBase = result.typesCode.slice(knowledgeBaseIndex);
+    expect(knowledgeBaseIndex).toBeGreaterThanOrEqual(0);
+    expect(knowledgeBase).toMatch(/\blist\(/u);
+    expect(knowledgeBase).toMatch(/\bsearch\(/u);
+    expect(knowledgeBase).toMatch(/\bread\(/u);
+    expect(knowledgeBase).not.toMatch(/propose|readBronze|readArticle|managerId|userId|ownerId|assertBoundTo/u);
+    expect(result.typesCode).not.toMatch(/expiresAt|receiptId|capability|managerId|userId|ownerId/u);
+    expect(result.catalog?.entries).toEqual([
+      {
+        id: "knowledge-base",
+        title: "Knowledge Base",
+        description: "Available. Use list, search, and read to inspect Knowledge pages.",
+      },
+    ]);
+    expect(JSON.stringify(result.catalog)).not.toContain("Private Knowledge fixture");
+
+    expect(result.errors).toEqual({ list: null, search: null, read: null });
+    expect(result.list).toEqual(expectedList);
+    expect(result.search).toEqual(expectedSearch);
+    expect(result.read).toEqual(expectedRead);
+    expect(JSON.stringify([result.list, result.search, result.read])).not.toMatch(
+      /expiresAt|receiptId|managerId|userId|ownerId/u,
+    );
+    expect(result.readerSnapshot).toMatchObject({
+      listInputs: [{ offset: 0, limit: 16 }],
+      searchInputs: [{ query: "private", offset: 0, limit: 16 }],
+      readInputs: [{ path: "index.md" }],
+    });
+    expect(result.readerSnapshot.readExpirySnapshots).toHaveLength(1);
+    expect(result.readerSnapshot.readExpirySnapshots[0]).toBeGreaterThan(Date.now());
+    expect(result.observations).toHaveLength(3);
+    expect(result.observations.every((item) =>
+      item.containsRestrictedData === true && item.ownerInvitesOnly === true,
+    )).toBe(true);
+  });
+
+  it("does not return private content when native observation rejects the read", async () => {
+    const result = await factory().runD04ObservationReject();
+    expect(result.error).not.toBeNull();
+    expect(result.result).toBeUndefined();
+    expect(result.observationCount).toBe(1);
+  });
+
+  it("removes legacy proposal and raw read methods from the runtime Knowledge prototypes", () => {
+    const exposedMethods = new Set(Object.getOwnPropertyNames(KnowledgeSession.prototype));
+    const legacyMethods = [
+      "proposeArticle",
+      "readArticle",
+      "readArticleOutcome",
+      "proposeKnowledgeCreate",
+      "readCreationOutcome",
+      "proposeBronzeAdoption",
+      "readAdoptionOutcome",
+      "readBronze",
+      "assertBoundTo",
+      "getAccess",
+    ];
+    expect(legacyMethods.filter((method) => exposedMethods.has(method))).toEqual([]);
+  });
+
+  it("does not let a concurrent renewal extend an earlier read held in native observation", async () => {
+    const result = await factory().runD04ConcurrentReceiptExpiry();
+    expect(result.firstObservationReached).toBe(true);
+    expect(result.firstExpiry).not.toBeNull();
+    expect(result.secondExpiry).not.toBeNull();
+    expect(result.secondExpiry).toBeGreaterThan(result.firstExpiry!);
+    expect(result.secondError).toBeNull();
+    expect(result.second).toEqual(expectedRead);
+    expect(result.first.error).toMatch(/permission_denied/u);
+    expect(result.first).not.toHaveProperty("value");
+  }, 15_000);
+
+  it("keeps private reader ownership unavailable to observer registration", async () => {
+    await expect(factory().runObserverRejection()).resolves.toMatch(/private/i);
+  });
+
+  it.each([
+    ["list", { offset: -1, limit: 16 }],
+    ["search", { query: String.fromCharCode(0xd800), offset: 0, limit: 16 }],
+    ["read", { path: "../index.md" }],
+  ] as const)("rejects invalid %s input before the Core call", async (method, input) => {
+    const queue = new FakeQueue();
+    let calls = 0;
+    const access: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() { calls += 1; return { ok: false, code: "permission_denied" }; },
+      async search() { calls += 1; return { ok: false, code: "permission_denied" }; },
+      async read() { calls += 1; return { ok: false, code: "permission_denied" }; },
+    };
+    const session = localSession(queue, access);
+    const operation = method === "list"
+      ? session.list(input)
+      : method === "search"
+        ? session.search(input)
+        : session.read(input);
+
+    await expect(operation).rejects.toThrow(/invalid_input/u);
+    expect(calls).toBe(0);
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it("rejects a read DTO that does not match its requested page", async () => {
+    const queue = new FakeQueue();
+    const access: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() { throw new Error("unused"); },
+      async search() { throw new Error("unused"); },
+      async read() {
+        return {
+          ok: true,
+          value: { value: { ...expectedRead, path: "other.md" }, expiresAt: Date.now() + 30_000 },
+        };
+      },
+    };
+
+    await expect(localSession(queue, access).read({ path: "index.md" })).rejects.toThrow(
+      /integrity_failure/u,
+    );
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it("accepts the producer's full TTL starting when the receipt arrives", async () => {
+    const queue = new FakeQueue();
+    const startedAt = Date.now();
+    let receiptCreatedAt = 0;
+    let expiresAt = 0;
+    const access: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        receiptCreatedAt = Date.now();
+        expiresAt = receiptCreatedAt + 3_600_000;
+        return {
+          ok: true,
+          value: {
+            value: expectedList,
+            expiresAt,
+          },
+        };
+      },
+      async search() { throw new Error("unused"); },
+      async read() { throw new Error("unused"); },
+    };
+
+    await expect(localSession(queue, access).list({ offset: 0, limit: 16 })).resolves.toEqual(expectedList);
+    expect(queue.observations).toHaveLength(1);
+    expect(queue.observations[0]).toMatchObject({
+      containsRestrictedData: true,
+      ownerInvitesOnly: true,
+    });
+    expect(receiptCreatedAt).toBeGreaterThan(startedAt);
+    expect(expiresAt).toBeGreaterThan(startedAt + 3_600_000);
+  });
+
+  it("accepts producer UUIDs without imposing a UUIDv4 version or lowercase rule", async () => {
+    const queue = new FakeQueue();
+    const result = {
+      ...expectedList,
+      versionId: "FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF",
+    };
+    const access: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() {
+        return { ok: true, value: { value: result, expiresAt: Date.now() + 30_000 } };
+      },
+      async search() { throw new Error("unused"); },
+      async read() { throw new Error("unused"); },
+    };
+
+    await expect(localSession(queue, access).list({ offset: 0, limit: 16 })).resolves.toEqual(result);
+    expect(queue.observations).toHaveLength(1);
+  });
+
+  it.each([
+    ["missing expiry", { value: expectedRead }],
+    ["unsafe expiry", { value: expectedRead, expiresAt: Number.MAX_SAFE_INTEGER + 1 }],
+    ["overlong expiry", { value: expectedRead, expiresAt: Date.now() + 3_605_000 }],
+  ])("rejects a %s receipt before observation", async (_name, receipt) => {
+    const queue = new FakeQueue();
+    const access: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() { throw new Error("unused"); },
+      async search() { throw new Error("unused"); },
+      async read() { return { ok: true, value: receipt }; },
+    };
+
+    await expect(localSession(queue, access).read({ path: "index.md" })).rejects.toThrow(
+      /integrity_failure/u,
+    );
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it("returns permission_denied for a receipt already expired at arrival", async () => {
+    const queue = new FakeQueue();
+    const access: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() { throw new Error("unused"); },
+      async search() { throw new Error("unused"); },
+      async read() {
+        return {
+          ok: true,
+          value: { value: expectedRead, expiresAt: Date.now() - 1 },
+        };
+      },
+    };
+
+    await expect(localSession(queue, access).read({ path: "index.md" })).rejects.toThrow(
+      /permission_denied/u,
+    );
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it("keeps typed producer failures separate from unexpected private RPC rejection", async () => {
+    const typedQueue = new FakeQueue();
+    const typedAccess: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() { return { ok: false, code: "permission_denied" }; },
+      async search() { throw new Error("unused"); },
+      async read() { throw new Error("unused"); },
+    };
+    await expect(localSession(typedQueue, typedAccess).list({ offset: 0, limit: 16 })).rejects.toThrow(
+      /permission_denied/u,
+    );
+    expect(typedQueue.observations).toHaveLength(0);
+
+    const rejectedQueue = new FakeQueue();
+    const privateCause = new Error("private transport details");
+    const rejectedAccess: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() { throw privateCause; },
+      async search() { throw new Error("unused"); },
+      async read() { throw new Error("unused"); },
+    };
+    await expect(localSession(rejectedQueue, rejectedAccess).list({ offset: 0, limit: 16 })).rejects.toThrow(
+      "Knowledge Base read failed.",
+    );
+    expect(rejectedQueue.observations).toHaveLength(0);
+  });
+
+  it.each(["list", "search", "read"] as const)(
+    "returns no %s payload when native observation rejects",
+    async (method) => {
+      const queue = new FakeQueue();
+      queue.reject = true;
+      const receipt = (value: unknown) => ({
+        ok: true,
+        value: { value, expiresAt: Date.now() + 30_000 },
+      });
+      const access: KnowledgeAccess = {
+        assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+        async list() { return receipt(expectedList); },
+        async search() { return receipt(expectedSearch); },
+        async read() { return receipt(expectedRead); },
+      };
+      const session = localSession(queue, access);
+      const operation = method === "list"
+        ? session.list({ offset: 0, limit: 16 })
+        : method === "search"
+          ? session.search({ query: "private", offset: 0, limit: 16 })
+          : session.read({ path: "index.md" });
+
+      await expect(operation).rejects.toThrow("observation denied");
+      expect(queue.observations).toHaveLength(1);
+    },
+  );
+});
+
+describe.skip("Retired Knowledge create proposal API", () => {
   it("fails closed when the direct unit seam has no durable proposal owner", async () => {
     const queue = new FakeQueue();
     const access = new FakeAccessImpl();
@@ -749,7 +1058,7 @@ describe("S15 native approved Knowledge create (test-first)", () => {
 
 
 
-describe("S15 native approval integration", () => {
+describe.skip("Retired native Knowledge create approval flow", () => {
   type InvalidInputMode =
     | "invalid_input_bare"
     | "invalid_input"
@@ -1063,7 +1372,7 @@ describe("S15 native approval integration", () => {
 });
 
 
-describe("S16 native approved exact Bronze adoption (test-first)", () => {
+describe.skip("Retired Bronze adoption API", () => {
   const exactDocument = "# Exact concept\n\n~~~\nnot a fence escape\n~~~~~\n";
   const provenance: BronzeProvenance = {
     sourceKind: "explicit_user_input",
@@ -1145,7 +1454,7 @@ describe("S16 native approved exact Bronze adoption (test-first)", () => {
   });
 });
 
-describe("S16 actual Gatekeeper DO / RpcTarget / ApprovalQueue boundary (test-first)", () => {
+describe.skip("Retired Bronze approval integration", () => {
   const exactDocument = "# Exact concept\n\n~~~\nnot a fence escape\n~~~~~\n";
   const provenance: BronzeProvenance = {
     sourceKind: "explicit_user_input",

@@ -22,7 +22,7 @@
   // When enabled, replace every placeholder and install CF_AI_GATEWAY_API_TOKEN separately.
   // Reference: docs/customization.md#ai-models
   "aiGateway": {
-    "enabled": true,
+    "enabled": false,
     "name": "default",
     "accountId": "d6726a38b563a01c6339a20854852086",
     "providers": ["cloudflare"],
@@ -33,7 +33,7 @@
 
   "context": {
     // Isolates Context data shared by this Workshop deployment.
-    "sharingDomain": "production",
+    "sharingDomain": "dev",
 
     // null: Wrangler provisions and remembers a KV namespace on first deploy.
     // string: bind an existing namespace by ID.
@@ -51,8 +51,8 @@
   // Set release to a commit/version when your deployment pipeline has one.
   // Reference: docs/observability.md#quick-start
   "errorReporting": {
-    "enabled": true,
-    "environment": "production",
+    "enabled": false,
+    "environment": "dev",
     "release": null
   },
 

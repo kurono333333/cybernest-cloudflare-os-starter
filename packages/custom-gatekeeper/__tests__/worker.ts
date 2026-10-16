@@ -2,7 +2,6 @@ import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:
 import type {
   AccountDescription,
   AgentCatalog,
-  AgentCatalogRequest,
   ApprovalQueue,
   ObservationAuthorizer,
   ObservationDescription,
@@ -103,6 +102,8 @@ type AdoptionOutcomeMode =
 type FixtureAccessProps = {
   managerId: string;
   token?: string;
+  d04ReaderMode?: boolean;
+  receiptSchedule?: "stable" | "renewal_during_observation";
   createMode?: CreateMode;
   outcomeMode?: OutcomeMode;
   states?: KnowledgeState[];
@@ -110,6 +111,7 @@ type FixtureAccessProps = {
   bronzeMode?: BronzeMode;
   nextCursor?: NextCursorMode;
   assertMode?: AssertMode;
+  bindDelayMs?: number;
   adoptionMode?: AdoptionMode;
   adoptionOutcomeMode?: AdoptionOutcomeMode;
   reviewDisplayName?: string;
@@ -122,6 +124,54 @@ type BronzeCall = {
   revisionId?: string;
 };
 
+type D04ListInput = { offset: number; limit: number };
+type D04SearchInput = { query: string; offset: number; limit: number };
+type D04ReadInput = { path: string };
+type D04ReaderResult = {
+  list: {
+    bundleId: string;
+    versionId: string;
+    items: Array<{ path: string }>;
+  };
+  search: {
+    bundleId: string;
+    versionId: string;
+    hits: Array<{ path: string; line: number; snippet: string }>;
+  };
+  read: {
+    bundleId: string;
+    versionId: string;
+    path: string;
+    sourceMarkdown: string;
+    metadata: Record<string, unknown>;
+  };
+};
+const D04_BUNDLE_ID = "a".repeat(64);
+const D04_VERSION_ID = "94444444-4444-4444-8444-444444444444";
+const D04_READER_RESULT: D04ReaderResult = {
+  list: {
+    bundleId: D04_BUNDLE_ID,
+    versionId: D04_VERSION_ID,
+    items: [{ path: "index.md" }],
+  },
+  search: {
+    bundleId: D04_BUNDLE_ID,
+    versionId: D04_VERSION_ID,
+    hits: [{ path: "index.md", line: 1, snippet: "Private Knowledge fixture." }],
+  },
+  read: {
+    bundleId: D04_BUNDLE_ID,
+    versionId: D04_VERSION_ID,
+    path: "index.md",
+    sourceMarkdown: "# Private Knowledge fixture\n",
+    metadata: { type: "Concept" },
+  },
+};
+const d04SuccessReceipt = <A>(value: A, expiresAt: number) => ({
+  ok: true as const,
+  value: { value, expiresAt },
+});
+
 type FixtureAccessInspector = {
   readInputLog(): Promise<unknown[]>;
   boundInputLog(): Promise<string[]>;
@@ -130,6 +180,12 @@ type FixtureAccessInspector = {
   adoptionInputLog(): Promise<unknown[]>;
   adoptionOutcomeInputLog(): Promise<unknown[]>;
   setAdoptionOutcomeMode(mode: AdoptionOutcomeMode): Promise<void>;
+  d04ReaderSnapshot(): Promise<{
+    listInputs: unknown[];
+    searchInputs: unknown[];
+    readInputs: unknown[];
+    readExpirySnapshots: number[];
+  }>;
 };
 
 type FixtureKnowledge = {
@@ -155,6 +211,8 @@ type FixturePage = {
 };
 
 type FixtureSession = {
+  // This test-only compatibility surface is used solely by suites below that are retired in D04.
+  // It does not describe or exercise the Agent-facing KnowledgeSession implementation.
   list(options?: { cursor?: string; limit?: number }): Promise<FixturePage>;
   proposeKnowledgeCreate(input: unknown): Promise<unknown>;
   readCreationOutcome(input: unknown): Promise<unknown | null>;
@@ -165,10 +223,8 @@ type BronzeTamperField = "document" | "content_hash" | "action_ref" | "fingerpri
 
 type FixtureGatekeeper = {
   startSession(queue: RpcStub<ApprovalQueue>): Promise<FixtureSession>;
-  getAgentCatalog(
-    request: AgentCatalogRequest,
-    authorizer: RpcStub<ObservationAuthorizer>,
-  ): Promise<AgentCatalog>;
+  getTypeScriptTypes(): Promise<string>;
+  getAgentCatalog(...args: unknown[]): Promise<AgentCatalog>;
   addObserver(
     observerId: string,
     user: unknown,
@@ -222,7 +278,16 @@ type FixtureAccount = {
 };
 
 type WorkerExports = {
-  TestKnowledgeAccess(options: { props: FixtureAccessProps }): FixtureAccessInspector & { managerIdForTest(): Promise<string> };
+  TestKnowledgeAccess(options: { props: FixtureAccessProps }): FixtureAccessInspector & {
+    managerIdForTest(): Promise<string>;
+    tokenForTest(): Promise<string>;
+  };
+  KnowledgeAccountAccess: {
+    getByName(managerId: string): {
+      bind(managerId: string, capability: unknown): Promise<void>;
+      getAccess(): Promise<unknown>;
+    };
+  };
   CustomGatekeeper(options: { props: { managerId: string } }): DurableObjectClass<CustomGatekeeper>;
   InspectableCustomGatekeeper(options: { props: { managerId: string } }): DurableObjectClass<InspectableCustomGatekeeper>;
   CustomAccount(options: { props?: unknown }): FixtureAccount;
@@ -232,8 +297,19 @@ type WorkerExports = {
   CustomVerifier(options: { props?: unknown }): unknown;
 };
 
+type D04AgentReaderSession = {
+  list(input: D04ListInput): Promise<unknown>;
+  search(input: D04SearchInput): Promise<unknown>;
+  read(input: D04ReadInput): Promise<unknown>;
+  [Symbol.dispose](): void;
+};
+
 type AccessLog = {
   readInputs: BronzeCall[];
+  d04ListInputs: unknown[];
+  d04SearchInputs: unknown[];
+  d04ReadInputs: unknown[];
+  d04ReadExpirySnapshots: number[];
   boundInputs: string[];
   createInputs: unknown[];
   outcomeInputs: unknown[];
@@ -249,6 +325,10 @@ const accessLog = (props: FixtureAccessProps): AccessLog => {
   if (existing !== undefined) return existing;
   const created: AccessLog = {
     readInputs: [],
+    d04ListInputs: [],
+    d04SearchInputs: [],
+    d04ReadInputs: [],
+    d04ReadExpirySnapshots: [],
     boundInputs: [],
     createInputs: [],
     outcomeInputs: [],
@@ -321,8 +401,13 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
   async managerIdForTest(): Promise<string> {
     return this.ctx.props.managerId;
   }
-  async assertBoundTo(managerId: string): Promise<void> {
+  async tokenForTest(): Promise<string> {
+    return this.ctx.props.token ?? "";
+  }
+  async assertBoundTo(managerId: string): Promise<"cybernest-knowledge-read-v1"> {
     accessLog(this.ctx.props).boundInputs.push(managerId);
+    if (this.ctx.props.bindDelayMs !== undefined)
+      await new Promise((resolve) => setTimeout(resolve, this.ctx.props.bindDelayMs));
     if (this.ctx.props.assertMode === "rpc_failure") {
       throw new Error("fixture capability RPC failure");
     }
@@ -332,9 +417,16 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
     ) {
       throw new Error("fixture capability is bound to another Manager");
     }
+    return "cybernest-knowledge-read-v1";
   }
 
-  async list(input?: { cursor?: string; limit?: number }): Promise<unknown> {
+  async list(
+    input?: { cursor?: string; limit?: number } | D04ListInput,
+  ): Promise<unknown> {
+    if (this.ctx.props.d04ReaderMode) {
+      accessLog(this.ctx.props).d04ListInputs.push(structuredClone(input));
+      return d04SuccessReceipt(D04_READER_RESULT.list, Date.now() + 3_599_000);
+    }
     const mode = this.ctx.props.listMode ?? "valid";
     if (mode === "rpc_failure") throw new Error("fixture list RPC failure");
     if (mode === "failure") return { _tag: "forbidden" };
@@ -351,6 +443,22 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
     if (nextCursor === "string") page.nextCursor = "next-page";
     if (mode === "extra") page.extra = true;
     return page;
+  }
+
+  async search(input: D04SearchInput): Promise<unknown> {
+    accessLog(this.ctx.props).d04SearchInputs.push(structuredClone(input));
+    return d04SuccessReceipt(D04_READER_RESULT.search, Date.now() + 3_599_000);
+  }
+
+  async read(input: D04ReadInput): Promise<unknown> {
+    const log = accessLog(this.ctx.props);
+    log.d04ReadInputs.push(structuredClone(input));
+    const readIndex = log.d04ReadInputs.length;
+    const expiry = this.ctx.props.receiptSchedule === "renewal_during_observation" && readIndex === 1
+      ? Date.now() + 2_000
+      : Date.now() + 3_599_000;
+    log.d04ReadExpirySnapshots.push(expiry);
+    return d04SuccessReceipt(D04_READER_RESULT.read, expiry);
   }
 
   async readBronze(input: BronzeCall): Promise<unknown> {
@@ -563,27 +671,53 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
     accessLog(this.ctx.props).adoptionOutcomeMode = mode;
   }
 
+  async d04ReaderSnapshot() {
+    const log = accessLog(this.ctx.props);
+    return {
+      listInputs: structuredClone(log.d04ListInputs),
+      searchInputs: structuredClone(log.d04SearchInputs),
+      readInputs: structuredClone(log.d04ReadInputs),
+      readExpirySnapshots: [...log.d04ReadExpirySnapshots],
+    };
+  }
+
 }
 
 class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
   readonly observations: ObservationDescription[] = [];
   #calls = 0;
   #disposals = 0;
+  #observationEntered: Promise<void>;
+  #resolveObservationEntered!: () => void;
   readonly submissions: Array<{ action: number; description: unknown }> = [];
 
   constructor(
     private readonly rejectAt: number | null = null,
     private readonly submitFailure = false,
+    private readonly observationBarrier?: Promise<void>,
   ) {
     super();
+    this.#observationEntered = new Promise((resolve) => {
+      this.#resolveObservationEntered = resolve;
+    });
+  }
+
+  waitForObservation(): Promise<void> {
+    return this.#observationEntered;
   }
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.#calls += 1;
     this.observations.push({ ...description });
+    this.#resolveObservationEntered();
+    if (this.observationBarrier !== undefined) await this.observationBarrier;
     if (this.rejectAt !== null && this.#calls === this.rejectAt) {
       throw new Error("fixture observation denied");
     }
+  }
+
+  async getGitCache(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge fixture.");
   }
 
   async submitAction(action: number, description: unknown): Promise<void> {
@@ -819,7 +953,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     let outcome: unknown | null = null;
     let operationId: string | null = null;
@@ -871,7 +1005,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     let outcome: unknown | null = null;
     let operationId: string | null = null;
@@ -924,7 +1058,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     let outcome: unknown | null = null;
     let bronzeRow: Record<string, unknown> | null = null;
@@ -983,7 +1117,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
   async probeStoredOutcomeUnknown(): Promise<{ observations: number; error: string | null }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     let error: string | null = null;
     try {
       const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
@@ -1013,7 +1147,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
   async probeApplyRejectRace(): Promise<{ createInputs: unknown[]; errors: string[] }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     try {
       await session.proposeKnowledgeCreate({ displayName: "Team Notes" });
@@ -1041,7 +1175,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     try {
       const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
@@ -1079,7 +1213,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
   async probeActionRefFingerprintMismatch(): Promise<{ observations: number; error: string | null }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     let error: string | null = null;
     try {
       const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
@@ -1108,6 +1242,10 @@ class TestObservationAuthorizer extends RpcTarget implements ObservationAuthoriz
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.observations.push({ ...description });
+  }
+
+  async getGitCache(): Promise<never> {
+    throw new Error("Unexpected GitCache access in catalog fixture.");
   }
 }
 
@@ -1236,6 +1374,178 @@ export class TestGatekeeperFactory extends DurableObject {
       readInputs: await access.readInputLog(),
       queueDisposals: target.snapshot().disposals,
     };
+  }
+
+  async runD04ReaderSurface(): Promise<{
+    typesCode: string;
+    catalog: AgentCatalog | null;
+    list: unknown;
+    search: unknown;
+    read: unknown;
+    errors: { list: string | null; search: string | null; read: string | null };
+    observations: ObservationDescription[];
+    readerSnapshot: Awaited<ReturnType<FixtureAccessInspector["d04ReaderSnapshot"]>>;
+  }> {
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
+      token: crypto.randomUUID(),
+      d04ReaderMode: true,
+    });
+    const typesCode = await gatekeeper.getTypeScriptTypes();
+    let catalog: AgentCatalog | null = null;
+    catalog = await gatekeeper.getAgentCatalog();
+
+    const target = new TestApprovalQueue();
+    const queue = new RpcStub<ApprovalQueue>(target);
+    const session = await gatekeeper.startSession(queue);
+    const reader = session as unknown as D04AgentReaderSession;
+    let list: unknown;
+    let search: unknown;
+    let read: unknown;
+    const errors: { list: string | null; search: string | null; read: string | null } = {
+      list: null,
+      search: null,
+      read: null,
+    };
+    try {
+      try {
+        list = await reader.list({ offset: 0, limit: 16 });
+      } catch (cause) {
+        errors.list = messageOf(cause);
+      }
+      try {
+        search = await reader.search({ query: "private", offset: 0, limit: 16 });
+      } catch (cause) {
+        errors.search = messageOf(cause);
+      }
+      try {
+        read = await reader.read({ path: "index.md" });
+      } catch (cause) {
+        errors.read = messageOf(cause);
+      }
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
+    return {
+      typesCode,
+      catalog,
+      list,
+      search,
+      read,
+      errors,
+      observations: target.observations.map((observation) => ({ ...observation })),
+      readerSnapshot: await access.d04ReaderSnapshot(),
+    };
+  }
+
+  async runD04ObservationReject(): Promise<{
+    result: unknown;
+    error: string | null;
+    observationCount: number;
+  }> {
+    const { gatekeeper } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
+      token: crypto.randomUUID(),
+      d04ReaderMode: true,
+    });
+    const target = new TestApprovalQueue(1);
+    const queue = new RpcStub<ApprovalQueue>(target);
+    const session = await gatekeeper.startSession(queue);
+    const reader = session as unknown as D04AgentReaderSession;
+    let result: unknown;
+    let error: string | null = null;
+    try {
+      result = await reader.read({ path: "index.md" });
+    } catch (cause) {
+      error = messageOf(cause);
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
+    return { result, error, observationCount: target.snapshot().calls };
+  }
+
+  async runD04ConcurrentReceiptExpiry(): Promise<{
+    first: { value?: unknown; error?: string };
+    second: unknown;
+    secondError: string | null;
+    firstExpiry: number | null;
+    secondExpiry: number | null;
+    firstObservationReached: boolean;
+  }> {
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
+      token: crypto.randomUUID(),
+      d04ReaderMode: true,
+      receiptSchedule: "renewal_during_observation",
+    });
+    let releaseObservation!: () => void;
+    const observationBarrier = new Promise<void>((resolve) => {
+      releaseObservation = resolve;
+    });
+    const firstTarget = new TestApprovalQueue(null, false, observationBarrier);
+    const firstQueue = new RpcStub<ApprovalQueue>(firstTarget);
+    const firstSession = await gatekeeper.startSession(firstQueue);
+    const firstReader = firstSession as unknown as D04AgentReaderSession;
+    const firstSettled = firstReader.read({ path: "index.md" }).then(
+      (value) => ({ value }),
+      (cause) => ({ error: messageOf(cause) }),
+    );
+    const firstObservationReached = await Promise.race([
+      firstTarget.waitForObservation().then(() => true),
+      firstSettled.then(() => false),
+    ]);
+    if (!firstObservationReached) {
+      releaseObservation();
+      firstSession[Symbol.dispose]();
+      firstQueue[Symbol.dispose]();
+      return {
+        first: await firstSettled,
+        second: null,
+        secondError: null,
+        firstExpiry: null,
+        secondExpiry: null,
+        firstObservationReached,
+      };
+    }
+
+    const afterRenewalTarget = new TestApprovalQueue();
+    const afterRenewalQueue = new RpcStub<ApprovalQueue>(afterRenewalTarget);
+    const afterRenewalSession = await gatekeeper.startSession(afterRenewalQueue);
+    const afterRenewalReader = afterRenewalSession as unknown as D04AgentReaderSession;
+    let second: unknown;
+    try {
+      let secondError: string | null = null;
+      try {
+        second = await afterRenewalReader.read({ path: "index.md" });
+      } catch (cause) {
+        secondError = messageOf(cause);
+      }
+      const receipts = (await access.d04ReaderSnapshot()).readExpirySnapshots;
+      const firstExpiry = receipts[0] ?? null;
+      const secondExpiry = receipts[1] ?? null;
+      if (firstExpiry !== null) {
+        const waitMs = Math.max(0, firstExpiry - Date.now() + 5);
+        if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+      releaseObservation();
+      const first = await firstSettled;
+      return {
+        first,
+        second,
+        secondError,
+        firstExpiry,
+        secondExpiry,
+        firstObservationReached,
+      };
+    } finally {
+      releaseObservation();
+      firstSession[Symbol.dispose]();
+      firstQueue[Symbol.dispose]();
+      afterRenewalSession[Symbol.dispose]();
+      afterRenewalQueue[Symbol.dispose]();
+    }
   }
 
   async runProposal(options: {
@@ -1845,13 +2155,13 @@ export class TestGatekeeperFactory extends DurableObject {
   async runAccount(managerId = MANAGER_ID): Promise<{
     description: AccountDescription;
     binding: "legacy" | "bound";
-    page: Array<Record<string, unknown>>;
+    page: Record<string, unknown>;
     observations: ObservationDescription[];
     boundInputs: string[];
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId, token: crypto.randomUUID() },
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
     });
     const vendor = workerExports.GatekeeperVendor({});
     const account = await vendor.createManagerAccount(managerId, access);
@@ -1866,15 +2176,12 @@ export class TestGatekeeperFactory extends DurableObject {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
     const session = await gatekeeper.startSession(queue);
-    let page: Array<Record<string, unknown>> = [];
+    let page: Record<string, unknown> = {};
     try {
-      const result = await session.list({});
-      page = result.items.map((item) => {
-        const summary: Record<string, unknown> = { ...item };
-        delete summary.access;
-        summary.hasAccess = item.access !== undefined;
-        return summary;
-      });
+      page = await (session as unknown as D04AgentReaderSession).list({
+        offset: 0,
+        limit: 16,
+      }) as Record<string, unknown>;
     } finally {
       session[Symbol.dispose]();
       queue[Symbol.dispose]();
@@ -1886,6 +2193,58 @@ export class TestGatekeeperFactory extends DurableObject {
       page,
       observations: target.observations.map((observation) => ({ ...observation })),
       boundInputs: await inspector.boundInputLog(),
+    };
+  }
+
+  async runConcurrentAccountBinding(): Promise<{
+    bindResults: Array<"fulfilled" | "rejected">;
+    firstStored: string;
+    afterRebind: string;
+    foreignError: string | null;
+    afterForeign: string;
+  }> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const firstToken = "parallel-bind-first";
+    const secondToken = "parallel-bind-second";
+    const first = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: firstToken, bindDelayMs: 15, d04ReaderMode: true },
+    });
+    const second = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: secondToken, bindDelayMs: 15, d04ReaderMode: true },
+    });
+    const store = workerExports.KnowledgeAccountAccess.getByName(managerId);
+    const results = await Promise.allSettled([
+      store.bind(managerId, first),
+      store.bind(managerId, second),
+    ]);
+    const storedToken = async (): Promise<string> => {
+      const capability = await store.getAccess() as {
+        tokenForTest(): Promise<string>;
+      };
+      return capability.tokenForTest();
+    };
+    const firstStored = await storedToken();
+    const laterCapability = firstStored === firstToken ? second : first;
+    await store.bind(managerId, laterCapability);
+    const afterRebind = await storedToken();
+
+    const foreign = workerExports.TestKnowledgeAccess({
+      props: { managerId: crypto.randomUUID(), token: "parallel-bind-foreign", d04ReaderMode: true },
+    });
+    let foreignError: string | null = null;
+    try {
+      await store.bind(managerId, foreign);
+    } catch (cause) {
+      foreignError = messageOf(cause);
+    }
+    const afterForeign = await storedToken();
+    return {
+      bindResults: results.map((result) => result.status),
+      firstStored,
+      afterRebind,
+      foreignError,
+      afterForeign,
     };
   }
 
@@ -1936,17 +2295,9 @@ export class TestGatekeeperFactory extends DurableObject {
     catalog: AgentCatalog;
     observations: ObservationDescription[];
   }> {
+    void limit;
     const { gatekeeper } = await this.#newBinding({ managerId: crypto.randomUUID() });
-    const target = new TestObservationAuthorizer();
-    const authorizer = new RpcStub<ObservationAuthorizer>(target);
-    try {
-      return {
-        catalog: await gatekeeper.getAgentCatalog({ limit }, authorizer),
-        observations: target.observations.map((observation) => ({ ...observation })),
-      };
-    } finally {
-      authorizer[Symbol.dispose]();
-    }
+    return { catalog: await gatekeeper.getAgentCatalog(), observations: [] };
   }
 
   async runObserverRejection(): Promise<string | null> {
@@ -2015,11 +2366,12 @@ export class NativeArticleAccess extends DurableObject<Cloudflare.Env> {
     await this.ctx.storage.deleteAll();
   }
 
-  async assertBoundTo(managerId: string): Promise<void> {
+  async assertBoundTo(managerId: string): Promise<"cybernest-knowledge-read-v1"> {
     const state = await this.#readState();
     if (state.managerId !== managerId) {
       throw new Error("Article fixture is bound to another Manager.");
     }
+    return "cybernest-knowledge-read-v1";
   }
 
   async setArticleSaveMode(mode: NativeArticleSaveMode): Promise<void> {
@@ -2244,7 +2596,8 @@ export class NativeApprovalOwner extends DurableObject<Cloudflare.Env> {
   }
 
   async listActions(managerId: string, workspaceId: string): Promise<unknown[]> {
-    return this.#withOwner(managerId, workspaceId, (owner) => owner.listActions());
+    const page = await this.#withOwner(managerId, workspaceId, (owner) => owner.listActions());
+    return page.entries;
   }
 
   async proposeArticle(
