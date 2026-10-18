@@ -26,6 +26,13 @@ type KnowledgeArticleProposal =
       sourceRelationshipClaim: string;
       expectedCurrentRevision: string;
     };
+type KnowledgeGoldJobControlIntent = {
+  operation: "stop" | "resume";
+  jobId: string;
+  expectedJobState: "disabled" | "clean" | "dirty" | "running" | "candidate" | "published" | "partial" | "retry_wait" | "budget_wait" | "paused_user" | "paused_deterministic" | "paused_unknown" | "needs_reconciliation";
+  expectedJobFence: number;
+  expectedControlRevision: number;
+};
 interface KnowledgeListResult { bundleId: string; versionId: string; items: Array<{ path: string }>; nextOffset?: number; }
 type KnowledgeSilverFacetCoverage = { status: "complete" | "partial"; reasons: string[]; };
 type KnowledgeSilverSearchCoverage = { metadata: KnowledgeSilverFacetCoverage; internalLinks: KnowledgeSilverFacetCoverage; sources: KnowledgeSilverFacetCoverage; };
@@ -73,6 +80,7 @@ interface KnowledgeBase {
   read(input: KnowledgeReadInput): Promise<KnowledgeReadResult>;
   proposeArticle(input: { article: KnowledgeArticleProposal }): Promise<{ status: "pending_approval"; operationId: string }>;
   proposeArticlePolicy(input: { articleId: string; usePolicy: "included" | "excluded"; expectedMetadataRevision: number; }): Promise<{ status: "pending_approval"; operationId: string; }>;
+  proposeGoldJobControl(input: { intent: KnowledgeGoldJobControlIntent; }): Promise<{ status: "pending_approval"; operationId: string; }>;
 }
 `;
 export default D04_TYPES_CODE;

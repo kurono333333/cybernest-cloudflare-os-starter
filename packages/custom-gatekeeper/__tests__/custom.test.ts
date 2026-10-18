@@ -145,6 +145,9 @@ const newSession = (
   new KnowledgeSession(
     queue as unknown as RpcStub<ApprovalQueue>,
     access as unknown as never,
+    async () => { throw new Error("unused article proposal"); },
+    async () => { throw new Error("unused policy proposal"); },
+    async () => { throw new Error("Gold proposal is unavailable in this fixture."); },
   );
 
 const knowledgeBaseMethodNames = (typesCode: string): string[] => {
@@ -155,7 +158,7 @@ const knowledgeBaseMethodNames = (typesCode: string): string[] => {
   return [...typesCode.slice(start, end).matchAll(/^\s{2}([A-Za-z]\w*)\(/gmu)]
     .map((match) => match[1] ?? "");
 };
-const PRIVATE_KNOWLEDGE_TYPE_FIELDS = /\b(?:owner|user|manager)(?:Id)?\b|authority|assertBoundTo|expiresAt|receipt|fence|fullIntentHash|operationBinding|namespace|KnowledgeAccess|KnowledgeBronzeWrite|KnowledgeSourceReader|sourceReader|verifySource|validateCandidate|capability/iu;
+const PRIVATE_KNOWLEDGE_TYPE_FIELDS = /\b(?:owner|user|manager)(?:Id)?\b|authority|assertBoundTo|expiresAt|receipt|\bfence\b|fullIntentHash|operationBinding|namespace|KnowledgeAccess|KnowledgeBronzeWrite|KnowledgeSourceReader|sourceReader|verifySource|validateCandidate|capability/iu;
 
 describe("S15 generated type contract", () => {
   it("publishes read DTOs and owner-reviewed article proposals without authority or receipt fields", () => {
@@ -169,14 +172,17 @@ describe("S15 generated type contract", () => {
       "read",
       "proposeArticle",
       "proposeArticlePolicy",
+      "proposeGoldJobControl",
     ]);
     expect(TYPES_CODE.match(/\b(?:proposal|propose)\w*/gu)).toEqual([
       "proposeArticle",
       "proposeArticlePolicy",
+      "proposeGoldJobControl",
     ]);
     expect(TYPES_CODE).toMatch(
       /proposeArticlePolicy\(input:\s*\{\s*articleId:\s*string;\s*usePolicy:\s*"included"\s*\|\s*"excluded";\s*expectedMetadataRevision:\s*number;\s*\}\):\s*Promise<\{\s*status:\s*"pending_approval";\s*operationId:\s*string;\s*\}>;/u,
     );
+    expect(TYPES_CODE).toMatch(/proposeGoldJobControl\(input:\s*\{\s*intent:\s*KnowledgeGoldJobControlIntent;\s*\}\):\s*Promise<\{\s*status:\s*"pending_approval";\s*operationId:\s*string;\s*\}>;/u);
     expect(TYPES_CODE).not.toMatch(/readBronze|readArticle/u);
     expect(TYPES_CODE).not.toMatch(PRIVATE_KNOWLEDGE_TYPE_FIELDS);
   });
@@ -202,16 +208,19 @@ describe("S14 public surface and descriptions", () => {
     expect(TYPES_CODE).toMatch(/read\(/u);
     expect(TYPES_CODE).toMatch(/proposeArticle\(/u);
     expect(TYPES_CODE).toMatch(/proposeArticlePolicy\(/u);
+    expect(TYPES_CODE).toMatch(/proposeGoldJobControl\(/u);
     expect(knowledgeBaseMethodNames(TYPES_CODE)).toEqual([
       "list",
       "search",
       "read",
       "proposeArticle",
       "proposeArticlePolicy",
+      "proposeGoldJobControl",
     ]);
     expect(TYPES_CODE.match(/\b(?:proposal|propose)\w*/gu)).toEqual([
       "proposeArticle",
       "proposeArticlePolicy",
+      "proposeGoldJobControl",
     ]);
     expect(TYPES_CODE).not.toMatch(/readBronze|readArticle/u);
     expect(TYPES_CODE).not.toMatch(PRIVATE_KNOWLEDGE_TYPE_FIELDS);
@@ -753,6 +762,9 @@ describe("D04 private Knowledge reader integration (test-first)", () => {
     new KnowledgeSession(
       queue as unknown as RpcStub<ApprovalQueue>,
       access,
+      async () => { throw new Error("unused article proposal"); },
+      async () => { throw new Error("unused policy proposal"); },
+      async () => { throw new Error("Gold proposal is unavailable in this fixture."); },
     );
 
   const expectedList = {
@@ -862,14 +874,17 @@ describe("D04 private Knowledge reader integration (test-first)", () => {
       "read",
       "proposeArticle",
       "proposeArticlePolicy",
+      "proposeGoldJobControl",
     ]);
     expect(knowledgeBase.match(/\b(?:proposal|propose)\w*/gu)).toEqual([
       "proposeArticle",
       "proposeArticlePolicy",
+      "proposeGoldJobControl",
     ]);
     expect(knowledgeBase).toMatch(
       /proposeArticlePolicy\(input:\s*\{\s*articleId:\s*string;\s*usePolicy:\s*"included"\s*\|\s*"excluded";\s*expectedMetadataRevision:\s*number;\s*\}\):\s*Promise<\{\s*status:\s*"pending_approval";\s*operationId:\s*string;\s*\}>;/u,
     );
+    expect(knowledgeBase).toMatch(/proposeGoldJobControl\(input:\s*\{\s*intent:\s*KnowledgeGoldJobControlIntent;\s*\}\):\s*Promise<\{\s*status:\s*"pending_approval";\s*operationId:\s*string;\s*\}>;/u);
     expect(knowledgeBase).not.toMatch(/readBronze|readArticle/u);
     expect(knowledgeBase).not.toMatch(PRIVATE_KNOWLEDGE_TYPE_FIELDS);
     expect(result.typesCode).not.toMatch(PRIVATE_KNOWLEDGE_TYPE_FIELDS);
@@ -1083,6 +1098,7 @@ describe("D04 private Knowledge reader integration (test-first)", () => {
     ];
     expect(exposedMethods).toContain("proposeArticle");
     expect(exposedMethods).toContain("proposeArticlePolicy");
+    expect(exposedMethods).toContain("proposeGoldJobControl");
     expect(legacyMethods.filter((method) => exposedMethods.has(method))).toEqual([]);
   });
 

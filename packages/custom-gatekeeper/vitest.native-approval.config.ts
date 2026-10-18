@@ -50,7 +50,10 @@ export default defineConfig({
     }),
   ],
   test: {
-    include: ["__tests__/native-approval.test.ts"],
+    include: [
+      "__tests__/native-approval.test.ts",
+      "__tests__/gl04-safe-control-capacity.native.test.ts",
+    ],
     testTimeout: 60_000,
   },
 });
