@@ -147,13 +147,38 @@ const newSession = (
     access as unknown as never,
   );
 
+const knowledgeBaseMethodNames = (typesCode: string): string[] => {
+  const start = typesCode.indexOf("interface KnowledgeBase {");
+  if (start < 0) return [];
+  const end = typesCode.indexOf("\n}", start);
+  if (end < 0) return [];
+  return [...typesCode.slice(start, end).matchAll(/^\s{2}([A-Za-z]\w*)\(/gmu)]
+    .map((match) => match[1] ?? "");
+};
+const PRIVATE_KNOWLEDGE_TYPE_FIELDS = /\b(?:owner|user|manager)(?:Id)?\b|authority|assertBoundTo|expiresAt|receipt|fence|fullIntentHash|operationBinding|namespace|KnowledgeAccess|KnowledgeBronzeWrite|KnowledgeSourceReader|sourceReader|verifySource|validateCandidate|capability/iu;
+
 describe("S15 generated type contract", () => {
-  it("publishes only list/search/read DTO types, without authority or receipt fields", () => {
+  it("publishes read DTOs and owner-reviewed article proposals without authority or receipt fields", () => {
     expect(TYPES_CODE).toContain("interface KnowledgeBase");
     expect(TYPES_CODE).toContain("list(input: KnowledgeListInput)");
     expect(TYPES_CODE).toContain("search(input: KnowledgeSearchInput)");
     expect(TYPES_CODE).toContain("read(input: KnowledgeReadInput)");
-    expect(TYPES_CODE).not.toMatch(/proposal|propose|readBronze|readArticle|managerId|userId|ownerId|assertBoundTo|expiresAt|receiptId/u);
+    expect(knowledgeBaseMethodNames(TYPES_CODE)).toEqual([
+      "list",
+      "search",
+      "read",
+      "proposeArticle",
+      "proposeArticlePolicy",
+    ]);
+    expect(TYPES_CODE.match(/\b(?:proposal|propose)\w*/gu)).toEqual([
+      "proposeArticle",
+      "proposeArticlePolicy",
+    ]);
+    expect(TYPES_CODE).toMatch(
+      /proposeArticlePolicy\(input:\s*\{\s*articleId:\s*string;\s*usePolicy:\s*"included"\s*\|\s*"excluded";\s*expectedMetadataRevision:\s*number;\s*\}\):\s*Promise<\{\s*status:\s*"pending_approval";\s*operationId:\s*string;\s*\}>;/u,
+    );
+    expect(TYPES_CODE).not.toMatch(/readBronze|readArticle/u);
+    expect(TYPES_CODE).not.toMatch(PRIVATE_KNOWLEDGE_TYPE_FIELDS);
   });
 });
 
@@ -170,12 +195,26 @@ describe("S14 public surface and descriptions", () => {
     });
   });
 
-  it("keeps generated Agent types free of owner, receipt, and write APIs", () => {
+  it("keeps generated Agent types free of owner, receipt, and private capability APIs", () => {
     expect(TYPES_CODE).toContain("interface KnowledgeBase");
     expect(TYPES_CODE).toMatch(/list\(/u);
     expect(TYPES_CODE).toMatch(/search\(/u);
     expect(TYPES_CODE).toMatch(/read\(/u);
-    expect(TYPES_CODE).not.toMatch(/managerId|userId|ownerId|assertBoundTo|expiresAt|receiptId|propose|readBronze|readArticle/u);
+    expect(TYPES_CODE).toMatch(/proposeArticle\(/u);
+    expect(TYPES_CODE).toMatch(/proposeArticlePolicy\(/u);
+    expect(knowledgeBaseMethodNames(TYPES_CODE)).toEqual([
+      "list",
+      "search",
+      "read",
+      "proposeArticle",
+      "proposeArticlePolicy",
+    ]);
+    expect(TYPES_CODE.match(/\b(?:proposal|propose)\w*/gu)).toEqual([
+      "proposeArticle",
+      "proposeArticlePolicy",
+    ]);
+    expect(TYPES_CODE).not.toMatch(/readBronze|readArticle/u);
+    expect(TYPES_CODE).not.toMatch(PRIVATE_KNOWLEDGE_TYPE_FIELDS);
   });
 });
 
@@ -580,7 +619,7 @@ describe("S14 actual Worker/DO/RPC integration", () => {
       observations: ObservationDescription[];
     }>;
     runObserverRejection(): Promise<string | null>;
-    runMalformedSession(): Promise<{ duplicateCount: number; error: string | null }>;
+    runMalformedSession(): Promise<{ error: string | null }>;
   };
 
   const testEnv = env as unknown as { TEST_FACTORY: DurableObjectNamespace<TestFactory> };
@@ -644,7 +683,7 @@ describe("S14 actual Worker/DO/RPC integration", () => {
     expect(one.catalog.entries[0]).toEqual({
       id: "knowledge-base",
       title: "Knowledge Base",
-      description: "Available. Use list, search, and read to inspect Knowledge pages.",
+      description: "Available. Use list, search, and read to inspect Knowledge pages, or proposeArticle to request an owner-reviewed article save.",
     });
     expect(await factory().runObserverRejection()).toMatch(/private/i);
   });
@@ -664,17 +703,19 @@ describe("S14 actual Worker/DO/RPC integration", () => {
     expect(deniedRead.error).toMatch(/observation denied/);
   });
 
-  it("checks malformed DO props before duplicating the approval queue", async () => {
+  it("rejects malformed DO props during construction before the session probe", async () => {
     const result = await factory().runMalformedSession();
-    expect(result.error).toMatch(/only access|props/);
-    expect(result.duplicateCount).toBe(0);
+    expect(result.error).toMatch(/only a valid managerId/u);
   });
 
 });
 
 describe("D04 private Knowledge reader integration (test-first)", () => {
   type TestFactory = {
-    runD04ReaderSurface(): Promise<{
+    runD04ReaderSurface(options?: {
+      articleRead?: boolean;
+      searchMode?: "articles" | "article-links";
+    }): Promise<{
       typesCode: string;
       catalog: { entries: Array<Record<string, unknown>>; truncated?: boolean } | null;
       list: unknown;
@@ -731,22 +772,112 @@ describe("D04 private Knowledge reader integration (test-first)", () => {
     sourceMarkdown: "# Private Knowledge fixture\n",
     metadata: { type: "Concept" },
   };
+  const expectedArticleRead = {
+    kind: "article",
+    articleId: "a",
+    revisionId: "silver-revision-7",
+    bodyHash: "b".repeat(64),
+    path: "articles/YQ.md",
+    sourceMarkdown: "# Private Knowledge article\n",
+    metadata: { type: "Concept" },
+  };
+  const completeCoverage = {
+    metadata: { status: "complete", reasons: [] },
+    internalLinks: { status: "complete", reasons: [] },
+    sources: { status: "complete", reasons: [] },
+  } as const;
+  const expectedArticleItem = {
+    articleId: "a",
+    currentRevisionId: "r",
+    usePolicy: "included",
+    currentPath: "articles/YQ.md",
+    exactRevisionPath: "articles/YQ/revisions/cg.md",
+    bodyHash: "b".repeat(64),
+    state: "indexed",
+    projection: {
+      articleId: "a",
+      inputRevisionId: "r",
+      projectionRuleVersion: "silver-v1",
+      processedVersion: "c".repeat(64),
+      relationVersion: "d".repeat(64),
+      metadata: { type: "Source", title: "Article A" },
+      literalLinks: [],
+      backlinks: [],
+      sources: [],
+      coverage: completeCoverage,
+    },
+    coverage: completeCoverage,
+  } as const;
+  const expectedArticlesSearch = {
+    kind: "articles",
+    items: [expectedArticleItem],
+    nextCursor: "a",
+    coverage: completeCoverage,
+  };
+  const expectedArticleLinksSearch = {
+    kind: "article-links",
+    items: [{ depth: 0, item: expectedArticleItem }],
+    coverage: completeCoverage,
+  };
+  const readAccess = (value: unknown): KnowledgeAccess => ({
+    assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+    async list() { throw new Error("unused"); },
+    async search() { throw new Error("unused"); },
+    async read() {
+      return { ok: true, value: { value, expiresAt: Date.now() + 30_000 } };
+    },
+  });
+  const searchWith = (input: unknown, value: unknown = expectedArticlesSearch) => {
+    const queue = new FakeQueue();
+    const access: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() { throw new Error("unused"); },
+      async search() {
+        return { ok: true, value: { value, expiresAt: Date.now() + 30_000 } };
+      },
+      async read() { throw new Error("unused"); },
+    };
+    const session = localSession(queue, access) as unknown as {
+      search(input: unknown): Promise<unknown>;
+    };
+    return { queue, operation: session.search(input) };
+  };
 
-  it("exposes only list/search/read and strips receipt metadata before returning each DTO", async () => {
+  it("exposes list/search/read plus article proposal and strips internal metadata from DTOs", async () => {
     const result = await factory().runD04ReaderSurface();
     const knowledgeBaseIndex = result.typesCode.indexOf("interface KnowledgeBase {");
     const knowledgeBase = result.typesCode.slice(knowledgeBaseIndex);
     expect(knowledgeBaseIndex).toBeGreaterThanOrEqual(0);
     expect(knowledgeBase).toMatch(/\blist\(/u);
     expect(knowledgeBase).toMatch(/\bsearch\(/u);
+    expect(result.typesCode).toContain(
+      "type KnowledgeSearchInput = KnowledgeComputerSearchInput | KnowledgeArticleSearchInput | KnowledgeArticleLinksSearchInput;",
+    );
+    expect(result.typesCode).toContain('kind: "articles"');
+    expect(result.typesCode).toContain('kind: "article-links"');
     expect(knowledgeBase).toMatch(/\bread\(/u);
-    expect(knowledgeBase).not.toMatch(/propose|readBronze|readArticle|managerId|userId|ownerId|assertBoundTo/u);
-    expect(result.typesCode).not.toMatch(/expiresAt|receiptId|capability|managerId|userId|ownerId/u);
+    expect(knowledgeBaseMethodNames(result.typesCode)).toEqual([
+      "list",
+      "search",
+      "read",
+      "proposeArticle",
+      "proposeArticlePolicy",
+    ]);
+    expect(knowledgeBase.match(/\b(?:proposal|propose)\w*/gu)).toEqual([
+      "proposeArticle",
+      "proposeArticlePolicy",
+    ]);
+    expect(knowledgeBase).toMatch(
+      /proposeArticlePolicy\(input:\s*\{\s*articleId:\s*string;\s*usePolicy:\s*"included"\s*\|\s*"excluded";\s*expectedMetadataRevision:\s*number;\s*\}\):\s*Promise<\{\s*status:\s*"pending_approval";\s*operationId:\s*string;\s*\}>;/u,
+    );
+    expect(knowledgeBase).not.toMatch(/readBronze|readArticle/u);
+    expect(knowledgeBase).not.toMatch(PRIVATE_KNOWLEDGE_TYPE_FIELDS);
+    expect(result.typesCode).not.toMatch(PRIVATE_KNOWLEDGE_TYPE_FIELDS);
     expect(result.catalog?.entries).toEqual([
       {
         id: "knowledge-base",
         title: "Knowledge Base",
-        description: "Available. Use list, search, and read to inspect Knowledge pages.",
+        description: "Available. Use list, search, and read to inspect Knowledge pages, or proposeArticle to request an owner-reviewed article save.",
       },
     ]);
     expect(JSON.stringify(result.catalog)).not.toContain("Private Knowledge fixture");
@@ -778,10 +909,168 @@ describe("D04 private Knowledge reader integration (test-first)", () => {
     expect(result.observationCount).toBe(1);
   });
 
+  it("accepts an exact Article read DTO through the bound owner receipt and observation path", async () => {
+    const result = await factory().runD04ReaderSurface({ articleRead: true });
+
+    expect(result.errors).toEqual({ list: null, search: null, read: null });
+    expect(result.read).toEqual(expectedArticleRead);
+    expect(result.readerSnapshot.readInputs).toEqual([{ path: expectedArticleRead.path }]);
+    expect(result.observations).toHaveLength(3);
+    expect(result.observations.every((item) =>
+      item.containsRestrictedData === true && item.ownerInvitesOnly === true,
+    )).toBe(true);
+  });
+
+  it.each([
+    [
+      "articles",
+      expectedArticlesSearch,
+      { kind: "articles", filters: { type: "Source", tag: "research" }, cursor: "0", limit: 16 },
+    ],
+    [
+      "article-links",
+      expectedArticleLinksSearch,
+      { kind: "article-links", articleId: "a", direction: "links", maxDepth: 4, candidateBudget: 32 },
+    ],
+  ] as const)("accepts the %s search DTO through the bound owner receipt and observation path", async (mode, expected, input) => {
+    const result = await factory().runD04ReaderSurface({ searchMode: mode });
+
+    expect(result.errors).toEqual({ list: null, search: null, read: null });
+    expect(result.search).toEqual(expected);
+    expect(result.readerSnapshot.searchInputs).toEqual([input]);
+    expect(JSON.stringify(result.search)).not.toMatch(/expiresAt|receiptId|managerId|userId|ownerId/u);
+    expect(result.observations).toHaveLength(3);
+    expect(result.observations.every((item) =>
+      item.containsRestrictedData === true && item.ownerInvitesOnly === true,
+    )).toBe(true);
+  });
+
+  it.each([
+    ["unknown articles filter", { kind: "articles", filters: { owner: "private" }, limit: 16 }, "application"],
+    ["empty article cursor", { kind: "articles", cursor: "", limit: 16 }, "application"],
+    ["zero article limit", { kind: "articles", limit: 0 }, "application"],
+    ["oversized article limit", { kind: "articles", limit: 17 }, "application"],
+    ["empty traversal Article ID", { kind: "article-links", articleId: "", direction: "links", maxDepth: 0, candidateBudget: 1 }, "application"],
+    ["invalid traversal direction", { kind: "article-links", articleId: "a", direction: "sources", maxDepth: 0, candidateBudget: 1 }, "rpc"],
+    ["excessive traversal depth", { kind: "article-links", articleId: "a", direction: "links", maxDepth: 5, candidateBudget: 1 }, "application"],
+    ["zero traversal budget", { kind: "article-links", articleId: "a", direction: "links", maxDepth: 0, candidateBudget: 0 }, "application"],
+    ["extra traversal field", { kind: "article-links", articleId: "a", direction: "links", maxDepth: 0, candidateBudget: 1, ownerId: "private" }, "application"],
+  ] as const)("rejects invalid Article search input: %s before the Core call", async (_name, input, rejectionBoundary) => {
+    let calls = 0;
+    const queue = new FakeQueue();
+    const access: KnowledgeAccess = {
+      assertBoundTo() { return "cybernest-knowledge-read-v1" as const; },
+      async list() { throw new Error("unused"); },
+      async search() {
+        calls += 1;
+        return { ok: true, value: { value: expectedArticlesSearch, expiresAt: Date.now() + 30_000 } };
+      },
+      async read() { throw new Error("unused"); },
+    };
+    const session = localSession(queue, access) as unknown as {
+      search(input: unknown): Promise<unknown>;
+    };
+
+    if (rejectionBoundary === "rpc")
+      expect(() => session.search(input)).toThrow(/capnweb-validate:/u);
+    else await expect(session.search(input)).rejects.toThrow(/invalid_input/u);
+    expect(calls).toBe(0);
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it.each([
+    ["top-level extra field", { ...expectedArticlesSearch, private: true }],
+    ["item extra field", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, ownerId: "private" }] }],
+    ["excluded Article item", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, usePolicy: "excluded" }] }],
+    ["malformed body hash", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, bodyHash: "g".repeat(64) }] }],
+    ["noncanonical current path", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, currentPath: "../private.md" }] }],
+    ["current path bound to another Article", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, currentPath: "articles/Yg.md" }] }],
+    ["exact path bound to another revision", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, exactRevisionPath: "articles/YQ/revisions/eg.md" }] }],
+    ["indexed item without projection", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, projection: null }] }],
+    ["stale projection revision", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, projection: { ...expectedArticleItem.projection, inputRevisionId: "older" } }] }],
+    ["projection for another Article", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, projection: { ...expectedArticleItem.projection, articleId: "other" } }] }],
+    ["pending item with projection", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, state: "pending" }] }],
+    ["metadata-unknown item with complete metadata coverage", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, state: "metadata_unknown", coverage: completeCoverage }] }],
+    ["malformed nested link hash", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, projection: { ...expectedArticleItem.projection, literalLinks: [{ rawDestination: "articles/b.md", targetPath: "articles/b.md", fragment: null, resolution: "resolved_exact", targetArticleId: "b", targetRevisionId: "r2", targetBodyHash: "z".repeat(64) }] } }] }],
+    ["extra nested source field", { ...expectedArticlesSearch, items: [{ ...expectedArticleItem, projection: { ...expectedArticleItem.projection, sources: [{ descriptor: { type: "Book" }, resolution: "unresolved", extra: true }] } }] }],
+  ] as const)("rejects malformed Article search response: %s before observation", async (_name, value) => {
+    const { queue, operation } = searchWith(
+      { kind: "articles", limit: 16 },
+      value,
+    );
+
+    await expect(operation).rejects.toThrow(/integrity_failure/u);
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it.each([
+    ["wrong result kind", { ...expectedArticleLinksSearch }, { kind: "articles", limit: 16 }],
+    ["result before the cursor", expectedArticlesSearch, { kind: "articles", cursor: "z", limit: 16 }],
+    ["next cursor does not equal last returned Article", { ...expectedArticlesSearch, nextCursor: "b" }, { kind: "articles", limit: 16 }],
+    ["next cursor does not advance the request cursor", { ...expectedArticlesSearch, nextCursor: "0" }, { kind: "articles", cursor: "0", limit: 16 }],
+    ["UTF-16 ordering differs from UTF-8 byte ordering", {
+      ...expectedArticlesSearch,
+      nextCursor: "\ue000",
+      items: [{
+        ...expectedArticleItem,
+        articleId: "\ue000",
+        currentPath: "articles/7oCA.md",
+        exactRevisionPath: "articles/7oCA/revisions/cg.md",
+        projection: { ...expectedArticleItem.projection, articleId: "\ue000" },
+      }],
+    }, { kind: "articles", cursor: "\u{10000}", limit: 16 }],
+    ["article count above requested limit", { ...expectedArticlesSearch, items: [expectedArticleItem, expectedArticleItem] }, { kind: "articles", limit: 1 }],
+    ["link depth above requested maxDepth", { ...expectedArticleLinksSearch, items: [{ depth: 1, item: expectedArticleItem }] }, { kind: "article-links", articleId: "a", direction: "links", maxDepth: 0, candidateBudget: 1 }],
+    ["link count above requested candidateBudget", { ...expectedArticleLinksSearch, items: [{ depth: 0, item: expectedArticleItem }, { depth: 0, item: expectedArticleItem }] }, { kind: "article-links", articleId: "a", direction: "links", maxDepth: 4, candidateBudget: 1 }],
+  ] as const)("rejects Article search result/request mismatch: %s before observation", async (_name, value, input) => {
+    const { queue, operation } = searchWith(input, value);
+
+    await expect(operation).rejects.toThrow(/integrity_failure/u);
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it.each([
+    ["pending with null projection", {
+      ...expectedArticleItem,
+      state: "pending",
+      projection: null,
+    }],
+    ["metadata-unknown with partial item coverage and visible projection", {
+      ...expectedArticleItem,
+      state: "metadata_unknown",
+      coverage: {
+        ...completeCoverage,
+        metadata: { status: "partial", reasons: ["invalid_frontmatter"] },
+      },
+    }],
+  ] as const)("accepts the Article state/projection pairing: %s", async (_name, item) => {
+    const value = { ...expectedArticlesSearch, items: [item] };
+    const { queue, operation } = searchWith({ kind: "articles", limit: 16 }, value);
+
+    await expect(operation).resolves.toEqual(value);
+    expect(queue.observations).toHaveLength(1);
+  });
+
+  it("rejects a Silver search response over the shared 256 KiB response cap before observation", async () => {
+    const value = {
+      ...expectedArticlesSearch,
+      items: [{
+        ...expectedArticleItem,
+        projection: {
+          ...expectedArticleItem.projection,
+          metadata: { description: "x".repeat(256 * 1024) },
+        },
+      }],
+    };
+    const { queue, operation } = searchWith({ kind: "articles", limit: 16 }, value);
+
+    await expect(operation).rejects.toThrow(/integrity_failure/u);
+    expect(queue.observations).toHaveLength(0);
+  });
+
   it("removes legacy proposal and raw read methods from the runtime Knowledge prototypes", () => {
     const exposedMethods = new Set(Object.getOwnPropertyNames(KnowledgeSession.prototype));
     const legacyMethods = [
-      "proposeArticle",
       "readArticle",
       "readArticleOutcome",
       "proposeKnowledgeCreate",
@@ -792,6 +1081,8 @@ describe("D04 private Knowledge reader integration (test-first)", () => {
       "assertBoundTo",
       "getAccess",
     ];
+    expect(exposedMethods).toContain("proposeArticle");
+    expect(exposedMethods).toContain("proposeArticlePolicy");
     expect(legacyMethods.filter((method) => exposedMethods.has(method))).toEqual([]);
   });
 
@@ -851,6 +1142,22 @@ describe("D04 private Knowledge reader integration (test-first)", () => {
     };
 
     await expect(localSession(queue, access).read({ path: "index.md" })).rejects.toThrow(
+      /integrity_failure/u,
+    );
+    expect(queue.observations).toHaveLength(0);
+  });
+
+  it.each([
+    ["Article extra field", { ...expectedArticleRead, ownerId: "private" }, expectedArticleRead.path],
+    ["empty Article ID", { ...expectedArticleRead, articleId: "" }, expectedArticleRead.path],
+    ["empty revision ID", { ...expectedArticleRead, revisionId: "" }, expectedArticleRead.path],
+    ["malformed Article hash", { ...expectedArticleRead, bodyHash: "g".repeat(64) }, expectedArticleRead.path],
+    ["legacy Computer extra field", { ...expectedRead, articleId: "a" }, expectedRead.path],
+    ["legacy Computer non-UUID version ID", { ...expectedRead, versionId: "silver-revision-7" }, expectedRead.path],
+  ] as const)("rejects a %s read DTO before observation", async (_name, value, path) => {
+    const queue = new FakeQueue();
+
+    await expect(localSession(queue, readAccess(value)).read({ path })).rejects.toThrow(
       /integrity_failure/u,
     );
     expect(queue.observations).toHaveLength(0);

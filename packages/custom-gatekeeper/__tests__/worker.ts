@@ -103,6 +103,7 @@ type FixtureAccessProps = {
   managerId: string;
   token?: string;
   d04ReaderMode?: boolean;
+  d04ArticleRead?: boolean;
   receiptSchedule?: "stable" | "renewal_during_observation";
   createMode?: CreateMode;
   outcomeMode?: OutcomeMode;
@@ -125,7 +126,21 @@ type BronzeCall = {
 };
 
 type D04ListInput = { offset: number; limit: number };
-type D04SearchInput = { query: string; offset: number; limit: number };
+type D04SearchInput =
+  | { query: string; offset: number; limit: number }
+  | {
+      kind: "articles";
+      filters?: { type?: string; title?: string; description?: string; tag?: string };
+      cursor?: string;
+      limit: number;
+    }
+  | {
+      kind: "article-links";
+      articleId: string;
+      direction: "links" | "backlinks";
+      maxDepth: number;
+      candidateBudget: number;
+    };
 type D04ReadInput = { path: string };
 type D04ReaderResult = {
   list: {
@@ -145,6 +160,15 @@ type D04ReaderResult = {
     sourceMarkdown: string;
     metadata: Record<string, unknown>;
   };
+};
+type D04ArticleReadResult = {
+  kind: "article";
+  articleId: string;
+  revisionId: string;
+  bodyHash: string;
+  path: string;
+  sourceMarkdown: string;
+  metadata: Record<string, unknown>;
 };
 const D04_BUNDLE_ID = "a".repeat(64);
 const D04_VERSION_ID = "94444444-4444-4444-8444-444444444444";
@@ -166,6 +190,53 @@ const D04_READER_RESULT: D04ReaderResult = {
     sourceMarkdown: "# Private Knowledge fixture\n",
     metadata: { type: "Concept" },
   },
+};
+const D04_ARTICLE_READ_RESULT: D04ArticleReadResult = {
+  kind: "article",
+  articleId: "a",
+  revisionId: "silver-revision-7",
+  bodyHash: "b".repeat(64),
+  path: "articles/YQ.md",
+  sourceMarkdown: "# Private Knowledge article\n",
+  metadata: { type: "Concept" },
+};
+const D04_SILVER_COVERAGE = {
+  metadata: { status: "complete", reasons: [] },
+  internalLinks: { status: "complete", reasons: [] },
+  sources: { status: "complete", reasons: [] },
+} as const;
+const D04_SILVER_ITEM = {
+  articleId: "a",
+  currentRevisionId: "r",
+  usePolicy: "included",
+  currentPath: "articles/YQ.md",
+  exactRevisionPath: "articles/YQ/revisions/cg.md",
+  bodyHash: "b".repeat(64),
+  state: "indexed",
+  projection: {
+    articleId: "a",
+    inputRevisionId: "r",
+    projectionRuleVersion: "silver-v1",
+    processedVersion: "c".repeat(64),
+    relationVersion: "d".repeat(64),
+    metadata: { type: "Source", title: "Article A" },
+    literalLinks: [],
+    backlinks: [],
+    sources: [],
+    coverage: D04_SILVER_COVERAGE,
+  },
+  coverage: D04_SILVER_COVERAGE,
+} as const;
+const D04_ARTICLES_SEARCH_RESULT = {
+  kind: "articles",
+  items: [D04_SILVER_ITEM],
+  nextCursor: "a",
+  coverage: D04_SILVER_COVERAGE,
+};
+const D04_ARTICLE_LINKS_SEARCH_RESULT = {
+  kind: "article-links",
+  items: [{ depth: 0, item: D04_SILVER_ITEM }],
+  coverage: D04_SILVER_COVERAGE,
 };
 const d04SuccessReceipt = <A>(value: A, expiresAt: number) => ({
   ok: true as const,
@@ -447,7 +518,13 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
 
   async search(input: D04SearchInput): Promise<unknown> {
     accessLog(this.ctx.props).d04SearchInputs.push(structuredClone(input));
-    return d04SuccessReceipt(D04_READER_RESULT.search, Date.now() + 3_599_000);
+    const result =
+      "kind" in input
+        ? input.kind === "articles"
+          ? D04_ARTICLES_SEARCH_RESULT
+          : D04_ARTICLE_LINKS_SEARCH_RESULT
+        : D04_READER_RESULT.search;
+    return d04SuccessReceipt(result, Date.now() + 3_599_000);
   }
 
   async read(input: D04ReadInput): Promise<unknown> {
@@ -458,7 +535,10 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
       ? Date.now() + 2_000
       : Date.now() + 3_599_000;
     log.d04ReadExpirySnapshots.push(expiry);
-    return d04SuccessReceipt(D04_READER_RESULT.read, expiry);
+    return d04SuccessReceipt(
+      this.ctx.props.d04ArticleRead ? D04_ARTICLE_READ_RESULT : D04_READER_RESULT.read,
+      expiry,
+    );
   }
 
   async readBronze(input: BronzeCall): Promise<unknown> {
@@ -1281,7 +1361,7 @@ export class TestGatekeeperFactory extends DurableObject {
     };
   }
 
-  async runMalformedSession(): Promise<{ duplicateCount: number; error: string | null }> {
+  async runMalformedSession(): Promise<{ error: string | null }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
@@ -1294,7 +1374,13 @@ export class TestGatekeeperFactory extends DurableObject {
       class: gatekeeperClass,
       id: facetName,
     })) as unknown as FixtureGatekeeperProbe;
-    return gatekeeper.probeMalformedSession();
+    try {
+      await gatekeeper.probeMalformedSession();
+      return { error: "session probe unexpectedly completed" };
+    } catch (cause) {
+      // Invalid props reject the Durable Object constructor before the session probe can run.
+      return { error: messageOf(cause) };
+    }
   }
 
   async runStoredOutcomeUnknown(): Promise<{ observations: number; error: string | null }> {
@@ -1376,7 +1462,10 @@ export class TestGatekeeperFactory extends DurableObject {
     };
   }
 
-  async runD04ReaderSurface(): Promise<{
+  async runD04ReaderSurface(options: {
+    articleRead?: boolean;
+    searchMode?: "articles" | "article-links";
+  } = {}): Promise<{
     typesCode: string;
     catalog: AgentCatalog | null;
     list: unknown;
@@ -1390,6 +1479,7 @@ export class TestGatekeeperFactory extends DurableObject {
       managerId: crypto.randomUUID(),
       token: crypto.randomUUID(),
       d04ReaderMode: true,
+      d04ArticleRead: options.articleRead === true,
     });
     const typesCode = await gatekeeper.getTypeScriptTypes();
     let catalog: AgentCatalog | null = null;
@@ -1414,12 +1504,18 @@ export class TestGatekeeperFactory extends DurableObject {
         errors.list = messageOf(cause);
       }
       try {
-        search = await reader.search({ query: "private", offset: 0, limit: 16 });
+        const searchInput: D04SearchInput =
+          options.searchMode === "articles"
+          ? { kind: "articles", filters: { type: "Source", tag: "research" }, cursor: "0", limit: 16 }
+            : options.searchMode === "article-links"
+              ? { kind: "article-links", articleId: "a", direction: "links", maxDepth: 4, candidateBudget: 32 }
+              : { query: "private", offset: 0, limit: 16 };
+        search = await reader.search(searchInput);
       } catch (cause) {
         errors.search = messageOf(cause);
       }
       try {
-        read = await reader.read({ path: "index.md" });
+        read = await reader.read({ path: options.articleRead ? D04_ARTICLE_READ_RESULT.path : "index.md" });
       } catch (cause) {
         errors.read = messageOf(cause);
       }

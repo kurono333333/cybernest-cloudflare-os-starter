@@ -91,8 +91,12 @@ export class NativeBronzeCapability extends WorkerEntrypoint<
     if (managerId !== this.ctx.props.managerId)
       throw new Error("Native Bronze test capability is bound to another Manager.");
     return this.ctx.props.role === "writer"
-      ? "cybernest-knowledge-bronze-write-v1"
+      ? "cybernest-knowledge-bronze-write-v2"
       : "cybernest-knowledge-source-read-v1";
+  }
+
+  async validateCandidate(_input: unknown): Promise<unknown> {
+    throw new Error("Native Bronze gate test capability cannot validate candidates.");
   }
 
   async apply(): Promise<unknown> {

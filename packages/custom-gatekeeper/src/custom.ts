@@ -1,9 +1,4 @@
-import {
-  RpcStub,
-  RpcTarget,
-  WorkerEntrypoint,
-  DurableObject,
-} from "cloudflare:workers";
+import { RpcStub, RpcTarget, WorkerEntrypoint, DurableObject } from "cloudflare:workers";
 import { skipRpcValidation, validateRpc, validateStub } from "capnweb-validate";
 import { boundAgentCatalog } from "@gadgets/workshop-shared/gatekeeper";
 import type {
@@ -29,8 +24,7 @@ const CUSTOM_ICON = {
       "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 256 256'><path d='M32 32h192v192H32z'/></svg>",
     ),
 };
-const UUID =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 const KNOWLEDGE_UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/iu;
 const KNOWLEDGE_RECEIPT_TTL = 3_600_000;
 const KNOWLEDGE_BRONZE_ADMISSION_WINDOW_MS = 300_000;
@@ -38,25 +32,48 @@ const KNOWLEDGE_BRONZE_MAX_BODY_BYTES = 64 * 1024;
 const KNOWLEDGE_BRONZE_MAX_ACTION_BYTES = 96 * 1024;
 const KNOWLEDGE_BRONZE_MAX_METADATA_BYTES = 64 * 1024;
 const KNOWLEDGE_BRONZE_MAX_STAGE_METADATA_BYTES = 32 * 1024;
+const KNOWLEDGE_READ_RESPONSE_MAX_BYTES = 256 * 1024;
+const KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_TARGETS = 64;
+const KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_BYTES_PER_TARGET = 4 * 1024;
 export type KnowledgeListInput = { offset: number; limit: number };
-export type KnowledgeSearchInput = { query: string; offset: number; limit: number };
+type KnowledgeComputerSearchInput = { query: string; offset: number; limit: number };
+type KnowledgeArticleSearchInput = {
+  kind: "articles";
+  filters?: { type?: string; title?: string; description?: string; tag?: string };
+  cursor?: string;
+  limit: number;
+};
+type KnowledgeArticleLinksSearchInput = {
+  kind: "article-links";
+  articleId: string;
+  direction: "links" | "backlinks";
+  maxDepth: number;
+  candidateBudget: number;
+};
+export type KnowledgeSearchInput =
+  | KnowledgeComputerSearchInput
+  | KnowledgeArticleSearchInput
+  | KnowledgeArticleLinksSearchInput;
 export type KnowledgeReadInput = { path: string };
 export type KnowledgeReadReceipt<A> = Readonly<{ value: A; expiresAt: number }>;
 export const KNOWLEDGE_READ_CONTRACT = "cybernest-knowledge-read-v1" as const;
 export type KnowledgeAccess = {
   /** Installation-only identity assertion. It is never part of the Agent session. */
-  assertBoundTo(managerId: string): typeof KNOWLEDGE_READ_CONTRACT | Promise<typeof KNOWLEDGE_READ_CONTRACT>;
+  assertBoundTo(
+    managerId: string,
+  ): typeof KNOWLEDGE_READ_CONTRACT | Promise<typeof KNOWLEDGE_READ_CONTRACT>;
   list(input: KnowledgeListInput): Promise<unknown>;
   search(input: KnowledgeSearchInput): Promise<unknown>;
   read(input: KnowledgeReadInput): Promise<unknown>;
 };
 type Access = KnowledgeAccess;
-export const KNOWLEDGE_BRONZE_WRITE_CONTRACT = "cybernest-knowledge-bronze-write-v1" as const;
+export const KNOWLEDGE_BRONZE_WRITE_CONTRACT = "cybernest-knowledge-bronze-write-v2" as const;
 export const KNOWLEDGE_SOURCE_READ_CONTRACT = "cybernest-knowledge-source-read-v1" as const;
 export type KnowledgeBronzeWrite = {
   assertBoundTo(
     managerId: string,
   ): typeof KNOWLEDGE_BRONZE_WRITE_CONTRACT | Promise<typeof KNOWLEDGE_BRONZE_WRITE_CONTRACT>;
+  validateCandidate(input: unknown): Promise<unknown>;
   apply(input: unknown): Promise<unknown>;
   cancel(input: unknown): Promise<unknown>;
 };
@@ -117,10 +134,11 @@ type KnowledgeVerifiedSource =
       title: string;
       resourceTitle: string;
     }>;
-type KnowledgeProvenance = KnowledgeVerifiedSource & Readonly<{
-  observedTargetDescription: string;
-  sourceRelationshipClaim: string;
-}>;
+type KnowledgeProvenance = KnowledgeVerifiedSource &
+  Readonly<{
+    observedTargetDescription: string;
+    sourceRelationshipClaim: string;
+  }>;
 type KnowledgeBronzeNamespace = Readonly<{
   workspaceId: string;
   gatekeeperInstanceId: string;
@@ -135,26 +153,75 @@ type KnowledgeBronzeStageSlot = Readonly<{
   operationDeadlineMs: number;
   retainedBytesReserved: number;
 }>;
-type KnowledgeSessionProposal = (input: unknown) => Promise<Readonly<{
-  status: "pending_approval";
+type KnowledgeSilverPolicyIntent = Readonly<{
+  articleId: string;
+  usePolicy: "included" | "excluded";
+  expectedMetadataRevision: number;
+}>;
+type KnowledgeSilverPolicyCommand = Readonly<{
+  kind: "silver_policy";
+  namespace: KnowledgeBronzeNamespace;
   operationId: string;
-}>>;
+  operationDeadlineMs: number;
+  intent: KnowledgeSilverPolicyIntent;
+}>;
+type KnowledgeSilverPolicyFenceCommand = Readonly<{
+  kind: "silver_policy_fence";
+  namespace: KnowledgeBronzeNamespace;
+  operationId: string;
+  operationDeadlineMs: number;
+  intent: KnowledgeSilverPolicyIntent;
+}>;
+type KnowledgeSilverPolicySavedResult = Readonly<{
+  status: "saved";
+  operationId: string;
+  articleId: string;
+  usePolicy: "included" | "excluded";
+  metadataRevision: number;
+}>;
+type KnowledgeSilverSafeControlReservation = Readonly<{
+  articleId: string;
+  workspaceId: string;
+  gatekeeperInstanceId: string;
+  localActionId: number;
+  operationId: string;
+  operationDeadlineMs: number;
+  retainedBytesReserved: number;
+}>;
+type KnowledgeArticleActionRow = Readonly<{
+  operation_id: string;
+  workspace_id: string | null;
+  operation_deadline_ms: number | null;
+  command_json: string;
+  payload_hash: string;
+  status: string;
+  outcome_json: string | null;
+}>;
+type KnowledgeSessionProposal = (input: unknown) => Promise<
+  Readonly<{
+    status: "pending_approval";
+    operationId: string;
+  }>
+>;
+type KnowledgeSessionPolicyProposal = KnowledgeSessionProposal;
 type InspectableAccess = Omit<Access, "assertBoundTo"> & {
   assertBoundTo(
     managerId: string,
-  ): void | typeof KNOWLEDGE_READ_CONTRACT |
-      Promise<void | typeof KNOWLEDGE_READ_CONTRACT>;
+  ): void | typeof KNOWLEDGE_READ_CONTRACT | Promise<void | typeof KNOWLEDGE_READ_CONTRACT>;
 };
 export type KnowledgeAccountProps = { managerId: string };
-const err = (tag: string) => new Error("Knowledge Base " + tag + ".");
+const err = (tag: string, cause?: unknown) => {
+  const error = new Error("Knowledge Base " + tag + ".");
+  if (cause !== undefined) Object.defineProperty(error, "cause", { value: cause });
+  return error;
+};
 const rec = (v: unknown): v is Record<string, unknown> => {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return false;
   const prototype = Object.getPrototypeOf(v);
   return prototype === Object.prototype || prototype === null;
 };
 const exact = (v: Record<string, unknown>, k: readonly string[]) =>
-  Object.keys(v).length === k.length &&
-  k.every((x) => Object.prototype.hasOwnProperty.call(v, x));
+  Object.keys(v).length === k.length && k.every((x) => Object.prototype.hasOwnProperty.call(v, x));
 const exactOptional = (
   v: Record<string, unknown>,
   required: readonly string[],
@@ -176,7 +243,9 @@ const sha256Hex = async (value: Uint8Array): Promise<string> => {
 const encodeLengthPrefixed = (fields: readonly string[]): Uint8Array => {
   const encoder = new TextEncoder();
   const encodedFields = fields.map((field) => encoder.encode(field));
-  const output = new Uint8Array(encodedFields.reduce((sum, field) => sum + 4 + field.byteLength, 0));
+  const output = new Uint8Array(
+    encodedFields.reduce((sum, field) => sum + 4 + field.byteLength, 0),
+  );
   const view = new DataView(output.buffer);
   let offset = 0;
   for (const field of encodedFields) {
@@ -187,20 +256,87 @@ const encodeLengthPrefixed = (fields: readonly string[]): Uint8Array => {
   }
   return output;
 };
-const parseKnowledgeEnvelope = (value: unknown):
-  | Readonly<{ ok: true; value: unknown }>
-  | Readonly<{ ok: false; code: string }> => {
+const parseKnowledgeEnvelope = (
+  value: unknown,
+): Readonly<{ ok: true; value: unknown }> | Readonly<{ ok: false; code: string }> => {
   if (!rec(value)) throw err("integrity_failure");
-  if (exact(value, ["ok", "value"]) && value.ok === true)
-    return { ok: true, value: value.value };
+  if (exact(value, ["ok", "value"]) && value.ok === true) return { ok: true, value: value.value };
   if (
     exact(value, ["ok", "code"]) &&
     value.ok === false &&
     typeof value.code === "string" &&
     KNOWLEDGE_FAILURE_CODES.includes(value.code as (typeof KNOWLEDGE_FAILURE_CODES)[number])
-  ) return { ok: false, code: value.code };
+  )
+    return { ok: false, code: value.code };
   throw err("integrity_failure");
 };
+type KnowledgeCandidateValidation = Readonly<{ bodyHash: string; profileId: string }>;
+async function validateKnowledgeCandidate(
+  writer: KnowledgeBronzeWrite,
+  body: string,
+): Promise<KnowledgeCandidateValidation> {
+  let raw: unknown;
+  try {
+    raw = await writer.validateCandidate({ body });
+  } catch (cause) {
+    throw err("dependency_unavailable", cause);
+  }
+  let envelope: ReturnType<typeof parseKnowledgeEnvelope>;
+  try {
+    envelope = parseKnowledgeEnvelope(raw);
+  } catch (cause) {
+    throw err("permission_denied", cause);
+  }
+  if (!envelope.ok) {
+    if (
+      ["invalid_input", "input_too_large", "permission_denied", "dependency_unavailable"].includes(
+        envelope.code,
+      )
+    )
+      throw err(envelope.code);
+    throw err("permission_denied");
+  }
+  if (
+    !rec(envelope.value) ||
+    !exact(envelope.value, ["bodyHash", "profileId"]) ||
+    !isHexDigest(envelope.value.bodyHash) ||
+    !isNonEmptyBoundedText(envelope.value.profileId, KNOWLEDGE_BRONZE_MAX_STAGE_METADATA_BYTES)
+  )
+    throw err("permission_denied");
+  const bodyHash = await sha256Hex(new TextEncoder().encode(body));
+  if (envelope.value.bodyHash !== bodyHash) throw err("permission_denied");
+  return { bodyHash, profileId: envelope.value.profileId };
+}
+async function assertLegacyBronzeAdmissionExists(
+  writer: KnowledgeBronzeWrite,
+  namespace: KnowledgeBronzeNamespace,
+): Promise<void> {
+  let raw: unknown;
+  try {
+    raw = await writer.cancel({ kind: "lookup", namespace });
+  } catch (cause) {
+    throw err("dependency_unavailable", cause);
+  }
+  let envelope: ReturnType<typeof parseKnowledgeEnvelope>;
+  try {
+    envelope = parseKnowledgeEnvelope(raw);
+  } catch (cause) {
+    throw err("permission_denied", cause);
+  }
+  if (!envelope.ok) {
+    if (envelope.code === "result_unknown" || envelope.code === "conflict") return;
+    throw err(envelope.code);
+  }
+  if (rec(envelope.value) && exact(envelope.value, ["status"]) && envelope.value.status === "clear")
+    throw err("conflict");
+  if (
+    rec(envelope.value) &&
+    exact(envelope.value, ["status", "operationId"]) &&
+    envelope.value.status === "fenced"
+  )
+    throw err("conflict");
+  throw err("permission_denied");
+}
 type KnowledgeBronzeSavedReceipt = Readonly<{
   status: "saved";
   operationId: string;
@@ -214,10 +350,13 @@ function parseBronzeSavedReceipt(value: unknown, operationId: string): Knowledge
     !exact(value, ["status", "operationId", "articleId", "revisionId", "bodyHash"]) ||
     value.status !== "saved" ||
     value.operationId !== operationId ||
-    typeof value.articleId !== "string" || !KNOWLEDGE_UUID.test(value.articleId) ||
-    typeof value.revisionId !== "string" || !KNOWLEDGE_UUID.test(value.revisionId) ||
+    typeof value.articleId !== "string" ||
+    !KNOWLEDGE_UUID.test(value.articleId) ||
+    typeof value.revisionId !== "string" ||
+    !KNOWLEDGE_UUID.test(value.revisionId) ||
     !isHexDigest(value.bodyHash)
-  ) throw err("integrity_failure");
+  )
+    throw err("integrity_failure");
   return {
     status: "saved",
     operationId,
@@ -226,7 +365,10 @@ function parseBronzeSavedReceipt(value: unknown, operationId: string): Knowledge
     bodyHash: value.bodyHash,
   };
 }
-function parseStoredBronzeSavedReceipt(serialized: string | null, operationId: string): KnowledgeBronzeSavedReceipt {
+function parseStoredBronzeSavedReceipt(
+  serialized: string | null,
+  operationId: string,
+): KnowledgeBronzeSavedReceipt {
   if (serialized === null) throw err("corrupt_state");
   let value: unknown;
   try {
@@ -236,9 +378,136 @@ function parseStoredBronzeSavedReceipt(serialized: string | null, operationId: s
   }
   return parseBronzeSavedReceipt(value, operationId);
 }
-function decodeKnowledgeArticleProposal(value: unknown): KnowledgeArticleProposal {
-  if (!rec(value) || !exact(value, ["article"]) || !rec(value.article))
+function decodeKnowledgeSilverPolicyProposal(value: unknown): KnowledgeSilverPolicyIntent {
+  if (
+    !rec(value) ||
+    !exact(value, ["articleId", "usePolicy", "expectedMetadataRevision"]) ||
+    !isNonEmptyBoundedText(value.articleId, KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_BYTES_PER_TARGET) ||
+    (value.usePolicy !== "included" && value.usePolicy !== "excluded") ||
+    !boundedInt(value.expectedMetadataRevision, 0, Number.MAX_SAFE_INTEGER)
+  )
     throw err("invalid_input");
+  return {
+    articleId: value.articleId,
+    usePolicy: value.usePolicy,
+    expectedMetadataRevision: value.expectedMetadataRevision,
+  };
+}
+function decodeStoredSilverPolicyStage(
+  serialized: string,
+  actionId: number,
+  gatekeeperInstanceId: string,
+): KnowledgeSilverPolicyCommand {
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch {
+    throw err("corrupt_state");
+  }
+  if (
+    !rec(value) ||
+    !exact(value, ["kind", "namespace", "operationId", "operationDeadlineMs", "intent"]) ||
+    value.kind !== "silver_policy" ||
+    !rec(value.namespace) ||
+    !exact(value.namespace, ["workspaceId", "gatekeeperInstanceId", "localActionId"]) ||
+    !isNonEmptyBoundedText(value.namespace.workspaceId, 512) ||
+    value.namespace.gatekeeperInstanceId !== gatekeeperInstanceId ||
+    !boundedInt(value.namespace.localActionId, 0, Number.MAX_SAFE_INTEGER) ||
+    value.namespace.localActionId !== actionId ||
+    typeof value.operationId !== "string" ||
+    !UUID.test(value.operationId) ||
+    !boundedInt(value.operationDeadlineMs, 0, Number.MAX_SAFE_INTEGER) ||
+    !rec(value.intent)
+  )
+    throw err("corrupt_state");
+  let intent: KnowledgeSilverPolicyIntent;
+  try {
+    intent = decodeKnowledgeSilverPolicyProposal(value.intent);
+  } catch {
+    throw err("corrupt_state");
+  }
+  return {
+    kind: "silver_policy",
+    namespace: {
+      workspaceId: value.namespace.workspaceId,
+      gatekeeperInstanceId,
+      localActionId: actionId,
+    },
+    operationId: value.operationId,
+    operationDeadlineMs: value.operationDeadlineMs,
+    intent,
+  };
+}
+async function computeSilverPolicyPayloadHash(
+  command: KnowledgeSilverPolicyCommand,
+): Promise<string> {
+  return sha256Hex(
+    encodeLengthPrefixed([
+      "knowledge-silver-policy-native-v1",
+      command.operationId,
+      command.namespace.workspaceId,
+      command.namespace.gatekeeperInstanceId,
+      String(command.namespace.localActionId),
+      command.intent.articleId,
+      command.intent.usePolicy,
+      String(command.intent.expectedMetadataRevision),
+    ]),
+  );
+}
+function parseSilverPolicySavedResult(
+  value: unknown,
+  command: KnowledgeSilverPolicyCommand,
+): KnowledgeSilverPolicySavedResult {
+  if (
+    !rec(value) ||
+    !exact(value, ["status", "operationId", "articleId", "usePolicy", "metadataRevision"]) ||
+    value.status !== "saved" ||
+    value.operationId !== command.operationId ||
+    value.articleId !== command.intent.articleId ||
+    value.usePolicy !== command.intent.usePolicy ||
+    !boundedInt(value.metadataRevision, 1, Number.MAX_SAFE_INTEGER) ||
+    value.metadataRevision !== command.intent.expectedMetadataRevision + 1
+  )
+    throw err("integrity_failure");
+  return {
+    status: "saved",
+    operationId: command.operationId,
+    articleId: command.intent.articleId,
+    usePolicy: command.intent.usePolicy,
+    metadataRevision: value.metadataRevision,
+  };
+}
+function parseStoredSilverPolicySavedResult(
+  serialized: string | null,
+  operationId: string,
+): KnowledgeSilverPolicySavedResult {
+  if (serialized === null) throw err("corrupt_state");
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch {
+    throw err("corrupt_state");
+  }
+  if (
+    !rec(value) ||
+    !exact(value, ["status", "operationId", "articleId", "usePolicy", "metadataRevision"]) ||
+    value.status !== "saved" ||
+    value.operationId !== operationId ||
+    !isNonEmptyBoundedText(value.articleId, KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_BYTES_PER_TARGET) ||
+    (value.usePolicy !== "included" && value.usePolicy !== "excluded") ||
+    !boundedInt(value.metadataRevision, 1, Number.MAX_SAFE_INTEGER)
+  )
+    throw err("corrupt_state");
+  return {
+    status: "saved",
+    operationId,
+    articleId: value.articleId,
+    usePolicy: value.usePolicy,
+    metadataRevision: value.metadataRevision,
+  };
+}
+function decodeKnowledgeArticleProposal(value: unknown): KnowledgeArticleProposal {
+  if (!rec(value) || !exact(value, ["article"]) || !rec(value.article)) throw err("invalid_input");
   const article = value.article;
   if (
     article.kind === "adopt" &&
@@ -279,7 +548,8 @@ function decodeKnowledgeArticleProposal(value: unknown): KnowledgeArticleProposa
       "sourceRelationshipClaim",
       "expectedCurrentRevision",
     ]) &&
-    typeof article.articleId === "string" && KNOWLEDGE_UUID.test(article.articleId) &&
+    typeof article.articleId === "string" &&
+    KNOWLEDGE_UUID.test(article.articleId) &&
     typeof article.expectedCurrentRevision === "string" &&
     KNOWLEDGE_UUID.test(article.expectedCurrentRevision) &&
     isNonEmptyBoundedText(article.body, KNOWLEDGE_BRONZE_MAX_BODY_BYTES) &&
@@ -306,11 +576,14 @@ function isKnowledgeSourceSelector(value: unknown): value is KnowledgeSourceSele
     exact(value, ["kind", "chatId", "sequence"]) &&
     boundedInt(value.chatId, 0, Number.MAX_SAFE_INTEGER) &&
     boundedInt(value.sequence, 0, Number.MAX_SAFE_INTEGER)
-  ) return true;
-  return value.kind === "os_observation" &&
+  )
+    return true;
+  return (
+    value.kind === "os_observation" &&
     exact(value, ["kind", "actionId", "gatekeeperId"]) &&
     boundedInt(value.actionId, 0, Number.MAX_SAFE_INTEGER) &&
-    boundedInt(value.gatekeeperId, 0, Number.MAX_SAFE_INTEGER);
+    boundedInt(value.gatekeeperId, 0, Number.MAX_SAFE_INTEGER)
+  );
 }
 function decodeVerifiedSource(
   value: unknown,
@@ -326,7 +599,9 @@ function decodeVerifiedSource(
     boundedInt(value.timestampMs, 0, Number.MAX_SAFE_INTEGER) &&
     rec(value.author) &&
     exact(value.author, ["type", "id"]) &&
-    (value.author.type === "user" || value.author.type === "agent" || value.author.type === "gadget") &&
+    (value.author.type === "user" ||
+      value.author.type === "agent" ||
+      value.author.type === "gadget") &&
     isNonEmptyBoundedText(value.author.id, KNOWLEDGE_BRONZE_MAX_METADATA_BYTES)
   ) {
     return {
@@ -341,7 +616,15 @@ function decodeVerifiedSource(
   if (
     selector.kind === "os_observation" &&
     value.kind === "os_observation" &&
-    exact(value, ["version", "kind", "actionId", "gatekeeperId", "createdAtMs", "title", "resourceTitle"]) &&
+    exact(value, [
+      "version",
+      "kind",
+      "actionId",
+      "gatekeeperId",
+      "createdAtMs",
+      "title",
+      "resourceTitle",
+    ]) &&
     value.actionId === selector.actionId &&
     value.gatekeeperId === selector.gatekeeperId &&
     boundedInt(value.createdAtMs, 0, Number.MAX_SAFE_INTEGER) &&
@@ -360,10 +643,9 @@ function decodeVerifiedSource(
   }
   throw err("integrity_failure");
 }
-function articleClaims(article: KnowledgeArticleProposal): Pick<
-  KnowledgeProvenance,
-  "observedTargetDescription" | "sourceRelationshipClaim"
-> {
+function articleClaims(
+  article: KnowledgeArticleProposal,
+): Pick<KnowledgeProvenance, "observedTargetDescription" | "sourceRelationshipClaim"> {
   return {
     observedTargetDescription: article.observedTargetDescription,
     sourceRelationshipClaim: article.sourceRelationshipClaim,
@@ -394,18 +676,23 @@ function canonicalKnowledgeProvenance(value: KnowledgeProvenance): string {
     sourceRelationshipClaim: value.sourceRelationshipClaim,
   });
 }
-async function computeKnowledgeBronzeIntentHash(input: Readonly<{
-  intent: KnowledgeProposedIntent;
-  operationId: string;
-  managerId: string;
-  namespace: KnowledgeBronzeNamespace;
-  bodyBytes: Uint8Array;
-}>): Promise<string> {
+async function computeKnowledgeBronzeIntentHash(
+  input: Readonly<{
+    intent: KnowledgeProposedIntent;
+    operationId: string;
+    managerId: string;
+    namespace: KnowledgeBronzeNamespace;
+    bodyBytes: Uint8Array;
+    profileId?: string;
+  }>,
+): Promise<string> {
   const bodyHash = await sha256Hex(input.bodyBytes);
-  const provenanceBytes = new TextEncoder().encode(canonicalKnowledgeProvenance(input.intent.provenance));
+  const provenanceBytes = new TextEncoder().encode(
+    canonicalKnowledgeProvenance(input.intent.provenance),
+  );
   const provenanceHash = await sha256Hex(provenanceBytes);
   const fields = [
-    "knowledge-bronze-intent-v1",
+    input.profileId === undefined ? "knowledge-bronze-intent-v1" : "knowledge-bronze-intent-v2",
     input.intent.kind,
     input.operationId,
     input.intent.articleId,
@@ -421,6 +708,7 @@ async function computeKnowledgeBronzeIntentHash(input: Readonly<{
     input.namespace.gatekeeperInstanceId,
     String(input.namespace.localActionId),
   ];
+  if (input.profileId !== undefined) fields.push(input.profileId);
   return sha256Hex(encodeLengthPrefixed(fields));
 }
 type KnowledgeProposedIntent =
@@ -441,7 +729,7 @@ type KnowledgeProposedIntent =
       body: string;
       provenance: KnowledgeProvenance;
     }>;
-type KnowledgeStagedCommand = Readonly<{
+type KnowledgeStagedCommandBase = Readonly<{
   kind: "staged";
   namespace: KnowledgeBronzeNamespace;
   operationId: string;
@@ -450,6 +738,29 @@ type KnowledgeStagedCommand = Readonly<{
   fullIntentHash: string;
   intent: KnowledgeProposedIntent;
 }>;
+type KnowledgeStagedCommand = KnowledgeStagedCommandBase &
+  (
+    | Readonly<{ profileId?: never; bodyHash?: never }>
+    | Readonly<{ profileId: string; bodyHash: string }>
+  );
+const isV2KnowledgeStagedCommand = (
+  command: KnowledgeStagedCommand,
+): command is KnowledgeStagedCommandBase & Readonly<{ profileId: string; bodyHash: string }> =>
+  typeof command.profileId === "string" && typeof command.bodyHash === "string";
+function knowledgeStagedFenceCommand(command: KnowledgeStagedCommand) {
+  const base = {
+    kind: "staged_fence" as const,
+    namespace: command.namespace,
+    operationId: command.operationId,
+    attemptFencingToken: command.attemptFencingToken,
+    operationDeadlineMs: command.operationDeadlineMs,
+    fullIntentHash: command.fullIntentHash,
+    intent: command.intent,
+  };
+  return isV2KnowledgeStagedCommand(command)
+    ? { ...base, profileId: command.profileId, bodyHash: command.bodyHash }
+    : base;
+}
 async function decodeStoredBronzeStage(
   serialized: string,
   actionId: number,
@@ -462,12 +773,29 @@ async function decodeStoredBronzeStage(
   } catch {
     throw err("corrupt_state");
   }
+  const v1Fields = [
+    "kind",
+    "namespace",
+    "operationId",
+    "attemptFencingToken",
+    "operationDeadlineMs",
+    "fullIntentHash",
+    "intent",
+  ];
+  const v2Fields = [
+    "kind",
+    "namespace",
+    "operationId",
+    "attemptFencingToken",
+    "operationDeadlineMs",
+    "fullIntentHash",
+    "profileId",
+    "bodyHash",
+    "intent",
+  ];
   if (
     !rec(value) ||
-    !exact(value, [
-      "kind", "namespace", "operationId", "attemptFencingToken",
-      "operationDeadlineMs", "fullIntentHash", "intent",
-    ]) ||
+    (!exact(value, v1Fields) && !exact(value, v2Fields)) ||
     value.kind !== "staged" ||
     !rec(value.namespace) ||
     !exact(value.namespace, ["workspaceId", "gatekeeperInstanceId", "localActionId"]) ||
@@ -475,12 +803,14 @@ async function decodeStoredBronzeStage(
     value.namespace.gatekeeperInstanceId !== gatekeeperInstanceId ||
     !boundedInt(value.namespace.localActionId, 0, Number.MAX_SAFE_INTEGER) ||
     value.namespace.localActionId !== actionId ||
-    typeof value.operationId !== "string" || !UUID.test(value.operationId) ||
+    typeof value.operationId !== "string" ||
+    !UUID.test(value.operationId) ||
     !boundedInt(value.attemptFencingToken, 1, Number.MAX_SAFE_INTEGER) ||
     !boundedInt(value.operationDeadlineMs, 0, Number.MAX_SAFE_INTEGER) ||
     !isHexDigest(value.fullIntentHash) ||
     !rec(value.intent)
-  ) throw err("corrupt_state");
+  )
+    throw err("corrupt_state");
 
   const rawIntent = value.intent;
   const rawProvenance = rawIntent.provenance;
@@ -493,10 +823,19 @@ async function decodeStoredBronzeStage(
       chatId: rawProvenance.chatId as number,
       sequence: rawProvenance.sequence as number,
     };
-    if (!exact(rawProvenance, [
-      "version", "kind", "chatId", "sequence", "timestampMs", "author",
-      "observedTargetDescription", "sourceRelationshipClaim",
-    ])) throw err("corrupt_state");
+    if (
+      !exact(rawProvenance, [
+        "version",
+        "kind",
+        "chatId",
+        "sequence",
+        "timestampMs",
+        "author",
+        "observedTargetDescription",
+        "sourceRelationshipClaim",
+      ])
+    )
+      throw err("corrupt_state");
     verifiedRaw = {
       version: rawProvenance.version,
       kind: rawProvenance.kind,
@@ -511,10 +850,20 @@ async function decodeStoredBronzeStage(
       actionId: rawProvenance.actionId as number,
       gatekeeperId: rawProvenance.gatekeeperId as number,
     };
-    if (!exact(rawProvenance, [
-      "version", "kind", "actionId", "gatekeeperId", "createdAtMs", "title",
-      "resourceTitle", "observedTargetDescription", "sourceRelationshipClaim",
-    ])) throw err("corrupt_state");
+    if (
+      !exact(rawProvenance, [
+        "version",
+        "kind",
+        "actionId",
+        "gatekeeperId",
+        "createdAtMs",
+        "title",
+        "resourceTitle",
+        "observedTargetDescription",
+        "sourceRelationshipClaim",
+      ])
+    )
+      throw err("corrupt_state");
     verifiedRaw = {
       version: rawProvenance.version,
       kind: rawProvenance.kind,
@@ -530,9 +879,16 @@ async function decodeStoredBronzeStage(
   if (!isKnowledgeSourceSelector(selector)) throw err("corrupt_state");
   const verified = decodeVerifiedSource(verifiedRaw, selector);
   if (
-    !isNonEmptyBoundedText(rawProvenance.observedTargetDescription, KNOWLEDGE_BRONZE_MAX_METADATA_BYTES) ||
-    !isNonEmptyBoundedText(rawProvenance.sourceRelationshipClaim, KNOWLEDGE_BRONZE_MAX_METADATA_BYTES)
-  ) throw err("corrupt_state");
+    !isNonEmptyBoundedText(
+      rawProvenance.observedTargetDescription,
+      KNOWLEDGE_BRONZE_MAX_METADATA_BYTES,
+    ) ||
+    !isNonEmptyBoundedText(
+      rawProvenance.sourceRelationshipClaim,
+      KNOWLEDGE_BRONZE_MAX_METADATA_BYTES,
+    )
+  )
+    throw err("corrupt_state");
   const provenance: KnowledgeProvenance = {
     ...verified,
     observedTargetDescription: rawProvenance.observedTargetDescription,
@@ -542,11 +898,18 @@ async function decodeStoredBronzeStage(
   if (
     rawIntent.kind === "adopt" &&
     exact(rawIntent, [
-      "kind", "articleId", "revisionId", "expectedCurrentRevision", "body",
-      "initialUsePolicy", "provenance",
+      "kind",
+      "articleId",
+      "revisionId",
+      "expectedCurrentRevision",
+      "body",
+      "initialUsePolicy",
+      "provenance",
     ]) &&
-    typeof rawIntent.articleId === "string" && KNOWLEDGE_UUID.test(rawIntent.articleId) &&
-    typeof rawIntent.revisionId === "string" && KNOWLEDGE_UUID.test(rawIntent.revisionId) &&
+    typeof rawIntent.articleId === "string" &&
+    KNOWLEDGE_UUID.test(rawIntent.articleId) &&
+    typeof rawIntent.revisionId === "string" &&
+    KNOWLEDGE_UUID.test(rawIntent.revisionId) &&
     rawIntent.expectedCurrentRevision === null &&
     (rawIntent.initialUsePolicy === "included" || rawIntent.initialUsePolicy === "excluded") &&
     isNonEmptyBoundedText(rawIntent.body, KNOWLEDGE_BRONZE_MAX_BODY_BYTES)
@@ -563,10 +926,17 @@ async function decodeStoredBronzeStage(
   } else if (
     rawIntent.kind === "revise" &&
     exact(rawIntent, [
-      "kind", "articleId", "revisionId", "expectedCurrentRevision", "body", "provenance",
+      "kind",
+      "articleId",
+      "revisionId",
+      "expectedCurrentRevision",
+      "body",
+      "provenance",
     ]) &&
-    typeof rawIntent.articleId === "string" && KNOWLEDGE_UUID.test(rawIntent.articleId) &&
-    typeof rawIntent.revisionId === "string" && KNOWLEDGE_UUID.test(rawIntent.revisionId) &&
+    typeof rawIntent.articleId === "string" &&
+    KNOWLEDGE_UUID.test(rawIntent.articleId) &&
+    typeof rawIntent.revisionId === "string" &&
+    KNOWLEDGE_UUID.test(rawIntent.revisionId) &&
     typeof rawIntent.expectedCurrentRevision === "string" &&
     KNOWLEDGE_UUID.test(rawIntent.expectedCurrentRevision) &&
     isNonEmptyBoundedText(rawIntent.body, KNOWLEDGE_BRONZE_MAX_BODY_BYTES)
@@ -587,7 +957,7 @@ async function decodeStoredBronzeStage(
     gatekeeperInstanceId,
     localActionId: actionId,
   };
-  const command: KnowledgeStagedCommand = {
+  const commandBase: KnowledgeStagedCommandBase = {
     kind: "staged",
     namespace,
     operationId: value.operationId,
@@ -596,12 +966,37 @@ async function decodeStoredBronzeStage(
     fullIntentHash: value.fullIntentHash,
     intent,
   };
+  const bodyBytes = new TextEncoder().encode(intent.body);
+  if (Object.prototype.hasOwnProperty.call(value, "profileId")) {
+    if (
+      !isNonEmptyBoundedText(value.profileId, KNOWLEDGE_BRONZE_MAX_STAGE_METADATA_BYTES) ||
+      !isHexDigest(value.bodyHash) ||
+      value.bodyHash !== (await sha256Hex(bodyBytes))
+    )
+      throw err("corrupt_state");
+    const command: KnowledgeStagedCommand = {
+      ...commandBase,
+      profileId: value.profileId,
+      bodyHash: value.bodyHash,
+    };
+    const actualHash = await computeKnowledgeBronzeIntentHash({
+      intent,
+      operationId: command.operationId,
+      managerId,
+      namespace,
+      bodyBytes,
+      profileId: command.profileId,
+    });
+    if (actualHash !== command.fullIntentHash) throw err("corrupt_state");
+    return command;
+  }
+  const command: KnowledgeStagedCommand = commandBase;
   const actualHash = await computeKnowledgeBronzeIntentHash({
     intent,
     operationId: command.operationId,
     managerId,
     namespace,
-    bodyBytes: new TextEncoder().encode(intent.body),
+    bodyBytes,
   });
   if (actualHash !== command.fullIntentHash) throw err("corrupt_state");
   return command;
@@ -617,8 +1012,7 @@ const hasLoneSurrogate = (value: string): boolean => {
   }
   return false;
 };
-const isHexDigest = (v: unknown): v is string =>
-  typeof v === "string" && /^[0-9a-f]{64}$/u.test(v);
+const isHexDigest = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{64}$/u.test(v);
 const isCanonicalMarkdownPath = (v: unknown): v is string =>
   typeof v === "string" &&
   !hasLoneSurrogate(v) &&
@@ -645,12 +1039,10 @@ const validListResult = (v: unknown): v is KnowledgeListResult =>
   Array.isArray(v.items) &&
   v.items.length <= 16 &&
   v.items.every(
-    (item) =>
-      rec(item) && exact(item, ["path"]) && isCanonicalMarkdownPath(item.path),
+    (item) => rec(item) && exact(item, ["path"]) && isCanonicalMarkdownPath(item.path),
   ) &&
-  (!Object.prototype.hasOwnProperty.call(v, "nextOffset") ||
-    boundedInt(v.nextOffset, 0, 64));
-const validSearchResult = (v: unknown): v is KnowledgeSearchResult =>
+  (!Object.prototype.hasOwnProperty.call(v, "nextOffset") || boundedInt(v.nextOffset, 0, 64));
+const validComputerSearchResult = (v: unknown): v is KnowledgeComputerSearchResult =>
   rec(v) &&
   exactOptional(v, ["bundleId", "versionId", "hits"], ["nextOffset"]) &&
   isHexDigest(v.bundleId) &&
@@ -668,18 +1060,336 @@ const validSearchResult = (v: unknown): v is KnowledgeSearchResult =>
   ) &&
   (!Object.prototype.hasOwnProperty.call(v, "nextOffset") ||
     boundedInt(v.nextOffset, 0, 1_048_576));
-const validReadResult = (v: unknown): v is KnowledgeReadResult =>
+const denseArray = (v: unknown): v is unknown[] =>
+  Array.isArray(v) && Object.keys(v).length === v.length;
+const validSilverFacetCoverage = (v: unknown): v is KnowledgeSilverFacetCoverage =>
   rec(v) &&
-  exact(v, ["bundleId", "versionId", "path", "sourceMarkdown", "metadata"]) &&
-  isHexDigest(v.bundleId) &&
-  knowledgeUuid(v.versionId) &&
-  isCanonicalMarkdownPath(v.path) &&
-  typeof v.sourceMarkdown === "string" &&
-  rec(v.metadata) &&
-  isJsonValue(v.metadata);
+  exact(v, ["status", "reasons"]) &&
+  (v.status === "complete" || v.status === "partial") &&
+  denseArray(v.reasons) &&
+  v.reasons.every((reason) => typeof reason === "string");
+const validSilverSearchCoverage = (v: unknown): v is KnowledgeSilverSearchCoverage =>
+  rec(v) &&
+  exact(v, ["metadata", "internalLinks", "sources"]) &&
+  validSilverFacetCoverage(v.metadata) &&
+  validSilverFacetCoverage(v.internalLinks) &&
+  validSilverFacetCoverage(v.sources);
+const validSilverProjectionLink = (v: unknown): v is KnowledgeSilverProjectionLink => {
+  if (
+    !rec(v) ||
+    typeof v.rawDestination !== "string" ||
+    typeof v.targetPath !== "string" ||
+    (v.fragment !== null && typeof v.fragment !== "string")
+  )
+    return false;
+  if (v.resolution === "resolved_current")
+    return (
+      exact(v, ["rawDestination", "targetPath", "fragment", "resolution", "targetArticleId"]) &&
+      typeof v.targetArticleId === "string" &&
+      v.targetArticleId.length > 0
+    );
+  if (v.resolution === "resolved_exact")
+    return (
+      exact(v, [
+        "rawDestination",
+        "targetPath",
+        "fragment",
+        "resolution",
+        "targetArticleId",
+        "targetRevisionId",
+        "targetBodyHash",
+      ]) &&
+      typeof v.targetArticleId === "string" &&
+      v.targetArticleId.length > 0 &&
+      typeof v.targetRevisionId === "string" &&
+      v.targetRevisionId.length > 0 &&
+      isHexDigest(v.targetBodyHash)
+    );
+  return (
+    (v.resolution === "unresolved" || v.resolution === "external_or_scope") &&
+    exact(v, ["rawDestination", "targetPath", "fragment", "resolution"])
+  );
+};
+const validSilverProjectionSource = (v: unknown): v is KnowledgeSilverProjectionSource => {
+  if (!rec(v) || !Object.prototype.hasOwnProperty.call(v, "descriptor") || !isJsonValue(v.descriptor))
+    return false;
+  if (v.resolution === "resolved_current")
+    return (
+      exact(v, ["descriptor", "resolution", "targetArticleId"]) &&
+      typeof v.targetArticleId === "string" &&
+      v.targetArticleId.length > 0
+    );
+  if (v.resolution === "resolved_exact")
+    return (
+      exact(v, ["descriptor", "resolution", "targetArticleId", "targetRevisionId", "targetBodyHash"]) &&
+      typeof v.targetArticleId === "string" &&
+      v.targetArticleId.length > 0 &&
+      typeof v.targetRevisionId === "string" &&
+      v.targetRevisionId.length > 0 &&
+      isHexDigest(v.targetBodyHash)
+    );
+  return (
+    (v.resolution === "unresolved" || v.resolution === "external_or_scope") &&
+    exact(v, ["descriptor", "resolution"])
+  );
+};
+const validSilverProjectionBacklink = (v: unknown): boolean =>
+  rec(v) &&
+  exact(v, ["sourceArticleId", "sourceRevisionId", "targetRevisionId", "targetBodyHash"]) &&
+  typeof v.sourceArticleId === "string" &&
+  v.sourceArticleId.length > 0 &&
+  typeof v.sourceRevisionId === "string" &&
+  v.sourceRevisionId.length > 0 &&
+  (v.targetRevisionId === null ||
+    (typeof v.targetRevisionId === "string" && v.targetRevisionId.length > 0)) &&
+  (v.targetBodyHash === null || isHexDigest(v.targetBodyHash));
+const validSilverProjection = (v: unknown): v is KnowledgeSilverProjectionResult =>
+  rec(v) &&
+  exact(v, [
+    "articleId",
+    "inputRevisionId",
+    "projectionRuleVersion",
+    "processedVersion",
+    "relationVersion",
+    "metadata",
+    "literalLinks",
+    "backlinks",
+    "sources",
+    "coverage",
+  ]) &&
+  typeof v.articleId === "string" &&
+  v.articleId.length > 0 &&
+  typeof v.inputRevisionId === "string" &&
+  v.inputRevisionId.length > 0 &&
+  typeof v.projectionRuleVersion === "string" &&
+  v.projectionRuleVersion.length > 0 &&
+  isHexDigest(v.processedVersion) &&
+  isHexDigest(v.relationVersion) &&
+  (v.metadata === null || (rec(v.metadata) && isJsonValue(v.metadata))) &&
+  denseArray(v.literalLinks) &&
+  v.literalLinks.every(validSilverProjectionLink) &&
+  denseArray(v.backlinks) &&
+  v.backlinks.every(validSilverProjectionBacklink) &&
+  denseArray(v.sources) &&
+  v.sources.every(validSilverProjectionSource) &&
+  validSilverSearchCoverage(v.coverage);
+const encodeArticlePathSegment = (value: string): string | undefined => {
+  if (value.length === 0 || hasLoneSurrogate(value)) return undefined;
+  const bytes = new TextEncoder().encode(value);
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x4000)
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x4000));
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+};
+const articlePathSegmentLength = (byteLength: number): number => Math.ceil((byteLength * 4) / 3);
+const articleVirtualPathsMatch = (
+  articleId: string,
+  revisionId: string,
+  currentPath: string,
+  exactRevisionPath: string,
+): boolean => {
+  if (articleId.length === 0 || revisionId.length === 0) return false;
+  const encoder = new TextEncoder();
+  const articleBytes = encoder.encode(articleId);
+  const revisionBytes = encoder.encode(revisionId);
+  if (hasLoneSurrogate(articleId) || hasLoneSurrogate(revisionId)) return false;
+  if (
+    12 + articlePathSegmentLength(articleBytes.byteLength) > 240 ||
+    23 + articlePathSegmentLength(articleBytes.byteLength) + articlePathSegmentLength(revisionBytes.byteLength) > 240
+  )
+    return false;
+  const encodedArticleId = encodeArticlePathSegment(articleId);
+  const encodedRevisionId = encodeArticlePathSegment(revisionId);
+  return (
+    encodedArticleId !== undefined &&
+    encodedRevisionId !== undefined &&
+    currentPath === `articles/${encodedArticleId}.md` &&
+    exactRevisionPath === `articles/${encodedArticleId}/revisions/${encodedRevisionId}.md`
+  );
+};
+const validSilverArticleSearchItem = (v: unknown): v is KnowledgeArticleSearchItem => {
+  if (
+    !rec(v) ||
+    typeof v.articleId !== "string" ||
+    v.articleId.length === 0 ||
+    typeof v.currentRevisionId !== "string" ||
+    v.currentRevisionId.length === 0 ||
+    v.usePolicy !== "included" ||
+    !isCanonicalMarkdownPath(v.currentPath) ||
+    !isCanonicalMarkdownPath(v.exactRevisionPath) ||
+    !articleVirtualPathsMatch(v.articleId, v.currentRevisionId, v.currentPath, v.exactRevisionPath) ||
+    !isHexDigest(v.bodyHash) ||
+    !validSilverSearchCoverage(v.coverage)
+  )
+    return false;
+  const common = [
+    "articleId",
+    "currentRevisionId",
+    "usePolicy",
+    "currentPath",
+    "exactRevisionPath",
+    "bodyHash",
+    "coverage",
+    "state",
+    "projection",
+  ];
+  if (v.state === "pending") return exact(v, common) && v.projection === null;
+  if (v.state !== "indexed" && v.state !== "metadata_unknown") return false;
+  if (
+    !exact(v, common) ||
+    !validSilverProjection(v.projection) ||
+    v.projection.articleId !== v.articleId ||
+    v.projection.inputRevisionId !== v.currentRevisionId
+  )
+    return false;
+  return v.state !== "metadata_unknown" || v.coverage.metadata.status === "partial";
+};
+const compareUtf8Bytes = (left: string, right: string): number => {
+  const encoder = new TextEncoder();
+  const leftBytes = encoder.encode(left);
+  const rightBytes = encoder.encode(right);
+  const sharedLength = Math.min(leftBytes.byteLength, rightBytes.byteLength);
+  for (let index = 0; index < sharedLength; index += 1) {
+    const difference = (leftBytes[index] ?? 0) - (rightBytes[index] ?? 0);
+    if (difference !== 0) return difference;
+  }
+  return leftBytes.byteLength - rightBytes.byteLength;
+};
+const validArticleSearchResult = (
+  v: unknown,
+  input: KnowledgeArticleSearchInput,
+): v is Extract<KnowledgeSearchResult, { kind: "articles" }> => {
+  if (
+    !rec(v) ||
+    !exactOptional(v, ["kind", "items", "coverage"], ["nextCursor"]) ||
+    v.kind !== "articles" ||
+    !denseArray(v.items) ||
+    v.items.length > input.limit ||
+    !v.items.every(validSilverArticleSearchItem) ||
+    !validSilverSearchCoverage(v.coverage) ||
+    (Object.prototype.hasOwnProperty.call(v, "nextCursor") &&
+      (typeof v.nextCursor !== "string" || v.nextCursor.length === 0))
+  )
+    return false;
+  let previousId = input.cursor;
+  for (const item of v.items) {
+    if (previousId !== undefined && compareUtf8Bytes(item.articleId, previousId) <= 0) return false;
+    previousId = item.articleId;
+  }
+  if (Object.prototype.hasOwnProperty.call(v, "nextCursor")) {
+    const lastItem = v.items[v.items.length - 1];
+    if (lastItem === undefined || v.nextCursor !== lastItem.articleId) return false;
+  }
+  return true;
+};
+const validArticleLinksSearchResult = (
+  v: unknown,
+  input: KnowledgeArticleLinksSearchInput,
+): v is Extract<KnowledgeSearchResult, { kind: "article-links" }> =>
+  rec(v) &&
+  exact(v, ["kind", "items", "coverage"]) &&
+  v.kind === "article-links" &&
+  denseArray(v.items) &&
+  v.items.length <= input.candidateBudget &&
+  v.items.every(
+    (entry) =>
+      rec(entry) &&
+      exact(entry, ["depth", "item"]) &&
+      boundedInt(entry.depth, 0, input.maxDepth) &&
+      validSilverArticleSearchItem(entry.item),
+  ) &&
+  validSilverSearchCoverage(v.coverage);
+const validSearchResult = (
+  v: unknown,
+  input: KnowledgeSearchInput,
+): v is KnowledgeSearchResult => {
+  if (!("kind" in input))
+    return (
+      validComputerSearchResult(v) &&
+      new TextEncoder().encode(JSON.stringify(v)).byteLength <= KNOWLEDGE_READ_RESPONSE_MAX_BYTES
+    );
+  const valid =
+    input.kind === "articles"
+      ? validArticleSearchResult(v, input)
+      : validArticleLinksSearchResult(v, input);
+  if (!valid) return false;
+  const serialized = JSON.stringify(v);
+  return (
+    typeof serialized === "string" &&
+    new TextEncoder().encode(serialized).byteLength <= KNOWLEDGE_READ_RESPONSE_MAX_BYTES
+  );
+};
+const validSearchInput = (v: unknown): v is KnowledgeSearchInput => {
+  if (!rec(v)) return false;
+  if (!Object.prototype.hasOwnProperty.call(v, "kind"))
+    return (
+      exact(v, ["query", "offset", "limit"]) &&
+      typeof v.query === "string" &&
+      v.query.length > 0 &&
+      !hasLoneSurrogate(v.query) &&
+      new TextEncoder().encode(v.query).byteLength <= 120 &&
+      !v.query.includes("\n") &&
+      !v.query.includes("\r") &&
+      // oxlint-disable-next-line no-control-regex -- preserve the Computer search contract.
+      !/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(v.query) &&
+      boundedInt(v.offset, 0, 1_048_576) &&
+      boundedInt(v.limit, 1, 16)
+    );
+  if (v.kind === "articles") {
+    if (
+      !exactOptional(v, ["kind", "limit"], ["filters", "cursor"]) ||
+      !boundedInt(v.limit, 1, 16) ||
+      (Object.prototype.hasOwnProperty.call(v, "cursor") &&
+        (typeof v.cursor !== "string" || v.cursor.length === 0))
+    )
+      return false;
+    if (!Object.prototype.hasOwnProperty.call(v, "filters")) return true;
+    const filters = v.filters;
+    return (
+      rec(filters) &&
+      exactOptional(filters, [], ["type", "title", "description", "tag"]) &&
+      ["type", "title", "description", "tag"].every(
+        (key) => !Object.prototype.hasOwnProperty.call(filters, key) || typeof filters[key] === "string",
+      )
+    );
+  }
+  return (
+    v.kind === "article-links" &&
+    exact(v, ["kind", "articleId", "direction", "maxDepth", "candidateBudget"]) &&
+    typeof v.articleId === "string" &&
+    v.articleId.length > 0 &&
+    (v.direction === "links" || v.direction === "backlinks") &&
+    boundedInt(v.maxDepth, 0, 4) &&
+    boundedInt(v.candidateBudget, 1, 32)
+  );
+};
+const validReadResult = (v: unknown): v is KnowledgeReadResult => {
+  if (!rec(v) || !isCanonicalMarkdownPath(v.path)) return false;
+  const computer =
+    exact(v, ["bundleId", "versionId", "path", "sourceMarkdown", "metadata"]) &&
+    isHexDigest(v.bundleId) &&
+    knowledgeUuid(v.versionId);
+  const article =
+    exact(v, ["kind", "articleId", "revisionId", "bodyHash", "path", "sourceMarkdown", "metadata"]) &&
+    v.kind === "article" &&
+    isNonEmptyBoundedText(v.articleId, KNOWLEDGE_READ_RESPONSE_MAX_BYTES) &&
+    isNonEmptyBoundedText(v.revisionId, KNOWLEDGE_READ_RESPONSE_MAX_BYTES) &&
+    isHexDigest(v.bodyHash);
+  if (
+    (!computer && !article) ||
+    typeof v.sourceMarkdown !== "string" ||
+    !rec(v.metadata) ||
+    !isJsonValue(v.metadata)
+  )
+    return false;
+  const serialized = JSON.stringify(v);
+  return (
+    typeof serialized === "string" &&
+    new TextEncoder().encode(serialized).byteLength <= KNOWLEDGE_READ_RESPONSE_MAX_BYTES
+  );
+};
 const uuid = (v: unknown): v is string => typeof v === "string" && UUID.test(v);
-const knowledgeUuid = (v: unknown): v is string =>
-  typeof v === "string" && KNOWLEDGE_UUID.test(v);
+const knowledgeUuid = (v: unknown): v is string => typeof v === "string" && KNOWLEDGE_UUID.test(v);
 const observation = (title: string, description: string) => ({
   title,
   description,
@@ -734,25 +1444,40 @@ export class KnowledgeSession extends RpcTarget {
   readonly #q: RpcStub<KnowledgeActionQueue>;
   readonly #a: KnowledgeAccess;
   readonly #propose: KnowledgeSessionProposal;
+  readonly #proposePolicy: KnowledgeSessionPolicyProposal;
   #disposed = false;
 
   constructor(
     q: RpcStub<KnowledgeActionQueue>,
     a: KnowledgeAccess,
     propose: KnowledgeSessionProposal,
+    proposePolicy: KnowledgeSessionPolicyProposal,
   ) {
     super();
     this.#q = q;
     this.#a = a;
     this.#propose = propose;
+    this.#proposePolicy = proposePolicy;
   }
 
-  async proposeArticle(input: unknown): Promise<Readonly<{
-    status: "pending_approval";
-    operationId: string;
-  }>> {
+  async proposeArticle(input: unknown): Promise<
+    Readonly<{
+      status: "pending_approval";
+      operationId: string;
+    }>
+  > {
     if (this.#disposed) throw err("invalid_input");
     return this.#propose(input);
+  }
+
+  async proposeArticlePolicy(input: unknown): Promise<
+    Readonly<{
+      status: "pending_approval";
+      operationId: string;
+    }>
+  > {
+    if (this.#disposed) throw err("invalid_input");
+    return this.#proposePolicy(input);
   }
 
   async #read<T>(
@@ -798,11 +1523,7 @@ export class KnowledgeSession extends RpcTarget {
     // The receipt is immutable for this read. A later read may have a newer expiry, but cannot
     // extend the authorization window for the payload currently held across observation.
     const authorizedAt = Date.now();
-    if (
-      !Number.isSafeInteger(authorizedAt) ||
-      authorizedAt < 0 ||
-      expiresAt <= authorizedAt
-    )
+    if (!Number.isSafeInteger(authorizedAt) || authorizedAt < 0 || expiresAt <= authorizedAt)
       throw err("permission_denied");
     return receipt.value;
   }
@@ -824,41 +1545,23 @@ export class KnowledgeSession extends RpcTarget {
   }
 
   async search(input: KnowledgeSearchInput): Promise<KnowledgeSearchResult> {
-    if (
-      !rec(input) ||
-      !exact(input, ["query", "offset", "limit"]) ||
-      typeof input.query !== "string" ||
-      input.query.length === 0 ||
-      hasLoneSurrogate(input.query) ||
-      new TextEncoder().encode(input.query).byteLength > 120 ||
-      input.query.includes("\n") ||
-      input.query.includes("\r") ||
-      /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(input.query) ||
-      !boundedInt(input.offset, 0, 1_048_576) ||
-      !boundedInt(input.limit, 1, 16)
-    )
-      throw err("invalid_input");
+    if (!validSearchInput(input)) throw err("invalid_input");
     return this.#read(
       "Knowledge Base search",
       "Search private Knowledge pages for this Manager.",
       () => this.#a.search(input),
-      validSearchResult,
+      (value): value is KnowledgeSearchResult => validSearchResult(value, input),
     );
   }
 
   async read(input: KnowledgeReadInput): Promise<KnowledgeReadResult> {
-    if (
-      !rec(input) ||
-      !exact(input, ["path"]) ||
-      !isCanonicalMarkdownPath(input.path)
-    )
+    if (!rec(input) || !exact(input, ["path"]) || !isCanonicalMarkdownPath(input.path))
       throw err("invalid_input");
     return this.#read(
       "Knowledge Base read",
       "Read a private Knowledge page for this Manager.",
       () => this.#a.read(input),
-      (value): value is KnowledgeReadResult =>
-        validReadResult(value) && value.path === input.path,
+      (value): value is KnowledgeReadResult => validReadResult(value) && value.path === input.path,
     );
   }
 
@@ -886,7 +1589,8 @@ type KnowledgeBronzeReservationBinding = Pick<
   "workspaceId" | "gatekeeperInstanceId" | "localActionId" | "operationId" | "operationDeadlineMs"
 >;
 function isKnowledgeBronzeStageSlot(value: unknown): value is KnowledgeBronzeStageSlot {
-  return rec(value) &&
+  return (
+    rec(value) &&
     exact(value, [
       "status",
       "workspaceId",
@@ -906,35 +1610,90 @@ function isKnowledgeBronzeStageSlot(value: unknown): value is KnowledgeBronzeSta
       value.retainedBytesReserved,
       1,
       KNOWLEDGE_BRONZE_MAX_ACTION_BYTES + KNOWLEDGE_BRONZE_MAX_METADATA_BYTES,
-    );
+    )
+  );
 }
 function sameBronzeReservation(
   slot: KnowledgeBronzeStageSlot,
   binding: KnowledgeBronzeReservationBinding,
 ): boolean {
-  return slot.workspaceId === binding.workspaceId &&
+  return (
+    slot.workspaceId === binding.workspaceId &&
     slot.gatekeeperInstanceId === binding.gatekeeperInstanceId &&
     slot.localActionId === binding.localActionId &&
     slot.operationId === binding.operationId &&
-    slot.operationDeadlineMs === binding.operationDeadlineMs;
+    slot.operationDeadlineMs === binding.operationDeadlineMs
+  );
+}
+type KnowledgeSilverSafeControlBinding = Omit<
+  KnowledgeSilverSafeControlReservation,
+  "retainedBytesReserved"
+>;
+function isKnowledgeSilverSafeControlReservation(
+  value: unknown,
+): value is KnowledgeSilverSafeControlReservation {
+  return (
+    rec(value) &&
+    exact(value, [
+      "articleId",
+      "workspaceId",
+      "gatekeeperInstanceId",
+      "localActionId",
+      "operationId",
+      "operationDeadlineMs",
+      "retainedBytesReserved",
+    ]) &&
+    isNonEmptyBoundedText(value.articleId, KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_BYTES_PER_TARGET) &&
+    isNonEmptyBoundedText(value.workspaceId, 512) &&
+    isNonEmptyBoundedText(value.gatekeeperInstanceId, 512) &&
+    boundedInt(value.localActionId, 0, Number.MAX_SAFE_INTEGER) &&
+    typeof value.operationId === "string" &&
+    UUID.test(value.operationId) &&
+    boundedInt(value.operationDeadlineMs, 0, Number.MAX_SAFE_INTEGER) &&
+    boundedInt(value.retainedBytesReserved, 1, KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_BYTES_PER_TARGET)
+  );
+}
+function isKnowledgeSilverSafeControlReservationList(
+  value: unknown,
+): value is readonly KnowledgeSilverSafeControlReservation[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_TARGETS &&
+    value.every(isKnowledgeSilverSafeControlReservation) &&
+    new Set(value.map((slot) => slot.articleId)).size === value.length &&
+    value.reduce((sum, slot) => sum + slot.retainedBytesReserved, 0) <=
+      KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_TARGETS * KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_BYTES_PER_TARGET
+  );
+}
+function sameSilverSafeControlBinding(
+  slot: KnowledgeSilverSafeControlReservation,
+  binding: KnowledgeSilverSafeControlBinding,
+): boolean {
+  return (
+    slot.articleId === binding.articleId &&
+    slot.workspaceId === binding.workspaceId &&
+    slot.gatekeeperInstanceId === binding.gatekeeperInstanceId &&
+    slot.localActionId === binding.localActionId &&
+    slot.operationId === binding.operationId &&
+    slot.operationDeadlineMs === binding.operationDeadlineMs
+  );
 }
 
 // Facet class props cannot contain capabilities on the deployed platform.
 // This namespace is Worker-private and never handed to an Agent or HTTP caller.
 export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
   async bind(managerId: string, capability: KnowledgeAccess): Promise<void> {
-    if (!isManagerId(managerId) ||
-        !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId)))
+    if (
+      !isManagerId(managerId) ||
+      !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId))
+    )
       throw new TypeError("Knowledge access store is bound to another Manager.");
     const contract = await validateStub<KnowledgeAccess>(capability).assertBoundTo(managerId);
-    if (contract !== KNOWLEDGE_READ_CONTRACT)
-      throw err("incompatible_reader_contract");
+    if (contract !== KNOWLEDGE_READ_CONTRACT) throw err("incompatible_reader_contract");
     const stored = await this.ctx.storage.get<KnowledgeAccess>("access");
     if (stored !== undefined) {
-      const storedContract = await validateStub<InspectableAccess>(stored)
-        .assertBoundTo(managerId);
-      if (storedContract !== KNOWLEDGE_READ_CONTRACT)
-        throw err("incompatible_reader_contract");
+      const storedContract = await validateStub<InspectableAccess>(stored).assertBoundTo(managerId);
+      if (storedContract !== KNOWLEDGE_READ_CONTRACT) throw err("incompatible_reader_contract");
       return;
     }
     // Serialize the check-and-first-write locally. The RPC assertions remain outside this gate.
@@ -946,10 +1705,9 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
       return undefined;
     });
     if (racedBinding !== undefined) {
-      const racedContract = await validateStub<InspectableAccess>(racedBinding)
-        .assertBoundTo(managerId);
-      if (racedContract !== KNOWLEDGE_READ_CONTRACT)
-        throw err("incompatible_reader_contract");
+      const racedContract =
+        await validateStub<InspectableAccess>(racedBinding).assertBoundTo(managerId);
+      if (racedContract !== KNOWLEDGE_READ_CONTRACT) throw err("incompatible_reader_contract");
     }
   }
 
@@ -966,29 +1724,33 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
     writer: KnowledgeBronzeWrite,
     sourceReader: KnowledgeSourceReader,
   ): Promise<void> {
-    if (!isManagerId(managerId) ||
-        !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId)))
+    if (
+      !isManagerId(managerId) ||
+      !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId))
+    )
       throw new TypeError("Knowledge Bronze role store is bound to another Manager.");
 
-    const writerContract = await validateStub<KnowledgeBronzeWrite>(writer)
-      .assertBoundTo(managerId);
-    const sourceContract = await validateStub<KnowledgeSourceReader>(sourceReader)
-      .assertBoundTo(managerId);
-    if (writerContract !== KNOWLEDGE_BRONZE_WRITE_CONTRACT ||
-        sourceContract !== KNOWLEDGE_SOURCE_READ_CONTRACT)
+    const writerContract =
+      await validateStub<KnowledgeBronzeWrite>(writer).assertBoundTo(managerId);
+    const sourceContract =
+      await validateStub<KnowledgeSourceReader>(sourceReader).assertBoundTo(managerId);
+    if (
+      writerContract !== KNOWLEDGE_BRONZE_WRITE_CONTRACT ||
+      sourceContract !== KNOWLEDGE_SOURCE_READ_CONTRACT
+    )
       throw err("incompatible_bronze_role_contract");
 
     const currentWriter = await this.ctx.storage.get<KnowledgeBronzeWrite>("bronzeWriter");
     const currentSourceReader = await this.ctx.storage.get<KnowledgeSourceReader>("sourceReader");
     if (currentWriter !== undefined) {
-      const currentContract = await validateStub<KnowledgeBronzeWrite>(currentWriter)
-        .assertBoundTo(managerId);
+      const currentContract =
+        await validateStub<KnowledgeBronzeWrite>(currentWriter).assertBoundTo(managerId);
       if (currentContract !== KNOWLEDGE_BRONZE_WRITE_CONTRACT)
         throw err("incompatible_bronze_role_contract");
     }
     if (currentSourceReader !== undefined) {
-      const currentContract = await validateStub<KnowledgeSourceReader>(currentSourceReader)
-        .assertBoundTo(managerId);
+      const currentContract =
+        await validateStub<KnowledgeSourceReader>(currentSourceReader).assertBoundTo(managerId);
       if (currentContract !== KNOWLEDGE_SOURCE_READ_CONTRACT)
         throw err("incompatible_bronze_role_contract");
     }
@@ -1009,22 +1771,26 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
     // Another bind may have filled a missing slot while the candidate stubs were being checked.
     // Revalidate those winning immutable values after leaving the local gate.
     if (raced.writer !== undefined) {
-      const currentContract = await validateStub<KnowledgeBronzeWrite>(raced.writer)
-        .assertBoundTo(managerId);
+      const currentContract = await validateStub<KnowledgeBronzeWrite>(raced.writer).assertBoundTo(
+        managerId,
+      );
       if (currentContract !== KNOWLEDGE_BRONZE_WRITE_CONTRACT)
         throw err("incompatible_bronze_role_contract");
     }
     if (raced.sourceReader !== undefined) {
-      const currentContract = await validateStub<KnowledgeSourceReader>(raced.sourceReader)
-        .assertBoundTo(managerId);
+      const currentContract = await validateStub<KnowledgeSourceReader>(
+        raced.sourceReader,
+      ).assertBoundTo(managerId);
       if (currentContract !== KNOWLEDGE_SOURCE_READ_CONTRACT)
         throw err("incompatible_bronze_role_contract");
     }
   }
 
   async inspectBronzeRoles(managerId: string): Promise<KnowledgeBronzeRoles> {
-    if (!isManagerId(managerId) ||
-        !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId)))
+    if (
+      !isManagerId(managerId) ||
+      !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId))
+    )
       throw new TypeError("Knowledge Bronze role store is bound to another Manager.");
     const writer = await this.ctx.storage.get<KnowledgeBronzeWrite>("bronzeWriter");
     const sourceReader = await this.ctx.storage.get<KnowledgeSourceReader>("sourceReader");
@@ -1036,20 +1802,29 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
   }
 
   async getBronzeCapabilities(managerId: string): Promise<KnowledgeBronzeCapabilities> {
-    if (!isManagerId(managerId) ||
-        !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId)))
+    if (
+      !isManagerId(managerId) ||
+      !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId))
+    )
       throw new TypeError("Knowledge Bronze role store is bound to another Manager.");
     const writer = await this.ctx.storage.get<KnowledgeBronzeWrite>("bronzeWriter");
     const sourceReader = await this.ctx.storage.get<KnowledgeSourceReader>("sourceReader");
-    if (writer === undefined || sourceReader === undefined)
-      throw err("dependency_unavailable");
-    const [writerContract, sourceContract] = await Promise.all([
-      validateStub<KnowledgeBronzeWrite>(writer).assertBoundTo(managerId),
-      validateStub<KnowledgeSourceReader>(sourceReader).assertBoundTo(managerId),
-    ]);
-    if (writerContract !== KNOWLEDGE_BRONZE_WRITE_CONTRACT ||
-        sourceContract !== KNOWLEDGE_SOURCE_READ_CONTRACT)
-      throw err("incompatible_bronze_role_contract");
+    if (writer === undefined || sourceReader === undefined) throw err("dependency_unavailable");
+    let writerContract: string;
+    let sourceContract: string;
+    try {
+      [writerContract, sourceContract] = await Promise.all([
+        validateStub<KnowledgeBronzeWrite>(writer).assertBoundTo(managerId),
+        validateStub<KnowledgeSourceReader>(sourceReader).assertBoundTo(managerId),
+      ]);
+    } catch (cause) {
+      throw err("permission_denied", cause);
+    }
+    if (
+      writerContract !== KNOWLEDGE_BRONZE_WRITE_CONTRACT ||
+      sourceContract !== KNOWLEDGE_SOURCE_READ_CONTRACT
+    )
+      throw err("permission_denied");
     return { writer, sourceReader };
   }
 
@@ -1065,7 +1840,8 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
     if (
       current.gatekeeperInstanceId !== gatekeeperInstanceId ||
       current.localActionId !== localActionId
-    ) return undefined;
+    )
+      return undefined;
     return current;
   }
 
@@ -1089,8 +1865,13 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
       !boundedInt(reservation.localActionId, 0, Number.MAX_SAFE_INTEGER) ||
       !UUID.test(reservation.operationId) ||
       !boundedInt(reservation.operationDeadlineMs, 0, Number.MAX_SAFE_INTEGER) ||
-      !boundedInt(reservation.retainedBytesReserved, 1, KNOWLEDGE_BRONZE_MAX_ACTION_BYTES + KNOWLEDGE_BRONZE_MAX_METADATA_BYTES)
-    ) throw err("invalid_input");
+      !boundedInt(
+        reservation.retainedBytesReserved,
+        1,
+        KNOWLEDGE_BRONZE_MAX_ACTION_BYTES + KNOWLEDGE_BRONZE_MAX_METADATA_BYTES,
+      )
+    )
+      throw err("invalid_input");
 
     const gateError = await this.ctx.blockConcurrencyWhile(async () => {
       const current = await this.ctx.storage.get<unknown>("bronzeActionReservation");
@@ -1112,19 +1893,25 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
 
   async activateBronzeAction(
     managerId: string,
-    reservation: Omit<KnowledgeBronzeStageSlot, "status" | "operationDeadlineMs" | "retainedBytesReserved">,
+    reservation: Omit<
+      KnowledgeBronzeStageSlot,
+      "status" | "operationDeadlineMs" | "retainedBytesReserved"
+    >,
     operationDeadlineMs: number,
   ): Promise<void> {
     this.#assertManager(managerId);
     if (!boundedInt(operationDeadlineMs, 1, Number.MAX_SAFE_INTEGER)) throw err("invalid_input");
     const gateError = await this.ctx.blockConcurrencyWhile(async () => {
       const current = await this.ctx.storage.get<unknown>("bronzeActionReservation");
-      if (!isKnowledgeBronzeStageSlot(current) ||
-          current.workspaceId !== reservation.workspaceId ||
-          current.gatekeeperInstanceId !== reservation.gatekeeperInstanceId ||
-          current.localActionId !== reservation.localActionId ||
-          current.operationId !== reservation.operationId ||
-          current.status !== "active") return err("result_unknown");
+      if (
+        !isKnowledgeBronzeStageSlot(current) ||
+        current.workspaceId !== reservation.workspaceId ||
+        current.gatekeeperInstanceId !== reservation.gatekeeperInstanceId ||
+        current.localActionId !== reservation.localActionId ||
+        current.operationId !== reservation.operationId ||
+        current.status !== "active"
+      )
+        return err("result_unknown");
       if (current.operationDeadlineMs === operationDeadlineMs) return undefined;
       if (current.operationDeadlineMs !== 0) return err("integrity_failure");
       await this.ctx.storage.put("bronzeActionReservation", {
@@ -1172,11 +1959,99 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
     if (gateError !== undefined) throw gateError;
   }
 
+  async reserveSilverSafeControl(
+    managerId: string,
+    reservation: KnowledgeSilverSafeControlReservation,
+  ): Promise<void> {
+    this.#assertManager(managerId);
+    if (!isKnowledgeSilverSafeControlReservation(reservation)) throw err("invalid_input");
+    const gateError = await this.ctx.blockConcurrencyWhile(async () => {
+      const stored = await this.ctx.storage.get<unknown>("silverSafeControlReservations");
+      if (stored !== undefined && !isKnowledgeSilverSafeControlReservationList(stored))
+        return err("corrupt_state");
+      const current = stored === undefined ? [] : stored;
+      const targetReservation = current.find((slot) => slot.articleId === reservation.articleId);
+      if (targetReservation !== undefined) {
+        if (
+          sameSilverSafeControlBinding(targetReservation, reservation) &&
+          targetReservation.retainedBytesReserved === reservation.retainedBytesReserved
+        )
+          return undefined;
+        return err("capacity_exceeded");
+      }
+      if (current.length >= KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_TARGETS)
+        return err("capacity_exceeded");
+      const totalBytes = current.reduce((sum, slot) => sum + slot.retainedBytesReserved, 0);
+      if (
+        totalBytes + reservation.retainedBytesReserved >
+        KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_TARGETS *
+          KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_BYTES_PER_TARGET
+      )
+        return err("capacity_exceeded");
+      await this.ctx.storage.put("silverSafeControlReservations", [...current, reservation]);
+      return undefined;
+    });
+    if (gateError !== undefined) throw gateError;
+  }
+
+  async activateSilverSafeControl(
+    managerId: string,
+    reservation: Omit<KnowledgeSilverSafeControlBinding, "operationDeadlineMs">,
+    operationDeadlineMs: number,
+  ): Promise<void> {
+    this.#assertManager(managerId);
+    if (!boundedInt(operationDeadlineMs, 1, Number.MAX_SAFE_INTEGER)) throw err("invalid_input");
+    const gateError = await this.ctx.blockConcurrencyWhile(async () => {
+      const stored = await this.ctx.storage.get<unknown>("silverSafeControlReservations");
+      if (stored === undefined || !isKnowledgeSilverSafeControlReservationList(stored))
+        return err(stored === undefined ? "result_unknown" : "corrupt_state");
+      const index = stored.findIndex(
+        (slot) =>
+          slot.articleId === reservation.articleId &&
+          slot.workspaceId === reservation.workspaceId &&
+          slot.gatekeeperInstanceId === reservation.gatekeeperInstanceId &&
+          slot.localActionId === reservation.localActionId &&
+          slot.operationId === reservation.operationId,
+      );
+      if (index < 0) return err("result_unknown");
+      const current = stored[index]!;
+      if (current.operationDeadlineMs === operationDeadlineMs) return undefined;
+      if (current.operationDeadlineMs !== 0) return err("integrity_failure");
+      const next = [...stored];
+      next[index] = { ...current, operationDeadlineMs };
+      await this.ctx.storage.put("silverSafeControlReservations", next);
+      return undefined;
+    });
+    if (gateError !== undefined) throw gateError;
+  }
+
+  async clearSilverSafeControl(
+    managerId: string,
+    reservation: KnowledgeSilverSafeControlBinding,
+  ): Promise<void> {
+    this.#assertManager(managerId);
+    const gateError = await this.ctx.blockConcurrencyWhile(async () => {
+      const stored = await this.ctx.storage.get<unknown>("silverSafeControlReservations");
+      if (stored === undefined) return undefined;
+      if (!isKnowledgeSilverSafeControlReservationList(stored)) return err("corrupt_state");
+      const current = stored.find((slot) => slot.articleId === reservation.articleId);
+      if (current === undefined || !sameSilverSafeControlBinding(current, reservation))
+        return undefined;
+      await this.ctx.storage.put(
+        "silverSafeControlReservations",
+        stored.filter((slot) => slot !== current),
+      );
+      return undefined;
+    });
+    if (gateError !== undefined) throw gateError;
+  }
+
   #assertManager(managerId: string): void {
     if (
       !isManagerId(managerId) ||
       !this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId))
-    ) throw new TypeError("Knowledge Bronze role store is bound to another Manager.");
+    )
+      throw new TypeError("Knowledge Bronze role store is bound to another Manager.");
   }
 
   async #inspectRole(
@@ -1185,14 +2060,16 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
     role: "writer" | "sourceReader",
   ): Promise<KnowledgeBronzeRoles["writer"]> {
     if (capability === undefined) return "absent";
-    const contract = role === "writer"
-      ? await validateStub<KnowledgeBronzeWrite>(capability as KnowledgeBronzeWrite)
-        .assertBoundTo(managerId)
-      : await validateStub<KnowledgeSourceReader>(capability as KnowledgeSourceReader)
-        .assertBoundTo(managerId);
-    const expected = role === "writer"
-      ? KNOWLEDGE_BRONZE_WRITE_CONTRACT
-      : KNOWLEDGE_SOURCE_READ_CONTRACT;
+    const contract =
+      role === "writer"
+        ? await validateStub<KnowledgeBronzeWrite>(
+            capability as KnowledgeBronzeWrite,
+          ).assertBoundTo(managerId)
+        : await validateStub<KnowledgeSourceReader>(
+            capability as KnowledgeSourceReader,
+          ).assertBoundTo(managerId);
+    const expected =
+      role === "writer" ? KNOWLEDGE_BRONZE_WRITE_CONTRACT : KNOWLEDGE_SOURCE_READ_CONTRACT;
     return contract === expected ? "installed" : "incompatible";
   }
 }
@@ -1268,7 +2145,12 @@ export class CustomGatekeeper
         );
       }
       const unstampedActions = this.ctx.storage.sql
-        .exec<{ local_action_id: number; workspace_id: string | null; operation_deadline_ms: number | null; command_json: string }>(
+        .exec<{
+          local_action_id: number;
+          workspace_id: string | null;
+          operation_deadline_ms: number | null;
+          command_json: string;
+        }>(
           `SELECT local_action_id, workspace_id, operation_deadline_ms, command_json
            FROM custom_gatekeeper_article_actions
            WHERE workspace_id IS NULL OR operation_deadline_ms IS NULL`,
@@ -1306,7 +2188,9 @@ export class CustomGatekeeper
 
   #nextActionId(): number {
     const rows = this.ctx.storage.sql
-      .exec<{ next_id: number }>("SELECT next_id FROM custom_gatekeeper_action_sequence WHERE id = 1")
+      .exec<{ next_id: number }>(
+        "SELECT next_id FROM custom_gatekeeper_action_sequence WHERE id = 1",
+      )
       .toArray();
     const nextId = rows[0]?.next_id;
     if (!Number.isSafeInteger(nextId) || nextId < 1 || nextId >= Number.MAX_SAFE_INTEGER)
@@ -1327,7 +2211,10 @@ export class CustomGatekeeper
     const article = decodeKnowledgeArticleProposal(input);
     const workspaceId = await queue.getWorkspaceId();
     const gatekeeperInstanceId = this.ctx.id.toString();
-    if (!isNonEmptyBoundedText(workspaceId, 512) || !isNonEmptyBoundedText(gatekeeperInstanceId, 512))
+    if (
+      !isNonEmptyBoundedText(workspaceId, 512) ||
+      !isNonEmptyBoundedText(gatekeeperInstanceId, 512)
+    )
       throw err("permission_denied");
 
     const capabilities = await account.getBronzeCapabilities(managerId);
@@ -1336,6 +2223,7 @@ export class CustomGatekeeper
       selector: article.sourceSelector,
     });
     const verified = decodeVerifiedSource(rawSource, article.sourceSelector);
+    const candidate = await validateKnowledgeCandidate(capabilities.writer, article.body);
     const provenance = { ...verified, ...articleClaims(article) };
     const namespace: KnowledgeBronzeNamespace = {
       workspaceId,
@@ -1344,24 +2232,25 @@ export class CustomGatekeeper
     };
     const operationId = crypto.randomUUID();
     const revisionId = crypto.randomUUID();
-    const intent = article.kind === "adopt"
-      ? {
-          kind: "adopt" as const,
-          articleId: crypto.randomUUID(),
-          revisionId,
-          expectedCurrentRevision: null,
-          body: article.body,
-          initialUsePolicy: article.initialUsePolicy,
-          provenance,
-        }
-      : {
-          kind: "revise" as const,
-          articleId: article.articleId,
-          revisionId,
-          expectedCurrentRevision: article.expectedCurrentRevision,
-          body: article.body,
-          provenance,
-        };
+    const intent =
+      article.kind === "adopt"
+        ? {
+            kind: "adopt" as const,
+            articleId: crypto.randomUUID(),
+            revisionId,
+            expectedCurrentRevision: null,
+            body: article.body,
+            initialUsePolicy: article.initialUsePolicy,
+            provenance,
+          }
+        : {
+            kind: "revise" as const,
+            articleId: article.articleId,
+            revisionId,
+            expectedCurrentRevision: article.expectedCurrentRevision,
+            body: article.body,
+            provenance,
+          };
     // The finite admission window starts at the first owner approval dispatch, not while the
     // native action waits for a human decision. Zero is the durable, undispatched sentinel.
     const operationDeadlineMs = 0;
@@ -1372,6 +2261,7 @@ export class CustomGatekeeper
       managerId,
       namespace,
       bodyBytes,
+      profileId: candidate.profileId,
     });
     const command = {
       kind: "staged" as const,
@@ -1380,11 +2270,15 @@ export class CustomGatekeeper
       attemptFencingToken: 1,
       operationDeadlineMs,
       fullIntentHash,
+      profileId: candidate.profileId,
+      bodyHash: candidate.bodyHash,
       intent,
     };
     const description: ActionDescription = {
-      title: article.kind === "adopt" ? "Propose a Knowledge article" : "Revise a Knowledge article",
-      description: "The exact Markdown body and its owner-verified source metadata are shown below. Approval saves this article to the Manager's Knowledge Base.",
+      title:
+        article.kind === "adopt" ? "Propose a Knowledge article" : "Revise a Knowledge article",
+      description:
+        "The exact Markdown body and its owner-verified source metadata are shown below. Approval saves this article to the Manager's Knowledge Base.",
       fields: [
         { label: "Article body", kind: "text", syntax: "markdown", value: article.body },
         {
@@ -1398,38 +2292,51 @@ export class CustomGatekeeper
       awaitDecision: true,
       implementsRevert: false,
     };
-    if (new TextEncoder().encode(JSON.stringify(description)).byteLength > KNOWLEDGE_BRONZE_MAX_ACTION_BYTES)
+    if (
+      new TextEncoder().encode(JSON.stringify(description)).byteLength >
+      KNOWLEDGE_BRONZE_MAX_ACTION_BYTES
+    )
       throw err("capacity_exceeded");
 
-    const metadataForReservation = article.kind === "adopt"
-      ? {
-          kind: intent.kind,
-          articleId: intent.articleId,
-          revisionId: intent.revisionId,
-          expectedCurrentRevision: intent.expectedCurrentRevision,
-          initialUsePolicy: intent.initialUsePolicy,
-          provenance: intent.provenance,
-          operationId,
-          operationDeadlineMs,
-          fullIntentHash,
-          namespace,
-        }
-      : {
-          kind: intent.kind,
-          articleId: intent.articleId,
-          revisionId: intent.revisionId,
-          expectedCurrentRevision: intent.expectedCurrentRevision,
-          provenance: intent.provenance,
-          operationId,
-          operationDeadlineMs,
-          fullIntentHash,
-          namespace,
-        };
-    const stageMetadataBytes = new TextEncoder().encode(JSON.stringify(metadataForReservation)).byteLength;
+    const metadataForReservation =
+      article.kind === "adopt"
+        ? {
+            kind: intent.kind,
+            articleId: intent.articleId,
+            revisionId: intent.revisionId,
+            expectedCurrentRevision: intent.expectedCurrentRevision,
+            initialUsePolicy: intent.initialUsePolicy,
+            provenance: intent.provenance,
+            operationId,
+            operationDeadlineMs,
+            fullIntentHash,
+            profileId: candidate.profileId,
+            bodyHash: candidate.bodyHash,
+            namespace,
+          }
+        : {
+            kind: intent.kind,
+            articleId: intent.articleId,
+            revisionId: intent.revisionId,
+            expectedCurrentRevision: intent.expectedCurrentRevision,
+            provenance: intent.provenance,
+            operationId,
+            operationDeadlineMs,
+            fullIntentHash,
+            profileId: candidate.profileId,
+            bodyHash: candidate.bodyHash,
+            namespace,
+          };
+    const stageMetadataBytes = new TextEncoder().encode(
+      JSON.stringify(metadataForReservation),
+    ).byteLength;
     const retainedBytesReserved = bodyBytes.byteLength + stageMetadataBytes;
     if (stageMetadataBytes > KNOWLEDGE_BRONZE_MAX_STAGE_METADATA_BYTES)
       throw err("capacity_exceeded");
-    if (retainedBytesReserved > KNOWLEDGE_BRONZE_MAX_ACTION_BYTES + KNOWLEDGE_BRONZE_MAX_METADATA_BYTES)
+    if (
+      retainedBytesReserved >
+      KNOWLEDGE_BRONZE_MAX_ACTION_BYTES + KNOWLEDGE_BRONZE_MAX_METADATA_BYTES
+    )
       throw err("capacity_exceeded");
 
     await account.reserveBronzeAction(managerId, {
@@ -1458,6 +2365,93 @@ export class CustomGatekeeper
     await queue.submitAction(namespace.localActionId, description);
     return { status: "pending_approval", operationId };
   }
+  async #proposeArticlePolicy(
+    queue: RpcStub<KnowledgeActionQueue>,
+    account: DurableObjectStub<KnowledgeAccountAccess>,
+    managerId: string,
+    input: unknown,
+  ): Promise<Readonly<{ status: "pending_approval"; operationId: string }>> {
+    const intent = decodeKnowledgeSilverPolicyProposal(input);
+    const workspaceId = await queue.getWorkspaceId();
+    const gatekeeperInstanceId = this.ctx.id.toString();
+    if (
+      !isNonEmptyBoundedText(workspaceId, 512) ||
+      !isNonEmptyBoundedText(gatekeeperInstanceId, 512)
+    )
+      throw err("permission_denied");
+
+    // Policy changes use the same installed Bronze writer/source-reader pair and native
+    // owner Action boundary. Knowledge decides gate state, target existence and metadata CAS
+    // only when the owner dispatches this exact staged command.
+    await account.getBronzeCapabilities(managerId);
+    const namespace: KnowledgeBronzeNamespace = {
+      workspaceId,
+      gatekeeperInstanceId,
+      localActionId: this.#nextActionId(),
+    };
+    const operationId = crypto.randomUUID();
+    const command: KnowledgeSilverPolicyCommand = {
+      kind: "silver_policy",
+      namespace,
+      operationId,
+      operationDeadlineMs: 0,
+      intent,
+    };
+    const description: ActionDescription = {
+      title: "Change Knowledge article policy",
+      description:
+        "The exact article policy update is shown below. Approval applies it to the Manager's Knowledge Base.",
+      fields: [
+        {
+          label: "Article policy update",
+          kind: "json",
+          value: JSON.stringify(intent),
+        },
+      ],
+      descriptionIsComplete: true,
+      autoApprovable: false,
+      awaitDecision: true,
+      implementsRevert: false,
+    };
+    const retainedBytesReserved =
+      new TextEncoder().encode(JSON.stringify(command)).byteLength +
+      new TextEncoder().encode(JSON.stringify(description)).byteLength;
+    if (retainedBytesReserved > KNOWLEDGE_SILVER_SAFE_CONTROL_MAX_BYTES_PER_TARGET)
+      throw err("capacity_exceeded");
+
+    const payloadHash = await computeSilverPolicyPayloadHash(command);
+    const reservation: KnowledgeSilverSafeControlReservation = {
+      articleId: intent.articleId,
+      ...namespace,
+      operationId,
+      operationDeadlineMs: 0,
+      retainedBytesReserved,
+    };
+    if (intent.usePolicy === "excluded") {
+      await account.reserveSilverSafeControl(managerId, reservation);
+    } else {
+      await account.reserveBronzeAction(managerId, {
+        ...namespace,
+        operationId,
+        operationDeadlineMs: 0,
+        retainedBytesReserved,
+      });
+    }
+
+    this.ctx.storage.sql.exec(
+      `INSERT INTO custom_gatekeeper_article_actions
+       (local_action_id, operation_id, action_ref, kind, workspace_id, operation_deadline_ms, command_json, payload_hash, status, outcome_json)
+       VALUES (?, ?, ?, 'silver_policy', ?, 0, ?, ?, 'pending_approval', NULL)`,
+      namespace.localActionId,
+      operationId,
+      `knowledge-silver-policy:${operationId}`,
+      workspaceId,
+      JSON.stringify(command),
+      payloadHash,
+    );
+    await queue.submitAction(namespace.localActionId, description);
+    return { status: "pending_approval", operationId };
+  }
   async describe(): Promise<ResourceDescription> {
     return {
       url: "knowledge://current",
@@ -1483,6 +2477,7 @@ export class CustomGatekeeper
         queue,
         access,
         (input) => this.#proposeArticle(queue, account, managerId, input),
+        (input) => this.#proposeArticlePolicy(queue, account, managerId, input),
       );
     } catch (cause) {
       try {
@@ -1502,22 +2497,177 @@ export class CustomGatekeeper
     try {
       await applying;
     } finally {
-      if (this.#bronzeApplies.get(actionId) === applying)
-        this.#bronzeApplies.delete(actionId);
+      if (this.#bronzeApplies.get(actionId) === applying) this.#bronzeApplies.delete(actionId);
     }
+  }
+
+  async #activateSilverPolicyReservation(
+    account: DurableObjectStub<KnowledgeAccountAccess>,
+    managerId: string,
+    command: KnowledgeSilverPolicyCommand,
+  ): Promise<void> {
+    if (command.intent.usePolicy === "excluded") {
+      await account.activateSilverSafeControl(
+        managerId,
+        {
+          articleId: command.intent.articleId,
+          ...command.namespace,
+          operationId: command.operationId,
+        },
+        command.operationDeadlineMs,
+      );
+      return;
+    }
+    await account.activateBronzeAction(
+      managerId,
+      {
+        ...command.namespace,
+        operationId: command.operationId,
+      },
+      command.operationDeadlineMs,
+    );
+  }
+
+  async #clearSilverPolicyReservation(
+    account: DurableObjectStub<KnowledgeAccountAccess>,
+    managerId: string,
+    command: KnowledgeSilverPolicyCommand,
+  ): Promise<void> {
+    if (command.intent.usePolicy === "excluded") {
+      await account.clearSilverSafeControl(managerId, {
+        articleId: command.intent.articleId,
+        ...command.namespace,
+        operationId: command.operationId,
+        operationDeadlineMs: command.operationDeadlineMs,
+      });
+      return;
+    }
+    await account.clearBronzeAction(managerId, {
+      ...command.namespace,
+      operationId: command.operationId,
+      operationDeadlineMs: command.operationDeadlineMs,
+    });
+  }
+
+  async #validateSilverPolicyStage(
+    row: KnowledgeArticleActionRow,
+    actionId: number,
+    gatekeeperInstanceId: string,
+  ): Promise<KnowledgeSilverPolicyCommand> {
+    if (!isNonEmptyBoundedText(row.workspace_id, 512)) throw err("corrupt_state");
+    const command = decodeStoredSilverPolicyStage(row.command_json, actionId, gatekeeperInstanceId);
+    if (
+      row.operation_id !== command.operationId ||
+      row.workspace_id !== command.namespace.workspaceId ||
+      row.operation_deadline_ms !== command.operationDeadlineMs ||
+      row.payload_hash !== (await computeSilverPolicyPayloadHash(command))
+    )
+      throw err("corrupt_state");
+    return command;
+  }
+
+  async #applySilverPolicyAction(actionId: number, row: KnowledgeArticleActionRow): Promise<void> {
+    const managerId = validateProps(this.ctx.props).managerId;
+    if (!isNonEmptyBoundedText(row.workspace_id, 512)) throw err("corrupt_state");
+    const namespace: KnowledgeBronzeNamespace = {
+      workspaceId: row.workspace_id,
+      gatekeeperInstanceId: this.ctx.id.toString(),
+      localActionId: actionId,
+    };
+    const account = this.#accountAccess();
+    const { writer } = await account.getBronzeCapabilities(managerId);
+    if (row.status === "rejected") throw err("conflict");
+
+    if (row.status === "applied") {
+      if (!boundedInt(row.operation_deadline_ms, 1, Number.MAX_SAFE_INTEGER))
+        throw err("corrupt_state");
+      const result = parseStoredSilverPolicySavedResult(row.outcome_json, row.operation_id);
+      const command: KnowledgeSilverPolicyCommand = {
+        kind: "silver_policy",
+        namespace,
+        operationId: row.operation_id,
+        operationDeadlineMs: row.operation_deadline_ms,
+        intent: {
+          articleId: result.articleId,
+          usePolicy: result.usePolicy,
+          expectedMetadataRevision: result.metadataRevision - 1,
+        },
+      };
+      if (row.payload_hash !== (await computeSilverPolicyPayloadHash(command)))
+        throw err("corrupt_state");
+      const envelope = parseKnowledgeEnvelope(await writer.apply(command));
+      if (!envelope.ok) throw err(envelope.code);
+      const latest = parseSilverPolicySavedResult(envelope.value, command);
+      if (JSON.stringify(latest) !== JSON.stringify(result)) throw err("integrity_failure");
+      await this.#clearSilverPolicyReservation(account, managerId, command);
+      return;
+    }
+    if (row.status !== "pending_approval" && row.status !== "applying")
+      throw err(row.status === "rejecting" ? "result_unknown" : "invalid_input");
+    if (typeof row.command_json !== "string" || row.command_json.length === 0)
+      throw err("corrupt_state");
+    let command = await this.#validateSilverPolicyStage(row, actionId, this.ctx.id.toString());
+    if (row.status === "pending_approval") {
+      const operationDeadlineMs =
+        command.operationDeadlineMs === 0
+          ? Date.now() + KNOWLEDGE_BRONZE_ADMISSION_WINDOW_MS
+          : command.operationDeadlineMs;
+      if (!Number.isSafeInteger(operationDeadlineMs) || operationDeadlineMs < 1)
+        throw err("invalid_input");
+      command = { ...command, operationDeadlineMs };
+      const started = this.ctx.storage.sql.exec(
+        `UPDATE custom_gatekeeper_article_actions
+         SET status = 'applying', operation_deadline_ms = ?, command_json = ?
+         WHERE local_action_id = ? AND status = 'pending_approval'`,
+        operationDeadlineMs,
+        JSON.stringify(command),
+        actionId,
+      );
+      if (started.rowsWritten !== 1) throw err("result_unknown");
+    } else if (
+      !boundedInt(command.operationDeadlineMs, 1, Number.MAX_SAFE_INTEGER) ||
+      row.operation_deadline_ms !== command.operationDeadlineMs
+    ) {
+      throw err("corrupt_state");
+    }
+
+    await this.#activateSilverPolicyReservation(account, managerId, command);
+    const envelope = parseKnowledgeEnvelope(await writer.apply(command));
+    if (!envelope.ok) {
+      if (envelope.code !== "result_unknown" && envelope.code !== "corrupt_state") {
+        this.ctx.storage.sql.exec(
+          `UPDATE custom_gatekeeper_article_actions SET status = 'pending_approval'
+           WHERE local_action_id = ? AND status = 'applying'`,
+          actionId,
+        );
+      }
+      throw err(envelope.code);
+    }
+    const result = parseSilverPolicySavedResult(envelope.value, command);
+    const completed = this.ctx.storage.sql.exec(
+      `UPDATE custom_gatekeeper_article_actions
+       SET status = 'applied', command_json = '', outcome_json = ?
+       WHERE local_action_id = ? AND status = 'applying'`,
+      JSON.stringify(result),
+      actionId,
+    );
+    if (completed.rowsWritten !== 1) throw err("result_unknown");
+    await this.#clearSilverPolicyReservation(account, managerId, command);
   }
 
   async #applyBronzeAction(actionId: number): Promise<void> {
     const rows = this.ctx.storage.sql
       .exec<{
+        kind: string;
         operation_id: string;
         workspace_id: string | null;
         operation_deadline_ms: number | null;
         command_json: string;
+        payload_hash: string;
         status: string;
         outcome_json: string | null;
       }>(
-        `SELECT operation_id, workspace_id, operation_deadline_ms, command_json, status, outcome_json
+        `SELECT kind, operation_id, workspace_id, operation_deadline_ms, command_json, payload_hash, status, outcome_json
          FROM custom_gatekeeper_article_actions WHERE local_action_id = ?`,
         actionId,
       )
@@ -1525,6 +2675,7 @@ export class CustomGatekeeper
     if (rows.length === 0) throw err("invalid_input");
     if (rows.length !== 1) throw err("corrupt_state");
     const row = rows[0]!;
+    if (row.kind === "silver_policy") return this.#applySilverPolicyAction(actionId, row);
     const managerId = validateProps(this.ctx.props).managerId;
     if (!isNonEmptyBoundedText(row.workspace_id, 512)) throw err("corrupt_state");
     const namespace: KnowledgeBronzeNamespace = {
@@ -1535,7 +2686,9 @@ export class CustomGatekeeper
     const account = this.#accountAccess();
     const { writer } = await account.getBronzeCapabilities(managerId);
     if (row.status === "applied") {
-      const envelope = parseKnowledgeEnvelope(await writer.apply({ kind: "saved_retry", namespace }));
+      const envelope = parseKnowledgeEnvelope(
+        await writer.apply({ kind: "saved_retry", namespace }),
+      );
       if (!envelope.ok) throw err(envelope.code);
       const receipt = parseBronzeSavedReceipt(envelope.value, row.operation_id);
       const recorded = parseStoredBronzeSavedReceipt(row.outcome_json, row.operation_id);
@@ -1543,8 +2696,10 @@ export class CustomGatekeeper
         receipt.articleId !== recorded.articleId ||
         receipt.revisionId !== recorded.revisionId ||
         receipt.bodyHash !== recorded.bodyHash
-      ) throw err("integrity_failure");
-      if (!boundedInt(row.operation_deadline_ms, 1, Number.MAX_SAFE_INTEGER)) throw err("corrupt_state");
+      )
+        throw err("integrity_failure");
+      if (!boundedInt(row.operation_deadline_ms, 1, Number.MAX_SAFE_INTEGER))
+        throw err("corrupt_state");
       await account.clearBronzeAction(managerId, {
         ...namespace,
         operationId: row.operation_id,
@@ -1565,9 +2720,13 @@ export class CustomGatekeeper
     if (command.namespace.workspaceId !== namespace.workspaceId) throw err("corrupt_state");
     if (row.status === "pending_approval") {
       if (row.operation_deadline_ms !== command.operationDeadlineMs) throw err("corrupt_state");
-      const operationDeadlineMs = command.operationDeadlineMs === 0
-        ? Date.now() + KNOWLEDGE_BRONZE_ADMISSION_WINDOW_MS
-        : command.operationDeadlineMs;
+      if (!isV2KnowledgeStagedCommand(command)) {
+        await assertLegacyBronzeAdmissionExists(writer, namespace);
+      }
+      const operationDeadlineMs =
+        command.operationDeadlineMs === 0
+          ? Date.now() + KNOWLEDGE_BRONZE_ADMISSION_WINDOW_MS
+          : command.operationDeadlineMs;
       if (!Number.isSafeInteger(operationDeadlineMs) || operationDeadlineMs < 1)
         throw err("invalid_input");
       command = { ...command, operationDeadlineMs };
@@ -1579,8 +2738,10 @@ export class CustomGatekeeper
         actionId,
       );
       if (started.rowsWritten !== 1) throw err("result_unknown");
-    } else if (!boundedInt(command.operationDeadlineMs, 1, Number.MAX_SAFE_INTEGER) ||
-        row.operation_deadline_ms !== command.operationDeadlineMs) {
+    } else if (
+      !boundedInt(command.operationDeadlineMs, 1, Number.MAX_SAFE_INTEGER) ||
+      row.operation_deadline_ms !== command.operationDeadlineMs
+    ) {
       throw err("corrupt_state");
     }
     await account.activateBronzeAction(
@@ -1608,8 +2769,9 @@ export class CustomGatekeeper
     if (
       receipt.articleId !== command.intent.articleId ||
       receipt.revisionId !== command.intent.revisionId ||
-      receipt.bodyHash !== await sha256Hex(new TextEncoder().encode(command.intent.body))
-    ) throw err("integrity_failure");
+      receipt.bodyHash !== (await sha256Hex(new TextEncoder().encode(command.intent.body)))
+    )
+      throw err("integrity_failure");
     const completed = this.ctx.storage.sql.exec(
       `UPDATE custom_gatekeeper_article_actions SET status = 'applied', command_json = '', outcome_json = ?
        WHERE local_action_id = ? AND status = 'applying'`,
@@ -1623,24 +2785,156 @@ export class CustomGatekeeper
       operationDeadlineMs: command.operationDeadlineMs,
     });
   }
+
+  async #rejectSilverPolicyAction(actionId: number, row: KnowledgeArticleActionRow): Promise<void> {
+    if (row.status === "rejected") return;
+    if (row.status === "applied") {
+      await this.#applySilverPolicyAction(actionId, row);
+      throw err("conflict");
+    }
+    if (
+      row.status !== "pending_approval" &&
+      row.status !== "applying" &&
+      row.status !== "rejecting"
+    )
+      throw err("corrupt_state");
+    if (typeof row.command_json !== "string" || row.command_json.length === 0)
+      throw err("corrupt_state");
+
+    if (row.status === "pending_approval" || row.status === "applying") {
+      const claimed = this.ctx.storage.sql.exec(
+        `UPDATE custom_gatekeeper_article_actions SET status = 'rejecting'
+         WHERE local_action_id = ? AND status = ?`,
+        actionId,
+        row.status,
+      );
+      if (claimed.rowsWritten !== 1) return this.rejectAction(actionId);
+    }
+
+    const command = await this.#validateSilverPolicyStage(row, actionId, this.ctx.id.toString());
+    const managerId = validateProps(this.ctx.props).managerId;
+    const account = this.#accountAccess();
+
+    if (command.operationDeadlineMs === 0) {
+      // The deadline-zero sentinel proves no Knowledge callback was dispatched. Close the
+      // exact native reservation without creating a Knowledge fence or receipt.
+      await this.#clearSilverPolicyReservation(account, managerId, command);
+      const rejected = this.ctx.storage.sql.exec(
+        `UPDATE custom_gatekeeper_article_actions
+         SET status = 'rejected', command_json = '', outcome_json = ?
+         WHERE local_action_id = ? AND status = 'rejecting'`,
+        JSON.stringify({ status: "rejected", operationId: command.operationId }),
+        actionId,
+      );
+      if (rejected.rowsWritten !== 1) throw err("result_unknown");
+      return;
+    }
+
+    const { writer } = await account.getBronzeCapabilities(managerId);
+    if (Date.now() >= command.operationDeadlineMs) {
+      // The fixed callback window is over. Recheck the same full command: an exact saved
+      // receipt is an applied operation, while a typed conflict proves this operation can no
+      // longer commit. Unknown and dependency failures retain the Action and its reservation.
+      const envelope = parseKnowledgeEnvelope(await writer.apply(command));
+      if (envelope.ok) {
+        const result = parseSilverPolicySavedResult(envelope.value, command);
+        const completed = this.ctx.storage.sql.exec(
+          `UPDATE custom_gatekeeper_article_actions
+           SET status = 'applied', command_json = '', outcome_json = ?
+           WHERE local_action_id = ? AND status = 'rejecting'`,
+          JSON.stringify(result),
+          actionId,
+        );
+        if (completed.rowsWritten !== 1) throw err("result_unknown");
+        await this.#clearSilverPolicyReservation(account, managerId, command);
+        // A native reject must not make a saved exact policy update appear discarded.
+        throw err("conflict");
+      }
+      if (envelope.code !== "conflict") throw err(envelope.code);
+      await this.#clearSilverPolicyReservation(account, managerId, command);
+      const rejected = this.ctx.storage.sql.exec(
+        `UPDATE custom_gatekeeper_article_actions
+         SET status = 'rejected', command_json = '', outcome_json = ?
+         WHERE local_action_id = ? AND status = 'rejecting'`,
+        JSON.stringify({ status: "rejected", operationId: command.operationId }),
+        actionId,
+      );
+      if (rejected.rowsWritten !== 1) {
+        const current = this.ctx.storage.sql
+          .exec<{ status: string }>(
+            `SELECT status FROM custom_gatekeeper_article_actions WHERE local_action_id = ?`,
+            actionId,
+          )
+          .toArray();
+        if (current.length === 1 && current[0]!.status === "rejected") return;
+        throw err("result_unknown");
+      }
+      return;
+    }
+
+    const fenceCommand: KnowledgeSilverPolicyFenceCommand = {
+      ...command,
+      kind: "silver_policy_fence",
+    };
+    const envelope = parseKnowledgeEnvelope(await writer.cancel(fenceCommand));
+    if (!envelope.ok) {
+      if (envelope.code === "conflict") {
+        this.ctx.storage.sql.exec(
+          `UPDATE custom_gatekeeper_article_actions SET status = 'applying'
+           WHERE local_action_id = ? AND status = 'rejecting'`,
+          actionId,
+        );
+      }
+      throw err(envelope.code);
+    }
+    if (
+      !rec(envelope.value) ||
+      !exact(envelope.value, ["status", "operationId"]) ||
+      envelope.value.status !== "fenced" ||
+      envelope.value.operationId !== command.operationId
+    )
+      throw err("integrity_failure");
+    await this.#clearSilverPolicyReservation(account, managerId, command);
+    const rejected = this.ctx.storage.sql.exec(
+      `UPDATE custom_gatekeeper_article_actions
+       SET status = 'rejected', command_json = '', outcome_json = ?
+       WHERE local_action_id = ? AND status = 'rejecting'`,
+      JSON.stringify(envelope.value),
+      actionId,
+    );
+    if (rejected.rowsWritten !== 1) {
+      const current = this.ctx.storage.sql
+        .exec<{ status: string }>(
+          `SELECT status FROM custom_gatekeeper_article_actions WHERE local_action_id = ?`,
+          actionId,
+        )
+        .toArray();
+      if (current.length === 1 && current[0]!.status === "rejected") return;
+      throw err("result_unknown");
+    }
+  }
+
   async rejectAction(actionId: number): Promise<void> {
     if (!boundedInt(actionId, 0, Number.MAX_SAFE_INTEGER)) throw err("invalid_input");
     const bronzeRows = this.ctx.storage.sql
       .exec<{
+        kind: string;
         operation_id: string;
         workspace_id: string | null;
         operation_deadline_ms: number | null;
         command_json: string;
+        payload_hash: string;
         status: string;
         outcome_json: string | null;
       }>(
-        `SELECT operation_id, workspace_id, operation_deadline_ms, command_json, status, outcome_json
+        `SELECT kind, operation_id, workspace_id, operation_deadline_ms, command_json, payload_hash, status, outcome_json
          FROM custom_gatekeeper_article_actions WHERE local_action_id = ?`,
         actionId,
       )
       .toArray();
     if (bronzeRows.length > 1) throw err("corrupt_state");
     const bronze = bronzeRows[0];
+    if (bronze?.kind === "silver_policy") return this.#rejectSilverPolicyAction(actionId, bronze);
     if (bronze !== undefined) {
       const managerId = validateProps(this.ctx.props).managerId;
       if (!isNonEmptyBoundedText(bronze.workspace_id, 512)) throw err("corrupt_state");
@@ -1661,14 +2955,26 @@ export class CustomGatekeeper
         const { writer } = await account.getBronzeCapabilities(managerId);
         const envelope = parseKnowledgeEnvelope(await writer.cancel({ kind: "lookup", namespace }));
         if (!envelope.ok) throw err(envelope.code);
-        if (rec(envelope.value) && exact(envelope.value, ["status"]) && envelope.value.status === "clear") return;
         if (
-          rec(envelope.value) && exact(envelope.value, ["status", "operationId"]) &&
-          envelope.value.status === "fenced" && envelope.value.operationId === bronze.operation_id
-        ) return;
+          rec(envelope.value) &&
+          exact(envelope.value, ["status"]) &&
+          envelope.value.status === "clear"
+        )
+          return;
+        if (
+          rec(envelope.value) &&
+          exact(envelope.value, ["status", "operationId"]) &&
+          envelope.value.status === "fenced" &&
+          envelope.value.operationId === bronze.operation_id
+        )
+          return;
         throw err("integrity_failure");
       }
-      if (bronze.status !== "pending_approval" && bronze.status !== "applying" && bronze.status !== "rejecting")
+      if (
+        bronze.status !== "pending_approval" &&
+        bronze.status !== "applying" &&
+        bronze.status !== "rejecting"
+      )
         throw err("integrity_failure");
 
       // Claim cancellation synchronously before any RPC/await. An approval callback that read
@@ -1690,7 +2996,10 @@ export class CustomGatekeeper
         this.ctx.id.toString(),
         managerId,
       );
-      if (command.operationId !== bronze.operation_id || command.namespace.workspaceId !== namespace.workspaceId)
+      if (
+        command.operationId !== bronze.operation_id ||
+        command.namespace.workspaceId !== namespace.workspaceId
+      )
         throw err("corrupt_state");
       if (bronze.operation_deadline_ms !== command.operationDeadlineMs) throw err("corrupt_state");
       const account = this.#accountAccess();
@@ -1698,10 +3007,10 @@ export class CustomGatekeeper
       let envelope: ReturnType<typeof parseKnowledgeEnvelope> | undefined;
       let durableFenceProof = false;
       if (command.operationDeadlineMs === 0) {
-      // `bronze` is the pre-CAS snapshot. A first rejection reaches this branch with
-      // `pending_approval`; the durable row is already `rejecting` after the synchronous claim.
-      if (bronze.status !== "pending_approval" && bronze.status !== "rejecting")
-        throw err("corrupt_state");
+        // `bronze` is the pre-CAS snapshot. A first rejection reaches this branch with
+        // `pending_approval`; the durable row is already `rejecting` after the synchronous claim.
+        if (bronze.status !== "pending_approval" && bronze.status !== "rejecting")
+          throw err("corrupt_state");
         envelope = parseKnowledgeEnvelope(await writer.cancel({ kind: "lookup", namespace }));
       } else if (bronze.status === "rejecting") {
         // A prior cancellation may have committed its Knowledge fence but lost the callback
@@ -1717,7 +3026,8 @@ export class CustomGatekeeper
           operationId: command.operationId,
           operationDeadlineMs: command.operationDeadlineMs,
         };
-        const matchingActiveReservation = accountReservation !== undefined &&
+        const matchingActiveReservation =
+          accountReservation !== undefined &&
           accountReservation.status === "active" &&
           accountReservation.workspaceId === binding.workspaceId &&
           accountReservation.gatekeeperInstanceId === binding.gatekeeperInstanceId &&
@@ -1726,15 +3036,23 @@ export class CustomGatekeeper
           (accountReservation.operationDeadlineMs === binding.operationDeadlineMs ||
             accountReservation.operationDeadlineMs === 0);
         if (
-          accountReservation !== undefined && accountReservation.status === "fenced" &&
+          accountReservation !== undefined &&
+          accountReservation.status === "fenced" &&
           sameBronzeReservation(accountReservation, binding)
         ) {
           if (Date.now() >= command.operationDeadlineMs) {
-            const lookup = parseKnowledgeEnvelope(await writer.cancel({ kind: "lookup", namespace }));
+            const lookup = parseKnowledgeEnvelope(
+              await writer.cancel({ kind: "lookup", namespace }),
+            );
             if (!lookup.ok) throw err(lookup.code);
-            if (!(
-              rec(lookup.value) && exact(lookup.value, ["status"]) && lookup.value.status === "clear"
-            )) throw err("result_unknown");
+            if (
+              !(
+                rec(lookup.value) &&
+                exact(lookup.value, ["status"]) &&
+                lookup.value.status === "clear"
+              )
+            )
+              throw err("result_unknown");
           }
           // Account's fenced state is written only after the trusted writer confirms its
           // durable Knowledge fence. At expiry, the trusted clear lookup above also releases
@@ -1745,26 +3063,26 @@ export class CustomGatekeeper
           // The earlier attempt may have committed Account activation but lost its response
           // before sending staged_fence. Re-send the same trusted fence command directly;
           // Knowledge resolves object_unknown durably, and the fence operation is idempotent.
-          await account.activateBronzeAction(managerId, {
-            workspaceId: command.namespace.workspaceId,
-            gatekeeperInstanceId: command.namespace.gatekeeperInstanceId,
-            localActionId: command.namespace.localActionId,
-            operationId: command.operationId,
-          }, command.operationDeadlineMs);
-          envelope = parseKnowledgeEnvelope(await writer.cancel({
-            kind: "staged_fence",
-            namespace: command.namespace,
-            operationId: command.operationId,
-            attemptFencingToken: command.attemptFencingToken,
-            operationDeadlineMs: command.operationDeadlineMs,
-            fullIntentHash: command.fullIntentHash,
-            intent: command.intent,
-          }));
+          await account.activateBronzeAction(
+            managerId,
+            {
+              workspaceId: command.namespace.workspaceId,
+              gatekeeperInstanceId: command.namespace.gatekeeperInstanceId,
+              localActionId: command.namespace.localActionId,
+              operationId: command.operationId,
+            },
+            command.operationDeadlineMs,
+          );
+          envelope = parseKnowledgeEnvelope(
+            await writer.cancel(knowledgeStagedFenceCommand(command)),
+          );
         } else {
           const lookup = parseKnowledgeEnvelope(await writer.cancel({ kind: "lookup", namespace }));
           if (!lookup.ok) throw err(lookup.code);
           if (
-            rec(lookup.value) && exact(lookup.value, ["status"]) && lookup.value.status === "clear" &&
+            rec(lookup.value) &&
+            exact(lookup.value, ["status"]) &&
+            lookup.value.status === "clear" &&
             Date.now() >= command.operationDeadlineMs
           ) {
             // After expiry a trusted clear lookup proves Knowledge has no saved or active write.
@@ -1772,26 +3090,28 @@ export class CustomGatekeeper
             // remains untouched while this old native action can finish as rejected.
             envelope = lookup;
           } else if (
-            rec(lookup.value) && exact(lookup.value, ["status"]) && lookup.value.status === "clear"
+            rec(lookup.value) &&
+            exact(lookup.value, ["status"]) &&
+            lookup.value.status === "clear"
           ) {
-            await account.activateBronzeAction(managerId, {
-              workspaceId: command.namespace.workspaceId,
-              gatekeeperInstanceId: command.namespace.gatekeeperInstanceId,
-              localActionId: command.namespace.localActionId,
-              operationId: command.operationId,
-            }, command.operationDeadlineMs);
-            envelope = parseKnowledgeEnvelope(await writer.cancel({
-              kind: "staged_fence",
-              namespace: command.namespace,
-              operationId: command.operationId,
-              attemptFencingToken: command.attemptFencingToken,
-              operationDeadlineMs: command.operationDeadlineMs,
-              fullIntentHash: command.fullIntentHash,
-              intent: command.intent,
-            }));
+            await account.activateBronzeAction(
+              managerId,
+              {
+                workspaceId: command.namespace.workspaceId,
+                gatekeeperInstanceId: command.namespace.gatekeeperInstanceId,
+                localActionId: command.namespace.localActionId,
+                operationId: command.operationId,
+              },
+              command.operationDeadlineMs,
+            );
+            envelope = parseKnowledgeEnvelope(
+              await writer.cancel(knowledgeStagedFenceCommand(command)),
+            );
           } else if (
-            rec(lookup.value) && exact(lookup.value, ["status", "operationId"]) &&
-            lookup.value.status === "fenced" && lookup.value.operationId === command.operationId
+            rec(lookup.value) &&
+            exact(lookup.value, ["status", "operationId"]) &&
+            lookup.value.status === "fenced" &&
+            lookup.value.operationId === command.operationId
           ) {
             envelope = lookup;
             durableFenceProof = true;
@@ -1800,21 +3120,19 @@ export class CustomGatekeeper
           }
         }
       } else {
-        await account.activateBronzeAction(managerId, {
-          workspaceId: command.namespace.workspaceId,
-          gatekeeperInstanceId: command.namespace.gatekeeperInstanceId,
-          localActionId: command.namespace.localActionId,
-          operationId: command.operationId,
-        }, command.operationDeadlineMs);
-        envelope = parseKnowledgeEnvelope(await writer.cancel({
-          kind: "staged_fence",
-          namespace: command.namespace,
-          operationId: command.operationId,
-          attemptFencingToken: command.attemptFencingToken,
-          operationDeadlineMs: command.operationDeadlineMs,
-          fullIntentHash: command.fullIntentHash,
-          intent: command.intent,
-        }));
+        await account.activateBronzeAction(
+          managerId,
+          {
+            workspaceId: command.namespace.workspaceId,
+            gatekeeperInstanceId: command.namespace.gatekeeperInstanceId,
+            localActionId: command.namespace.localActionId,
+            operationId: command.operationId,
+          },
+          command.operationDeadlineMs,
+        );
+        envelope = parseKnowledgeEnvelope(
+          await writer.cancel(knowledgeStagedFenceCommand(command)),
+        );
       }
       if (envelope === undefined) throw err("integrity_failure");
       if (!envelope.ok) {
@@ -1829,8 +3147,10 @@ export class CustomGatekeeper
       }
       let outcome: unknown;
       if (
-        rec(envelope.value) && exact(envelope.value, ["status", "operationId"]) &&
-        envelope.value.status === "fenced" && envelope.value.operationId === command.operationId
+        rec(envelope.value) &&
+        exact(envelope.value, ["status", "operationId"]) &&
+        envelope.value.status === "fenced" &&
+        envelope.value.operationId === command.operationId
       ) {
         outcome = envelope.value;
         if (command.operationDeadlineMs > 0 && !durableFenceProof) {
@@ -1840,7 +3160,11 @@ export class CustomGatekeeper
             operationDeadlineMs: command.operationDeadlineMs,
           });
         }
-      } else if (rec(envelope.value) && exact(envelope.value, ["status"]) && envelope.value.status === "clear") {
+      } else if (
+        rec(envelope.value) &&
+        exact(envelope.value, ["status"]) &&
+        envelope.value.status === "clear"
+      ) {
         outcome = envelope.value;
         await account.clearBronzeAction(managerId, {
           ...command.namespace,
@@ -1880,8 +3204,7 @@ export class CustomGatekeeper
         )
         .toArray(),
     );
-    if (matches.filter((rows) => rows.length > 0).length > 1)
-      throw err("integrity_failure");
+    if (matches.filter((rows) => rows.length > 0).length > 1) throw err("integrity_failure");
     const [rows] = matches.filter((found) => found.length > 0);
     const row = rows?.[0];
     if (row === undefined) {
@@ -1901,7 +3224,11 @@ export class CustomGatekeeper
       };
       const envelope = parseKnowledgeEnvelope(await writer.cancel({ kind: "lookup", namespace }));
       if (!envelope.ok) throw err(envelope.code);
-      if (rec(envelope.value) && exact(envelope.value, ["status"]) && envelope.value.status === "clear") {
+      if (
+        rec(envelope.value) &&
+        exact(envelope.value, ["status"]) &&
+        envelope.value.status === "clear"
+      ) {
         if (reservation.status === "active") {
           await account.clearBronzeAction(managerId, {
             ...namespace,
@@ -1912,8 +3239,10 @@ export class CustomGatekeeper
         return;
       }
       if (
-        rec(envelope.value) && exact(envelope.value, ["status", "operationId"]) &&
-        envelope.value.status === "fenced" && envelope.value.operationId === reservation.operationId
+        rec(envelope.value) &&
+        exact(envelope.value, ["status", "operationId"]) &&
+        envelope.value.status === "fenced" &&
+        envelope.value.operationId === reservation.operationId
       ) {
         if (reservation.status === "active") {
           await account.fenceBronzeAction(managerId, {
@@ -1934,8 +3263,7 @@ export class CustomGatekeeper
       );
       return;
     }
-    if (row.status === "applying" || row.status === "applied")
-      throw err("outcome_unknown");
+    if (row.status === "applying" || row.status === "applied") throw err("outcome_unknown");
     if (row.status === "failed") return;
     throw err("integrity_failure");
   }
@@ -1947,14 +3275,12 @@ export class CustomGatekeeper
       {
         id: "knowledge-base",
         title: "Knowledge Base",
-        description: "Available. Use list, search, and read to inspect Knowledge pages, or proposeArticle to request an owner-reviewed article save.",
+        description:
+          "Available. Use list, search, and read to inspect Knowledge pages, or proposeArticle to request an owner-reviewed article save.",
       },
     ]);
   }
-  async addObserver(
-    _observerId: string,
-    _user: Fetcher<GatekeeperUserVerifier>,
-  ) {
+  async addObserver(_observerId: string, _user: Fetcher<GatekeeperUserVerifier>) {
     throw new Error("Knowledge Base is private to its Manager.");
   }
   async removeObserver() {}
@@ -1963,10 +3289,7 @@ export class CustomGatekeeper
   }
 }
 @validateRpc()
-export class CustomAccount
-  extends WorkerEntrypoint<Cloudflare.Env>
-  implements GatekeeperUser
-{
+export class CustomAccount extends WorkerEntrypoint<Cloudflare.Env> implements GatekeeperUser {
   async describe(): Promise<AccountDescription> {
     return describeCustomAccount();
   }
@@ -1977,22 +3300,23 @@ export class CustomAccount
   async inspectManagerBinding(
     managerIdValue: string,
   ): Promise<"legacy" | "bound" | "incompatible"> {
-    if (!isManagerId(managerIdValue))
-      throw new TypeError("Manager ID must be a UUID.");
+    if (!isManagerId(managerIdValue)) throw new TypeError("Manager ID must be a UUID.");
     if (legacyProps(this.ctx.props)) return "legacy";
     const previous = this.ctx.props;
     if (rec(previous) && exact(previous, ["access"]) && previous.access) {
       // The OS atomically replaces legacy accounts. Validate the old binding first.
-      await validateStub<InspectableAccess>(previous.access as object)
-        .assertBoundTo(managerIdValue);
+      await validateStub<InspectableAccess>(previous.access as object).assertBoundTo(
+        managerIdValue,
+      );
       return "legacy";
     }
     const p = validateProps(this.ctx.props);
     if (p.managerId !== managerIdValue)
       throw new TypeError("Knowledge Account is bound to another Manager.");
     const access = await this.ctx.exports.KnowledgeAccountAccess.getByName(p.managerId).getAccess();
-    const contract = await validateStub<InspectableAccess>(access as object)
-      .assertBoundTo(managerIdValue);
+    const contract = await validateStub<InspectableAccess>(access as object).assertBoundTo(
+      managerIdValue,
+    );
     return contract === KNOWLEDGE_READ_CONTRACT ? "bound" : "incompatible";
   }
   @skipRpcValidation() async inspectBronzeRoles(
@@ -2001,8 +3325,9 @@ export class CustomAccount
     const p = validateProps(this.ctx.props);
     if (!isManagerId(managerIdValue) || p.managerId !== managerIdValue)
       throw new TypeError("Knowledge account is bound to another Manager.");
-    return this.ctx.exports.KnowledgeAccountAccess.getByName(managerIdValue)
-      .inspectBronzeRoles(managerIdValue);
+    return this.ctx.exports.KnowledgeAccountAccess.getByName(managerIdValue).inspectBronzeRoles(
+      managerIdValue,
+    );
   }
   @skipRpcValidation() async installBronzeRoles(
     managerIdValue: string,
@@ -2015,9 +3340,7 @@ export class CustomAccount
     const access = this.ctx.exports.KnowledgeAccountAccess.getByName(managerIdValue);
     await access.bindBronzeRoles(managerIdValue, writer, sourceReader);
   }
-  async getSingletonGatekeeperClass(): Promise<
-    DurableObjectClass<Gatekeeper<KnowledgeBase>>
-  > {
+  async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<KnowledgeBase>>> {
     return this.ctx.exports.CustomGatekeeper({ props: validateProps(this.ctx.props) });
   }
   async getSupportedResources(): Promise<SupportedResource[]> {
@@ -2039,9 +3362,7 @@ export class CustomAccount
   async getAuthenticatedEmail() {
     return null;
   }
-  @skipRpcValidation() async getVerifier(): Promise<
-    Fetcher<GatekeeperUserVerifier>
-  > {
+  @skipRpcValidation() async getVerifier(): Promise<Fetcher<GatekeeperUserVerifier>> {
     return this.ctx.exports.CustomVerifier({});
   }
 }
@@ -2061,8 +3382,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
     managerId: string,
     capability: KnowledgeAccess,
   ): Promise<Fetcher<GatekeeperUser>> {
-    if (!isManagerId(managerId))
-      throw new TypeError("Manager ID must be a UUID.");
+    if (!isManagerId(managerId)) throw new TypeError("Manager ID must be a UUID.");
     await this.ctx.exports.KnowledgeAccountAccess.getByName(managerId).bind(managerId, capability);
     return this.ctx.exports.CustomAccount({ props: { managerId } });
   }
@@ -2070,9 +3390,7 @@ export class GatekeeperVendor extends WorkerEntrypoint<Cloudflare.Env> {
     _c: Fetcher<GatekeeperConnectCallback>,
     _o?: GatekeeperConnectOptions,
   ): Promise<{ url: string }> {
-    throw new Error(
-      "Knowledge Base is installed by the Manager runtime and has no connect flow.",
-    );
+    throw new Error("Knowledge Base is installed by the Manager runtime and has no connect flow.");
   }
   async getSupportedResources(): Promise<SupportedResource[]> {
     return [];
@@ -2089,6 +3407,14 @@ export type KnowledgeBase = {
     status: "pending_approval";
     operationId: string;
   }>;
+  proposeArticlePolicy(input: {
+    articleId: string;
+    usePolicy: "included" | "excluded";
+    expectedMetadataRevision: number;
+  }): Promise<{
+    status: "pending_approval";
+    operationId: string;
+  }>;
 };
 export type KnowledgeListResult = {
   bundleId: string;
@@ -2096,16 +3422,121 @@ export type KnowledgeListResult = {
   items: Array<{ path: string }>;
   nextOffset?: number;
 };
-export type KnowledgeSearchResult = {
+type KnowledgeSilverFacetCoverage = {
+  status: "complete" | "partial";
+  reasons: string[];
+};
+type KnowledgeSilverSearchCoverage = {
+  metadata: KnowledgeSilverFacetCoverage;
+  internalLinks: KnowledgeSilverFacetCoverage;
+  sources: KnowledgeSilverFacetCoverage;
+};
+type KnowledgeSilverMetadataUnknownCoverage = KnowledgeSilverSearchCoverage & {
+  metadata: { status: "partial"; reasons: string[] };
+};
+type KnowledgeSilverProjectionLink =
+  | {
+      rawDestination: string;
+      targetPath: string;
+      fragment: string | null;
+      resolution: "resolved_current";
+      targetArticleId: string;
+    }
+  | {
+      rawDestination: string;
+      targetPath: string;
+      fragment: string | null;
+      resolution: "resolved_exact";
+      targetArticleId: string;
+      targetRevisionId: string;
+      targetBodyHash: string;
+    }
+  | {
+      rawDestination: string;
+      targetPath: string;
+      fragment: string | null;
+      resolution: "unresolved" | "external_or_scope";
+    };
+type KnowledgeSilverProjectionSource =
+  | { descriptor: unknown; resolution: "resolved_current"; targetArticleId: string }
+  | {
+      descriptor: unknown;
+      resolution: "resolved_exact";
+      targetArticleId: string;
+      targetRevisionId: string;
+      targetBodyHash: string;
+    }
+  | { descriptor: unknown; resolution: "unresolved" | "external_or_scope" };
+type KnowledgeSilverProjectionResult = {
+  articleId: string;
+  inputRevisionId: string;
+  projectionRuleVersion: string;
+  processedVersion: string;
+  relationVersion: string;
+  metadata: Record<string, unknown> | null;
+  literalLinks: KnowledgeSilverProjectionLink[];
+  backlinks: Array<{
+    sourceArticleId: string;
+    sourceRevisionId: string;
+    targetRevisionId: string | null;
+    targetBodyHash: string | null;
+  }>;
+  sources: KnowledgeSilverProjectionSource[];
+  coverage: KnowledgeSilverSearchCoverage;
+};
+type KnowledgeArticleSearchItemCommon = {
+  articleId: string;
+  currentRevisionId: string;
+  usePolicy: "included";
+  currentPath: string;
+  exactRevisionPath: string;
+  bodyHash: string;
+  coverage: KnowledgeSilverSearchCoverage;
+};
+type KnowledgeArticleSearchItem =
+  | (KnowledgeArticleSearchItemCommon & {
+      state: "indexed";
+      projection: KnowledgeSilverProjectionResult;
+    })
+  | (Omit<KnowledgeArticleSearchItemCommon, "coverage"> & {
+      state: "metadata_unknown";
+      projection: KnowledgeSilverProjectionResult;
+      coverage: KnowledgeSilverMetadataUnknownCoverage;
+    })
+  | (KnowledgeArticleSearchItemCommon & { state: "pending"; projection: null });
+type KnowledgeComputerSearchResult = {
   bundleId: string;
   versionId: string;
   hits: Array<{ path: string; line: number; snippet: string }>;
   nextOffset?: number;
 };
-export type KnowledgeReadResult = {
-  bundleId: string;
-  versionId: string;
-  path: string;
-  sourceMarkdown: string;
-  metadata: Record<string, unknown>;
-};
+export type KnowledgeSearchResult =
+  | KnowledgeComputerSearchResult
+  | {
+      kind: "articles";
+      items: KnowledgeArticleSearchItem[];
+      nextCursor?: string;
+      coverage: KnowledgeSilverSearchCoverage;
+    }
+  | {
+      kind: "article-links";
+      items: Array<{ depth: number; item: KnowledgeArticleSearchItem }>;
+      coverage: KnowledgeSilverSearchCoverage;
+    };
+export type KnowledgeReadResult =
+  | {
+      bundleId: string;
+      versionId: string;
+      path: string;
+      sourceMarkdown: string;
+      metadata: Record<string, unknown>;
+    }
+  | {
+      kind: "article";
+      articleId: string;
+      revisionId: string;
+      bodyHash: string;
+      path: string;
+      sourceMarkdown: string;
+      metadata: Record<string, unknown>;
+    };
