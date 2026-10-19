@@ -2926,10 +2926,21 @@ export class CustomGatekeeper
     const supportedTransition =
       (intent.operation === "stop" &&
         initialHead.mode === "enabled" &&
-        (initialHead.job.state === "running" || initialHead.job.state === "dirty")) ||
+        [
+          "clean",
+          "dirty",
+          "running",
+          "candidate",
+          "partial",
+          "published",
+          "retry_wait",
+          "budget_wait",
+          "needs_reconciliation",
+        ].includes(initialHead.job.state)) ||
       (intent.operation === "resume" &&
         initialHead.mode === "paused" &&
-        initialHead.job.state === "paused_user");
+        (initialHead.job.state === "paused_user" ||
+          initialHead.job.state === "paused_deterministic"));
     if (!supportedTransition) throw err("conflict");
     const previous = await account.findKnowledgeSafeControlReservation(managerId, target);
     const namespace: KnowledgeBronzeNamespace = {
