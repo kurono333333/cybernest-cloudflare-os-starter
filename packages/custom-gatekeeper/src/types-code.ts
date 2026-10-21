@@ -32,7 +32,28 @@ type KnowledgeGoldJobControlIntent = {
   expectedJobState: "disabled" | "clean" | "dirty" | "running" | "candidate" | "published" | "partial" | "retry_wait" | "budget_wait" | "paused_user" | "paused_deterministic" | "paused_unknown" | "needs_reconciliation";
   expectedJobFence: number;
   expectedControlRevision: number;
+  system1Recovery?: { decisionKeyHash: string; expectedRequestId: string; additionalMaxMicroUsd: 5000; };
 };
+type KnowledgeGoldPageSourceContextEntry = {
+  articleId: string;
+  revisionId: string;
+  bodyHash: string;
+  metadataRevision: number;
+  projectionVersions: {
+    projectionRuleVersion: string;
+    processedVersion: string;
+    relationVersion: string;
+  };
+};
+type KnowledgeGoldPageActionIntent = {
+  path: string;
+  pageId: string;
+  expectedPageVersion: number;
+  expectedProtectionVersion: number;
+  expectedControlRevision: number;
+  sourceContext: KnowledgeGoldPageSourceContextEntry[];
+};
+type KnowledgeGoldPageEditIntent = KnowledgeGoldPageActionIntent & { content: string; };
 interface KnowledgeListResult { bundleId: string; versionId: string; items: Array<{ path: string }>; nextOffset?: number; }
 type KnowledgeSilverFacetCoverage = { status: "complete" | "partial"; reasons: string[]; };
 type KnowledgeSilverSearchCoverage = { metadata: KnowledgeSilverFacetCoverage; internalLinks: KnowledgeSilverFacetCoverage; sources: KnowledgeSilverFacetCoverage; };
@@ -64,6 +85,7 @@ type KnowledgeSearchResult =
   | { kind: "articles"; items: KnowledgeArticleSearchItem[]; nextCursor?: string; coverage: KnowledgeSilverSearchCoverage; }
   | { kind: "article-links"; items: Array<{ depth: number; item: KnowledgeArticleSearchItem; }>; coverage: KnowledgeSilverSearchCoverage; };
 type KnowledgeReadResult =
+  | { kind: "navigation"; path: "articles" | "index.md"; sourceMarkdown: string; goldStatus: "disabled" | "enabled" | "paused"; }
   | { bundleId: string; versionId: string; path: string; sourceMarkdown: string; metadata: Record<string, unknown>; }
   | {
       kind: "article";
@@ -81,6 +103,8 @@ interface KnowledgeBase {
   proposeArticle(input: { article: KnowledgeArticleProposal }): Promise<{ status: "pending_approval"; operationId: string }>;
   proposeArticlePolicy(input: { articleId: string; usePolicy: "included" | "excluded"; expectedMetadataRevision: number; }): Promise<{ status: "pending_approval"; operationId: string; }>;
   proposeGoldJobControl(input: { intent: KnowledgeGoldJobControlIntent; }): Promise<{ status: "pending_approval"; operationId: string; }>;
+  proposeGoldPageEdit(input: { intent: KnowledgeGoldPageEditIntent; }): Promise<{ status: "pending_approval"; operationId: string; }>;
+  proposeGoldCleanReplacement(input: { intent: KnowledgeGoldPageActionIntent; }): Promise<{ status: "pending_approval"; operationId: string; }>;
 }
 `;
 export default D04_TYPES_CODE;

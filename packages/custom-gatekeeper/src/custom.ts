@@ -32,12 +32,16 @@ const KNOWLEDGE_BRONZE_MAX_BODY_BYTES = 64 * 1024;
 const KNOWLEDGE_BRONZE_MAX_ACTION_BYTES = 96 * 1024;
 const KNOWLEDGE_BRONZE_MAX_METADATA_BYTES = 64 * 1024;
 const KNOWLEDGE_BRONZE_MAX_STAGE_METADATA_BYTES = 32 * 1024;
+const KNOWLEDGE_GOLD_PAGE_MAX_PATH_BYTES = 240;
+const KNOWLEDGE_GOLD_PAGE_MAX_CONTENT_BYTES = 64 * 1024;
 const KNOWLEDGE_READ_RESPONSE_MAX_BYTES = 256 * 1024;
 const KNOWLEDGE_SAFE_CONTROL_MAX_TARGETS = 65;
 const KNOWLEDGE_SAFE_CONTROL_MAX_ARTICLE_TARGETS = 64;
 const KNOWLEDGE_SAFE_CONTROL_MAX_GOLD_TARGETS = 1;
 const KNOWLEDGE_SAFE_CONTROL_MAX_BYTES_PER_TARGET = 4 * 1024;
 export const KNOWLEDGE_GOLD_CONTROL_CONTRACT = "cybernest-knowledge-gold-job-control-v1" as const;
+export const KNOWLEDGE_GOLD_PAGE_CONTROL_CONTRACT =
+  "cybernest-knowledge-gold-page-control-v1" as const;
 export type KnowledgeListInput = { offset: number; limit: number };
 type KnowledgeComputerSearchInput = { query: string; offset: number; limit: number };
 type KnowledgeArticleSearchInput = {
@@ -189,6 +193,11 @@ type KnowledgeGoldControlIntent = Readonly<{
   expectedJobState: string;
   expectedJobFence: number;
   expectedControlRevision: number;
+  system1Recovery?: Readonly<{
+    decisionKeyHash: string;
+    expectedRequestId: string;
+    additionalMaxMicroUsd: 5_000;
+  }>;
 }>;
 type KnowledgeGoldJobControlCommand = Readonly<{
   kind: "gold_job_control";
@@ -196,6 +205,7 @@ type KnowledgeGoldJobControlCommand = Readonly<{
   operationId: string;
   operationDeadlineMs: number;
   intent: KnowledgeGoldControlIntent;
+  system1RecoveryNextRequestId?: string;
 }>;
 type KnowledgeGoldJobControlSavedResult = Readonly<{
   status: "saved";
@@ -221,6 +231,64 @@ type KnowledgeGoldController = {
   inspect(): Promise<unknown>;
   apply(input: unknown): Promise<unknown>;
 };
+type KnowledgeGoldPageController = {
+  assertBoundTo(
+    managerId: string,
+  ):
+    | typeof KNOWLEDGE_GOLD_PAGE_CONTROL_CONTRACT
+    | Promise<typeof KNOWLEDGE_GOLD_PAGE_CONTROL_CONTRACT>;
+  inspectPage(input: unknown): Promise<unknown>;
+  admitPageAction(input: unknown): Promise<unknown>;
+  editPage(input: unknown): Promise<unknown>;
+  requestProtectionReleaseAndCleanReplacement(input: unknown): Promise<unknown>;
+};
+type KnowledgeGoldPageSourceContextEntry = Readonly<{
+  articleId: string;
+  revisionId: string;
+  bodyHash: string;
+  metadataRevision: number;
+  projectionVersions: Readonly<{
+    projectionRuleVersion: string;
+    processedVersion: string;
+    relationVersion: string;
+  }>;
+}>;
+export type KnowledgeGoldPageActionIntent = Readonly<{
+  path: string;
+  pageId: string;
+  expectedPageVersion: number;
+  expectedProtectionVersion: number;
+  expectedControlRevision: number;
+  sourceContext: readonly KnowledgeGoldPageSourceContextEntry[];
+}>;
+export type KnowledgeGoldPageEditIntent = KnowledgeGoldPageActionIntent &
+  Readonly<{ content: string }>;
+type KnowledgeGoldPageEditCommand = Readonly<{
+  kind: "gold_page_edit";
+  namespace: KnowledgeBronzeNamespace;
+  operationId: string;
+  operationDeadlineMs: number;
+  intent: KnowledgeGoldPageEditIntent;
+}>;
+type KnowledgeGoldCleanRequestCommand = Readonly<{
+  kind: "gold_page_clean_request";
+  namespace: KnowledgeBronzeNamespace;
+  operationId: string;
+  operationDeadlineMs: number;
+  intent: KnowledgeGoldPageActionIntent;
+}>;
+type KnowledgeGoldPageActionCommand =
+  | KnowledgeGoldPageEditCommand
+  | KnowledgeGoldCleanRequestCommand;
+type KnowledgeGoldPageActionSavedResult = Readonly<{
+  status: "saved";
+  operation: "edit" | "clean_replacement";
+  operationId: string;
+  pageId: string;
+  pageVersion: number;
+  protectionVersion: number;
+  controlRevision: number;
+}>;
 type KnowledgeSafeControlTarget =
   | Readonly<{ kind: "article"; id: string }>
   | Readonly<{ kind: "gold_job"; id: string }>;
@@ -263,6 +331,8 @@ type KnowledgeSessionProposal = (input: unknown) => Promise<
   }>
 >;
 type KnowledgeSessionPolicyProposal = KnowledgeSessionProposal;
+type KnowledgeSessionGoldPageEditProposal = KnowledgeSessionProposal;
+type KnowledgeSessionGoldCleanRequestProposal = KnowledgeSessionProposal;
 type InspectableAccess = Omit<Access, "assertBoundTo"> & {
   assertBoundTo(
     managerId: string,
@@ -539,13 +609,11 @@ function parseSilverPolicySavedResult(
 function decodeKnowledgeGoldControlIntent(value: unknown): KnowledgeGoldControlIntent {
   if (
     !rec(value) ||
-    !exact(value, [
-      "operation",
-      "jobId",
-      "expectedJobState",
-      "expectedJobFence",
-      "expectedControlRevision",
-    ]) ||
+    !exactOptional(
+      value,
+      ["operation", "jobId", "expectedJobState", "expectedJobFence", "expectedControlRevision"],
+      ["system1Recovery"],
+    ) ||
     (value.operation !== "stop" && value.operation !== "resume") ||
     typeof value.jobId !== "string" ||
     !KNOWLEDGE_UUID.test(value.jobId) ||
@@ -554,12 +622,33 @@ function decodeKnowledgeGoldControlIntent(value: unknown): KnowledgeGoldControlI
     !boundedInt(value.expectedControlRevision, 0, Number.MAX_SAFE_INTEGER)
   )
     throw err("invalid_input");
+  let system1Recovery: KnowledgeGoldControlIntent["system1Recovery"];
+  if (Object.prototype.hasOwnProperty.call(value, "system1Recovery")) {
+    const recovery = value.system1Recovery;
+    if (
+      value.operation !== "resume" ||
+      !rec(recovery) ||
+      !exact(recovery, ["decisionKeyHash", "expectedRequestId", "additionalMaxMicroUsd"]) ||
+      typeof recovery.decisionKeyHash !== "string" ||
+      !/^[0-9a-f]{64}$/u.test(recovery.decisionKeyHash) ||
+      typeof recovery.expectedRequestId !== "string" ||
+      !KNOWLEDGE_UUID.test(recovery.expectedRequestId) ||
+      recovery.additionalMaxMicroUsd !== 5_000
+    )
+      throw err("invalid_input");
+    system1Recovery = {
+      decisionKeyHash: recovery.decisionKeyHash,
+      expectedRequestId: recovery.expectedRequestId,
+      additionalMaxMicroUsd: 5_000,
+    };
+  }
   return {
     operation: value.operation,
     jobId: value.jobId,
     expectedJobState: value.expectedJobState,
     expectedJobFence: value.expectedJobFence,
     expectedControlRevision: value.expectedControlRevision,
+    ...(system1Recovery === undefined ? {} : { system1Recovery }),
   };
 }
 function decodeStoredGoldJobControlStage(
@@ -575,7 +664,11 @@ function decodeStoredGoldJobControlStage(
   }
   if (
     !rec(value) ||
-    !exact(value, ["kind", "namespace", "operationId", "operationDeadlineMs", "intent"]) ||
+    !exactOptional(
+      value,
+      ["kind", "namespace", "operationId", "operationDeadlineMs", "intent"],
+      ["system1RecoveryNextRequestId"],
+    ) ||
     value.kind !== "gold_job_control" ||
     !rec(value.namespace) ||
     !exact(value.namespace, ["workspaceId", "gatekeeperInstanceId", "localActionId"]) ||
@@ -594,6 +687,22 @@ function decodeStoredGoldJobControlStage(
   } catch {
     throw err("corrupt_state");
   }
+  let system1RecoveryNextRequestId: string | undefined;
+  if (Object.prototype.hasOwnProperty.call(value, "system1RecoveryNextRequestId")) {
+    if (
+      typeof value.system1RecoveryNextRequestId !== "string" ||
+      !KNOWLEDGE_UUID.test(value.system1RecoveryNextRequestId)
+    )
+      throw err("corrupt_state");
+    system1RecoveryNextRequestId = value.system1RecoveryNextRequestId;
+  }
+  if (
+    (intent.system1Recovery === undefined && system1RecoveryNextRequestId !== undefined) ||
+    (intent.system1Recovery !== undefined &&
+      (system1RecoveryNextRequestId === undefined ||
+        system1RecoveryNextRequestId === intent.system1Recovery.expectedRequestId))
+  )
+    throw err("corrupt_state");
   return {
     kind: "gold_job_control",
     namespace: {
@@ -604,28 +713,324 @@ function decodeStoredGoldJobControlStage(
     operationId: value.operationId,
     operationDeadlineMs: value.operationDeadlineMs,
     intent,
+    ...(system1RecoveryNextRequestId === undefined ? {} : { system1RecoveryNextRequestId }),
+  };
+}
+type GoldPageActionKind = KnowledgeGoldPageActionCommand["kind"];
+const isCanonicalGoldPagePath = (value: unknown): value is string => {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    hasLoneSurrogate(value) ||
+    new TextEncoder().encode(value).byteLength > KNOWLEDGE_GOLD_PAGE_MAX_PATH_BYTES ||
+    // oxlint-disable-next-line no-control-regex -- Reject C0 controls from canonical Gold page paths.
+    /[\u0000-\u001f]/u.test(value) ||
+    value.includes("\\") ||
+    value.startsWith("/") ||
+    /^[A-Za-z][A-Za-z0-9+.-]*:/u.test(value) ||
+    !value.endsWith(".md")
+  )
+    return false;
+  return value
+    .split("/")
+    .every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
+};
+function decodeGoldPageActionIntent(
+  value: unknown,
+  kind: "gold_page_edit",
+  failureTag: "invalid_input" | "corrupt_state",
+): KnowledgeGoldPageEditIntent;
+function decodeGoldPageActionIntent(
+  value: unknown,
+  kind: "gold_page_clean_request",
+  failureTag: "invalid_input" | "corrupt_state",
+): KnowledgeGoldPageActionIntent;
+function decodeGoldPageActionIntent(
+  value: unknown,
+  kind: GoldPageActionKind,
+  failureTag: "invalid_input" | "corrupt_state",
+): KnowledgeGoldPageActionCommand["intent"] {
+  const hasContent = kind === "gold_page_edit";
+  const intentKeys = [
+    "path",
+    "pageId",
+    "expectedPageVersion",
+    "expectedProtectionVersion",
+    "expectedControlRevision",
+    "sourceContext",
+    ...(hasContent ? ["content"] : []),
+  ];
+  if (
+    !rec(value) ||
+    !exact(value, intentKeys) ||
+    !isCanonicalGoldPagePath(value.path) ||
+    !isNonEmptyBoundedText(value.pageId, 512) ||
+    !boundedInt(
+      value.expectedPageVersion,
+      0,
+      kind === "gold_page_edit" ? Number.MAX_SAFE_INTEGER - 1 : Number.MAX_SAFE_INTEGER,
+    ) ||
+    !boundedInt(value.expectedProtectionVersion, 0, Number.MAX_SAFE_INTEGER) ||
+    !boundedInt(value.expectedControlRevision, 0, Number.MAX_SAFE_INTEGER - 1) ||
+    !Array.isArray(value.sourceContext) ||
+    value.sourceContext.length > 64 ||
+    (kind === "gold_page_clean_request" && value.sourceContext.length === 0)
+  )
+    throw err(failureTag);
+
+  const sourceContext: KnowledgeGoldPageSourceContextEntry[] = [];
+  for (const rawSource of value.sourceContext) {
+    if (
+      !rec(rawSource) ||
+      !exact(rawSource, [
+        "articleId",
+        "revisionId",
+        "bodyHash",
+        "metadataRevision",
+        "projectionVersions",
+      ]) ||
+      !isNonEmptyBoundedText(rawSource.articleId, 512) ||
+      !isNonEmptyBoundedText(rawSource.revisionId, 512) ||
+      !isHexDigest(rawSource.bodyHash) ||
+      !boundedInt(rawSource.metadataRevision, 0, Number.MAX_SAFE_INTEGER) ||
+      !rec(rawSource.projectionVersions) ||
+      !exact(rawSource.projectionVersions, [
+        "projectionRuleVersion",
+        "processedVersion",
+        "relationVersion",
+      ]) ||
+      !isNonEmptyBoundedText(rawSource.projectionVersions.projectionRuleVersion, 256) ||
+      !isHexDigest(rawSource.projectionVersions.processedVersion) ||
+      !isHexDigest(rawSource.projectionVersions.relationVersion)
+    )
+      throw err(failureTag);
+    sourceContext.push({
+      articleId: rawSource.articleId,
+      revisionId: rawSource.revisionId,
+      bodyHash: rawSource.bodyHash,
+      metadataRevision: rawSource.metadataRevision,
+      projectionVersions: {
+        projectionRuleVersion: rawSource.projectionVersions.projectionRuleVersion,
+        processedVersion: rawSource.projectionVersions.processedVersion,
+        relationVersion: rawSource.projectionVersions.relationVersion,
+      },
+    });
+  }
+
+  const base = {
+    path: value.path,
+    pageId: value.pageId,
+    expectedPageVersion: value.expectedPageVersion,
+    expectedProtectionVersion: value.expectedProtectionVersion,
+    expectedControlRevision: value.expectedControlRevision,
+    sourceContext,
+  };
+  if (!hasContent) return base;
+  if (
+    typeof value.content !== "string" ||
+    value.content.length === 0 ||
+    value.content.startsWith("\uFEFF") ||
+    // oxlint-disable-next-line no-control-regex -- Reject disallowed C0 controls from submitted Markdown.
+    /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/u.test(value.content)
+  )
+    throw err(failureTag);
+  const contentBytes = new TextEncoder().encode(value.content);
+  if (
+    contentBytes.byteLength > KNOWLEDGE_GOLD_PAGE_MAX_CONTENT_BYTES ||
+    new TextDecoder().decode(contentBytes) !== value.content
+  )
+    throw err(failureTag);
+  return { ...base, content: value.content };
+}
+function decodeGoldPageEditProposal(value: unknown): KnowledgeGoldPageEditIntent {
+  if (!rec(value) || !exact(value, ["intent"])) throw err("invalid_input");
+  return decodeGoldPageActionIntent(value.intent, "gold_page_edit", "invalid_input");
+}
+function decodeGoldPageCleanReplacementProposal(value: unknown): KnowledgeGoldPageActionIntent {
+  if (!rec(value) || !exact(value, ["intent"])) throw err("invalid_input");
+  return decodeGoldPageActionIntent(value.intent, "gold_page_clean_request", "invalid_input");
+}
+function decodeStoredGoldPageActionStage(
+  serialized: string,
+  actionId: number,
+  gatekeeperInstanceId: string,
+  expectedKind: GoldPageActionKind,
+): KnowledgeGoldPageActionCommand {
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch {
+    throw err("corrupt_state");
+  }
+  if (
+    !rec(value) ||
+    !exact(value, ["kind", "namespace", "operationId", "operationDeadlineMs", "intent"]) ||
+    value.kind !== expectedKind ||
+    !rec(value.namespace) ||
+    !exact(value.namespace, ["workspaceId", "gatekeeperInstanceId", "localActionId"]) ||
+    !isNonEmptyBoundedText(value.namespace.workspaceId, 512) ||
+    value.namespace.gatekeeperInstanceId !== gatekeeperInstanceId ||
+    !boundedInt(value.namespace.localActionId, 0, Number.MAX_SAFE_INTEGER) ||
+    value.namespace.localActionId !== actionId ||
+    typeof value.operationId !== "string" ||
+    !UUID.test(value.operationId) ||
+    !boundedInt(value.operationDeadlineMs, 0, Number.MAX_SAFE_INTEGER)
+  )
+    throw err("corrupt_state");
+  const namespace = {
+    workspaceId: value.namespace.workspaceId,
+    gatekeeperInstanceId,
+    localActionId: actionId,
+  };
+  if (expectedKind === "gold_page_edit")
+    return {
+      kind: expectedKind,
+      namespace,
+      operationId: value.operationId,
+      operationDeadlineMs: value.operationDeadlineMs,
+      intent: decodeGoldPageActionIntent(value.intent, expectedKind, "corrupt_state"),
+    };
+  return {
+    kind: expectedKind,
+    namespace,
+    operationId: value.operationId,
+    operationDeadlineMs: value.operationDeadlineMs,
+    intent: decodeGoldPageActionIntent(value.intent, expectedKind, "corrupt_state"),
+  };
+}
+async function computeGoldPageActionPayloadHash(
+  managerId: string,
+  command: KnowledgeGoldPageActionCommand,
+): Promise<string> {
+  return sha256Hex(
+    encodeLengthPrefixed([
+      "knowledge-gold-page-action-native-v1",
+      managerId,
+      JSON.stringify(command),
+    ]),
+  );
+}
+function parseGoldPageActionSavedResult(
+  value: unknown,
+  command: KnowledgeGoldPageActionCommand,
+): KnowledgeGoldPageActionSavedResult {
+  const operation = command.kind === "gold_page_edit" ? "edit" : "clean_replacement";
+  const pageVersion =
+    command.kind === "gold_page_edit"
+      ? command.intent.expectedPageVersion + 1
+      : command.intent.expectedPageVersion;
+  if (
+    !rec(value) ||
+    !exact(value, [
+      "status",
+      "operation",
+      "operationId",
+      "pageId",
+      "pageVersion",
+      "protectionVersion",
+      "controlRevision",
+    ]) ||
+    value.status !== "saved" ||
+    value.operation !== operation ||
+    value.operationId !== command.operationId ||
+    value.pageId !== command.intent.pageId ||
+    value.pageVersion !== pageVersion ||
+    !boundedInt(
+      value.protectionVersion,
+      command.intent.expectedProtectionVersion,
+      command.kind === "gold_page_edit" &&
+        command.intent.expectedProtectionVersion < Number.MAX_SAFE_INTEGER
+        ? command.intent.expectedProtectionVersion + 1
+        : command.intent.expectedProtectionVersion,
+    ) ||
+    value.controlRevision !== command.intent.expectedControlRevision + 1
+  )
+    throw err("integrity_failure");
+  return {
+    status: "saved",
+    operation,
+    operationId: command.operationId,
+    pageId: command.intent.pageId,
+    pageVersion,
+    protectionVersion: value.protectionVersion,
+    controlRevision: command.intent.expectedControlRevision + 1,
+  };
+}
+function parseStoredGoldPageActionSavedResult(
+  serialized: string | null,
+  operationId: string,
+  kind: GoldPageActionKind,
+): KnowledgeGoldPageActionSavedResult {
+  if (serialized === null) throw err("corrupt_state");
+  let value: unknown;
+  try {
+    value = JSON.parse(serialized);
+  } catch {
+    throw err("corrupt_state");
+  }
+  const operation = kind === "gold_page_edit" ? "edit" : "clean_replacement";
+  if (
+    !rec(value) ||
+    !exact(value, [
+      "status",
+      "operation",
+      "operationId",
+      "pageId",
+      "pageVersion",
+      "protectionVersion",
+      "controlRevision",
+    ]) ||
+    value.status !== "saved" ||
+    value.operation !== operation ||
+    value.operationId !== operationId ||
+    !isNonEmptyBoundedText(value.pageId, 512) ||
+    !boundedInt(value.pageVersion, 0, Number.MAX_SAFE_INTEGER) ||
+    !boundedInt(value.protectionVersion, 0, Number.MAX_SAFE_INTEGER) ||
+    !boundedInt(value.controlRevision, 1, Number.MAX_SAFE_INTEGER)
+  )
+    throw err("corrupt_state");
+  return {
+    status: "saved",
+    operation,
+    operationId,
+    pageId: value.pageId,
+    pageVersion: value.pageVersion,
+    protectionVersion: value.protectionVersion,
+    controlRevision: value.controlRevision,
   };
 }
 async function computeGoldJobControlPayloadHash(
   managerId: string,
   command: KnowledgeGoldJobControlCommand,
 ): Promise<string> {
-  return sha256Hex(
-    encodeLengthPrefixed([
-      "knowledge-gold-job-control-native-v1",
-      managerId,
-      command.operationId,
-      command.namespace.workspaceId,
-      command.namespace.gatekeeperInstanceId,
-      String(command.namespace.localActionId),
-      String(command.operationDeadlineMs),
-      command.intent.operation,
-      command.intent.jobId,
-      command.intent.expectedJobState,
-      String(command.intent.expectedJobFence),
-      String(command.intent.expectedControlRevision),
-    ]),
-  );
+  const fields = [
+    "knowledge-gold-job-control-native-v1",
+    managerId,
+    command.operationId,
+    command.namespace.workspaceId,
+    command.namespace.gatekeeperInstanceId,
+    String(command.namespace.localActionId),
+    String(command.operationDeadlineMs),
+    command.intent.operation,
+    command.intent.jobId,
+    command.intent.expectedJobState,
+    String(command.intent.expectedJobFence),
+    String(command.intent.expectedControlRevision),
+  ];
+  const recovery = command.intent.system1Recovery;
+  if (recovery !== undefined) {
+    const nextRequestId = command.system1RecoveryNextRequestId;
+    if (nextRequestId === undefined || nextRequestId === recovery.expectedRequestId)
+      throw err("corrupt_state");
+    fields.push(
+      "system1-recovery-v1",
+      recovery.decisionKeyHash,
+      recovery.expectedRequestId,
+      nextRequestId,
+      String(recovery.additionalMaxMicroUsd),
+    );
+  }
+  return sha256Hex(encodeLengthPrefixed(fields));
 }
 function readKnowledgeGoldControlHead(value: unknown): KnowledgeGoldControlHead {
   if (
@@ -664,7 +1069,18 @@ function parseGoldJobControlSavedResult(
   value: unknown,
   command: KnowledgeGoldJobControlCommand,
 ): KnowledgeGoldJobControlSavedResult {
-  const nextState = command.intent.operation === "stop" ? "paused_user" : "dirty";
+  const recovery = command.intent.system1Recovery !== undefined;
+  const nextState = recovery
+    ? command.intent.expectedJobState
+    : command.intent.operation === "stop"
+      ? "paused_user"
+      : "dirty";
+  const nextFence = recovery
+    ? command.intent.expectedJobFence
+    : command.intent.expectedJobFence + 1;
+  const nextControlRevision = recovery
+    ? command.intent.expectedControlRevision
+    : command.intent.expectedControlRevision + 1;
   if (
     !rec(value) ||
     !exact(value, ["status", "operationId", "jobId", "state", "fence", "controlRevision"]) ||
@@ -673,9 +1089,9 @@ function parseGoldJobControlSavedResult(
     value.jobId !== command.intent.jobId ||
     value.state !== nextState ||
     !boundedInt(value.fence, 1, Number.MAX_SAFE_INTEGER) ||
-    value.fence !== command.intent.expectedJobFence + 1 ||
-    !boundedInt(value.controlRevision, 1, Number.MAX_SAFE_INTEGER) ||
-    value.controlRevision !== command.intent.expectedControlRevision + 1
+    value.fence !== nextFence ||
+    !boundedInt(value.controlRevision, recovery ? 0 : 1, Number.MAX_SAFE_INTEGER) ||
+    value.controlRevision !== nextControlRevision
   )
     throw err("integrity_failure");
   return {
@@ -691,6 +1107,7 @@ function parseStoredGoldJobControlSavedResult(
   serialized: string | null,
   operationId: string,
 ): KnowledgeGoldJobControlSavedResult {
+  // The applied Action no longer retains its command; its saved result follows the shared nonnegative schema.
   if (typeof serialized !== "string") throw err("corrupt_state");
   let value: unknown;
   try {
@@ -707,7 +1124,7 @@ function parseStoredGoldJobControlSavedResult(
     !KNOWLEDGE_UUID.test(value.jobId) ||
     !isNonEmptyBoundedText(value.state, 128) ||
     !boundedInt(value.fence, 1, Number.MAX_SAFE_INTEGER) ||
-    !boundedInt(value.controlRevision, 1, Number.MAX_SAFE_INTEGER)
+    !boundedInt(value.controlRevision, 0, Number.MAX_SAFE_INTEGER)
   )
     throw err("corrupt_state");
   return {
@@ -1623,12 +2040,20 @@ const validSearchInput = (v: unknown): v is KnowledgeSearchInput => {
   );
 };
 const validReadResult = (v: unknown): v is KnowledgeReadResult => {
-  if (!rec(v) || !isCanonicalMarkdownPath(v.path)) return false;
+  if (!rec(v)) return false;
+  const navigation =
+    exact(v, ["kind", "path", "sourceMarkdown", "goldStatus"]) &&
+    v.kind === "navigation" &&
+    (v.path === "articles" || v.path === "index.md") &&
+    (v.goldStatus === "disabled" || v.goldStatus === "enabled" || v.goldStatus === "paused");
+  const canonicalMarkdownPath = isCanonicalMarkdownPath(v.path);
   const computer =
+    canonicalMarkdownPath &&
     exact(v, ["bundleId", "versionId", "path", "sourceMarkdown", "metadata"]) &&
     isHexDigest(v.bundleId) &&
     knowledgeUuid(v.versionId);
   const article =
+    canonicalMarkdownPath &&
     exact(v, [
       "kind",
       "articleId",
@@ -1643,10 +2068,9 @@ const validReadResult = (v: unknown): v is KnowledgeReadResult => {
     isNonEmptyBoundedText(v.revisionId, KNOWLEDGE_READ_RESPONSE_MAX_BYTES) &&
     isHexDigest(v.bodyHash);
   if (
-    (!computer && !article) ||
+    (!navigation && !computer && !article) ||
     typeof v.sourceMarkdown !== "string" ||
-    !rec(v.metadata) ||
-    !isJsonValue(v.metadata)
+    (!navigation && (!rec(v.metadata) || !isJsonValue(v.metadata)))
   )
     return false;
   const serialized = JSON.stringify(v);
@@ -1712,6 +2136,8 @@ export class KnowledgeSession extends RpcTarget {
   readonly #propose: KnowledgeSessionProposal;
   readonly #proposePolicy: KnowledgeSessionPolicyProposal;
   readonly #proposeGoldJobControl: KnowledgeSessionProposal;
+  readonly #proposeGoldPageEdit: KnowledgeSessionGoldPageEditProposal;
+  readonly #proposeGoldCleanRequest: KnowledgeSessionGoldCleanRequestProposal;
   #disposed = false;
 
   constructor(
@@ -1720,6 +2146,8 @@ export class KnowledgeSession extends RpcTarget {
     propose: KnowledgeSessionProposal,
     proposePolicy: KnowledgeSessionPolicyProposal,
     proposeGoldJobControl: KnowledgeSessionProposal,
+    proposeGoldPageEdit: KnowledgeSessionGoldPageEditProposal,
+    proposeGoldCleanRequest: KnowledgeSessionGoldCleanRequestProposal,
   ) {
     super();
     this.#q = q;
@@ -1727,6 +2155,8 @@ export class KnowledgeSession extends RpcTarget {
     this.#propose = propose;
     this.#proposePolicy = proposePolicy;
     this.#proposeGoldJobControl = proposeGoldJobControl;
+    this.#proposeGoldPageEdit = proposeGoldPageEdit;
+    this.#proposeGoldCleanRequest = proposeGoldCleanRequest;
   }
 
   async proposeArticle(input: unknown): Promise<
@@ -1754,6 +2184,20 @@ export class KnowledgeSession extends RpcTarget {
   ): Promise<Readonly<{ status: "pending_approval"; operationId: string }>> {
     if (this.#disposed) throw err("invalid_input");
     return this.#proposeGoldJobControl(input);
+  }
+
+  async proposeGoldPageEdit(
+    input: unknown,
+  ): Promise<Readonly<{ status: "pending_approval"; operationId: string }>> {
+    if (this.#disposed) throw err("invalid_input");
+    return this.#proposeGoldPageEdit(input);
+  }
+
+  async proposeGoldCleanReplacement(
+    input: unknown,
+  ): Promise<Readonly<{ status: "pending_approval"; operationId: string }>> {
+    if (this.#disposed) throw err("invalid_input");
+    return this.#proposeGoldCleanRequest(input);
   }
 
   async #read<T>(
@@ -1831,7 +2275,11 @@ export class KnowledgeSession extends RpcTarget {
   }
 
   async read(input: KnowledgeReadInput): Promise<KnowledgeReadResult> {
-    if (!rec(input) || !exact(input, ["path"]) || !isCanonicalMarkdownPath(input.path))
+    if (
+      !rec(input) ||
+      !exact(input, ["path"]) ||
+      (input.path !== "articles" && !isCanonicalMarkdownPath(input.path))
+    )
       throw err("invalid_input");
     return this.#read(
       "Knowledge Base read",
@@ -2122,6 +2570,68 @@ export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
       const contract =
         await validateStub<KnowledgeGoldController>(controller).assertBoundTo(managerId);
       if (contract !== KNOWLEDGE_GOLD_CONTROL_CONTRACT) throw err("permission_denied");
+    } catch (cause) {
+      if (cause instanceof Error && cause.message === "Knowledge Base permission_denied.")
+        throw cause;
+      throw err("permission_denied", cause);
+    }
+    return controller;
+  }
+
+  async bindGoldPageController(
+    managerId: string,
+    controller: KnowledgeGoldPageController,
+  ): Promise<void> {
+    this.#assertManager(managerId);
+    const contract =
+      await validateStub<KnowledgeGoldPageController>(controller).assertBoundTo(managerId);
+    if (contract !== KNOWLEDGE_GOLD_PAGE_CONTROL_CONTRACT)
+      throw err("incompatible_gold_page_role_contract");
+    const stored = await this.ctx.storage.get<KnowledgeGoldPageController>("goldPageController");
+    if (stored !== undefined) {
+      const storedContract =
+        await validateStub<KnowledgeGoldPageController>(stored).assertBoundTo(managerId);
+      if (storedContract !== KNOWLEDGE_GOLD_PAGE_CONTROL_CONTRACT)
+        throw err("incompatible_gold_page_role_contract");
+      return;
+    }
+    const raced = await this.ctx.blockConcurrencyWhile(async () => {
+      const current = await this.ctx.storage.get<KnowledgeGoldPageController>("goldPageController");
+      if (current !== undefined) return current;
+      await this.ctx.storage.put("goldPageController", controller);
+      return undefined;
+    });
+    if (raced !== undefined) {
+      const racedContract =
+        await validateStub<KnowledgeGoldPageController>(raced).assertBoundTo(managerId);
+      if (racedContract !== KNOWLEDGE_GOLD_PAGE_CONTROL_CONTRACT)
+        throw err("incompatible_gold_page_role_contract");
+    }
+  }
+
+  async inspectGoldPageRole(managerId: string): Promise<KnowledgeGoldRoles> {
+    this.#assertManager(managerId);
+    const controller =
+      await this.ctx.storage.get<KnowledgeGoldPageController>("goldPageController");
+    if (controller === undefined) return "absent";
+    try {
+      const contract =
+        await validateStub<KnowledgeGoldPageController>(controller).assertBoundTo(managerId);
+      return contract === KNOWLEDGE_GOLD_PAGE_CONTROL_CONTRACT ? "installed" : "incompatible";
+    } catch {
+      return "incompatible";
+    }
+  }
+
+  async getGoldPageController(managerId: string): Promise<KnowledgeGoldPageController> {
+    this.#assertManager(managerId);
+    const controller =
+      await this.ctx.storage.get<KnowledgeGoldPageController>("goldPageController");
+    if (controller === undefined) throw err("dependency_unavailable");
+    try {
+      const contract =
+        await validateStub<KnowledgeGoldPageController>(controller).assertBoundTo(managerId);
+      if (contract !== KNOWLEDGE_GOLD_PAGE_CONTROL_CONTRACT) throw err("permission_denied");
     } catch (cause) {
       if (cause instanceof Error && cause.message === "Knowledge Base permission_denied.")
         throw cause;
@@ -2923,43 +3433,56 @@ export class CustomGatekeeper
       initialHead.controlRevision !== intent.expectedControlRevision
     )
       throw err("conflict");
-    const supportedTransition =
-      (intent.operation === "stop" &&
+    const recovery = intent.system1Recovery !== undefined;
+    const supportedTransition = recovery
+      ? intent.operation === "resume" &&
         initialHead.mode === "enabled" &&
-        [
-          "clean",
-          "dirty",
-          "running",
-          "candidate",
-          "partial",
-          "published",
-          "retry_wait",
-          "budget_wait",
-          "needs_reconciliation",
-        ].includes(initialHead.job.state)) ||
-      (intent.operation === "resume" &&
-        initialHead.mode === "paused" &&
-        (initialHead.job.state === "paused_user" ||
-          initialHead.job.state === "paused_deterministic"));
+        (initialHead.job.state === "published" || initialHead.job.state === "partial")
+      : (intent.operation === "stop" &&
+          initialHead.mode === "enabled" &&
+          [
+            "clean",
+            "dirty",
+            "running",
+            "candidate",
+            "partial",
+            "published",
+            "retry_wait",
+            "budget_wait",
+            "needs_reconciliation",
+          ].includes(initialHead.job.state)) ||
+        (intent.operation === "resume" &&
+          initialHead.mode === "paused" &&
+          (initialHead.job.state === "paused_user" ||
+            initialHead.job.state === "paused_deterministic"));
     if (!supportedTransition) throw err("conflict");
-    const previous = await account.findKnowledgeSafeControlReservation(managerId, target);
+    const previous = recovery
+      ? undefined
+      : await account.findKnowledgeSafeControlReservation(managerId, target);
     const namespace: KnowledgeBronzeNamespace = {
       workspaceId,
       gatekeeperInstanceId,
       localActionId: this.#nextActionId(),
     };
     const operationId = crypto.randomUUID();
+    const system1RecoveryNextRequestId = recovery ? crypto.randomUUID().toLowerCase() : undefined;
     const command: KnowledgeGoldJobControlCommand = {
       kind: "gold_job_control",
       namespace,
       operationId,
       operationDeadlineMs: 0,
       intent,
+      ...(system1RecoveryNextRequestId === undefined ? {} : { system1RecoveryNextRequestId }),
     };
     const description: ActionDescription = {
-      title: intent.operation === "stop" ? "Stop Knowledge Gold job" : "Resume Knowledge Gold job",
-      description:
-        "The exact Gold job control request is shown below. Approval applies it to the Manager's Knowledge Base.",
+      title: recovery
+        ? "Retry a Knowledge System 1 decision"
+        : intent.operation === "stop"
+          ? "Stop Knowledge Gold job"
+          : "Resume Knowledge Gold job",
+      description: recovery
+        ? "The original System 1 request may already have executed. Approval starts another attempt and may cause a double charge or effect; additional spend is capped at 5,000 micro-USD."
+        : "The exact Gold job control request is shown below. Approval applies it to the Manager's Knowledge Base.",
       fields: [{ label: "Gold job control", kind: "json", value: JSON.stringify(intent) }],
       descriptionIsComplete: true,
       autoApprovable: false,
@@ -2969,19 +3492,26 @@ export class CustomGatekeeper
     const retainedBytesReserved =
       new TextEncoder().encode(JSON.stringify(command)).byteLength +
       new TextEncoder().encode(JSON.stringify(description)).byteLength;
-    if (retainedBytesReserved > KNOWLEDGE_SAFE_CONTROL_MAX_BYTES_PER_TARGET)
+    if (
+      retainedBytesReserved >
+      (recovery
+        ? KNOWLEDGE_BRONZE_MAX_ACTION_BYTES + KNOWLEDGE_BRONZE_MAX_METADATA_BYTES
+        : KNOWLEDGE_SAFE_CONTROL_MAX_BYTES_PER_TARGET)
+    )
       throw err("capacity_exceeded");
     const payloadHash = await computeGoldJobControlPayloadHash(managerId, command);
-    const reservation: KnowledgeSafeControlReservation = {
-      target,
-      ...namespace,
-      operationId,
-      operationDeadlineMs: 0,
-      retainedBytesReserved,
-      expectedJobFence: intent.expectedJobFence,
-      expectedControlRevision: intent.expectedControlRevision,
-    };
-    if (previous !== undefined) {
+    const reservation: KnowledgeSafeControlReservation | undefined = recovery
+      ? undefined
+      : {
+          target,
+          ...namespace,
+          operationId,
+          operationDeadlineMs: 0,
+          retainedBytesReserved,
+          expectedJobFence: intent.expectedJobFence,
+          expectedControlRevision: intent.expectedControlRevision,
+        };
+    if (!recovery && previous !== undefined) {
       if (
         previous.target.kind !== "gold_job" ||
         previous.expectedJobFence === undefined ||
@@ -2997,7 +3527,16 @@ export class CustomGatekeeper
         await account.clearKnowledgeSafeControl(managerId, oldBinding);
       }
     }
-    await account.reserveKnowledgeSafeControl(managerId, reservation);
+    if (recovery) {
+      await account.reserveBronzeAction(managerId, {
+        ...namespace,
+        operationId,
+        operationDeadlineMs: 0,
+        retainedBytesReserved,
+      });
+    } else if (reservation !== undefined) {
+      await account.reserveKnowledgeSafeControl(managerId, reservation);
+    }
     try {
       this.ctx.storage.sql.exec(
         `INSERT INTO custom_gatekeeper_article_actions
@@ -3031,7 +3570,15 @@ export class CustomGatekeeper
       }
       if (!localActionExists) {
         try {
-          await account.clearKnowledgeSafeControl(managerId, reservation);
+          if (recovery) {
+            await account.clearBronzeAction(managerId, {
+              ...namespace,
+              operationId,
+              operationDeadlineMs: 0,
+            });
+          } else if (reservation !== undefined) {
+            await account.clearKnowledgeSafeControl(managerId, reservation);
+          }
         } catch (clearCause) {
           // oxlint cannot see ErrorOptions on AggregateError; the primary cause is attached below.
           // oxlint-disable-next-line eslint/preserve-caught-error -- AggregateError options preserve insertCause.
@@ -3049,6 +3596,216 @@ export class CustomGatekeeper
     } catch (cause) {
       // The workspace may have persisted the Action before its RPC acknowledgement was lost.
       // Keep the exact staged row and reservation for native approval/retry; never blind-resubmit.
+      throw err("result_unknown", cause);
+    }
+    return { status: "pending_approval", operationId };
+  }
+  async #proposeGoldPageEdit(
+    queue: RpcStub<KnowledgeActionQueue>,
+    account: DurableObjectStub<KnowledgeAccountAccess>,
+    managerId: string,
+    input: unknown,
+  ): Promise<Readonly<{ status: "pending_approval"; operationId: string }>> {
+    return this.#proposeGoldPageAction(queue, account, managerId, {
+      kind: "gold_page_edit",
+      intent: decodeGoldPageEditProposal(input),
+    });
+  }
+  async #proposeGoldCleanReplacement(
+    queue: RpcStub<KnowledgeActionQueue>,
+    account: DurableObjectStub<KnowledgeAccountAccess>,
+    managerId: string,
+    input: unknown,
+  ): Promise<Readonly<{ status: "pending_approval"; operationId: string }>> {
+    return this.#proposeGoldPageAction(queue, account, managerId, {
+      kind: "gold_page_clean_request",
+      intent: decodeGoldPageCleanReplacementProposal(input),
+    });
+  }
+  async #proposeGoldPageAction(
+    queue: RpcStub<KnowledgeActionQueue>,
+    account: DurableObjectStub<KnowledgeAccountAccess>,
+    managerId: string,
+    proposal:
+      | Readonly<{ kind: "gold_page_edit"; intent: KnowledgeGoldPageEditIntent }>
+      | Readonly<{ kind: "gold_page_clean_request"; intent: KnowledgeGoldPageActionIntent }>,
+  ): Promise<Readonly<{ status: "pending_approval"; operationId: string }>> {
+    const workspaceId = await queue.getWorkspaceId();
+    const gatekeeperInstanceId = this.ctx.id.toString();
+    if (
+      !isNonEmptyBoundedText(workspaceId, 512) ||
+      !isNonEmptyBoundedText(gatekeeperInstanceId, 512)
+    )
+      throw err("permission_denied");
+
+    const controller = await account.getGoldPageController(managerId);
+    const initialInspection = parseKnowledgeEnvelope(
+      await controller.inspectPage({ path: proposal.intent.path }),
+    );
+    if (!initialInspection.ok) throw err(initialInspection.code);
+    if (
+      !rec(initialInspection.value) ||
+      !isNonEmptyBoundedText(initialInspection.value.pageId, 512) ||
+      !isCanonicalGoldPagePath(initialInspection.value.path) ||
+      !boundedInt(initialInspection.value.pageVersion, 0, Number.MAX_SAFE_INTEGER) ||
+      !boundedInt(initialInspection.value.protectionVersion, 0, Number.MAX_SAFE_INTEGER)
+    )
+      throw err("integrity_failure");
+    if (
+      initialInspection.value.pageId !== proposal.intent.pageId ||
+      initialInspection.value.path !== proposal.intent.path ||
+      initialInspection.value.pageVersion !== proposal.intent.expectedPageVersion ||
+      initialInspection.value.protectionVersion !== proposal.intent.expectedProtectionVersion
+    )
+      throw err("conflict");
+
+    const namespace: KnowledgeBronzeNamespace = {
+      workspaceId,
+      gatekeeperInstanceId,
+      localActionId: this.#nextActionId(),
+    };
+    const operationId = crypto.randomUUID();
+    const admissionDeadlineMs = Date.now() + KNOWLEDGE_BRONZE_ADMISSION_WINDOW_MS;
+    if (!Number.isSafeInteger(admissionDeadlineMs) || admissionDeadlineMs < 1)
+      throw err("invalid_input");
+    const command: KnowledgeGoldPageActionCommand =
+      proposal.kind === "gold_page_edit"
+        ? {
+            kind: proposal.kind,
+            namespace,
+            operationId,
+            operationDeadlineMs: admissionDeadlineMs,
+            intent: proposal.intent,
+          }
+        : {
+            kind: proposal.kind,
+            namespace,
+            operationId,
+            operationDeadlineMs: admissionDeadlineMs,
+            intent: proposal.intent,
+          };
+    const admission = parseKnowledgeEnvelope(await controller.admitPageAction(command));
+    if (!admission.ok) throw err(admission.code);
+    if (
+      !rec(admission.value) ||
+      !exact(admission.value, ["status", "pageId"]) ||
+      admission.value.status !== "admitted" ||
+      admission.value.pageId !== command.intent.pageId
+    )
+      throw err("integrity_failure");
+
+    // Like other owner-reviewed Actions, the finite execution window starts when approval is
+    // first dispatched. Admission uses a short-lived command only to register its baseline.
+    const stagedCommand: KnowledgeGoldPageActionCommand = {
+      ...command,
+      operationDeadlineMs: 0,
+    };
+
+    const description: ActionDescription = {
+      title:
+        proposal.kind === "gold_page_edit"
+          ? "Edit a Knowledge Gold page"
+          : "Request clean replacement of a Knowledge Gold page",
+      description:
+        proposal.kind === "gold_page_edit"
+          ? "The exact page edit is shown below. Approval applies it to the Manager's Knowledge Base."
+          : "The exact clean replacement request is shown below. Approval records the request for the Manager's Knowledge Base; it does not include replacement body text.",
+      fields: [
+        {
+          label:
+            proposal.kind === "gold_page_edit" ? "Gold page edit" : "Gold page clean replacement",
+          kind: "json",
+          value: JSON.stringify(proposal.intent),
+        },
+      ],
+      descriptionIsComplete: true,
+      autoApprovable: false,
+      awaitDecision: true,
+      implementsRevert: false,
+    };
+    const descriptionBytes = new TextEncoder().encode(JSON.stringify(description)).byteLength;
+    if (descriptionBytes > KNOWLEDGE_BRONZE_MAX_ACTION_BYTES) throw err("capacity_exceeded");
+    const stageMetadata = {
+      kind: proposal.kind,
+      namespace,
+      operationId,
+      operationDeadlineMs: stagedCommand.operationDeadlineMs,
+      intent: {
+        ...proposal.intent,
+        ...(proposal.kind === "gold_page_edit" ? { content: undefined } : {}),
+      },
+    };
+    const stageMetadataBytes = new TextEncoder().encode(JSON.stringify(stageMetadata)).byteLength;
+    const bodyBytes =
+      proposal.kind === "gold_page_edit"
+        ? new TextEncoder().encode(proposal.intent.content).byteLength
+        : 0;
+    const retainedBytesReserved = bodyBytes + stageMetadataBytes;
+    if (stageMetadataBytes > KNOWLEDGE_BRONZE_MAX_STAGE_METADATA_BYTES)
+      throw err("capacity_exceeded");
+    if (
+      retainedBytesReserved >
+      KNOWLEDGE_BRONZE_MAX_ACTION_BYTES + KNOWLEDGE_BRONZE_MAX_METADATA_BYTES
+    )
+      throw err("capacity_exceeded");
+
+    const reservation = {
+      ...namespace,
+      operationId,
+      operationDeadlineMs: stagedCommand.operationDeadlineMs,
+    };
+    await account.reserveBronzeAction(managerId, { ...reservation, retainedBytesReserved });
+    try {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO custom_gatekeeper_article_actions
+         (local_action_id, operation_id, action_ref, kind, workspace_id, operation_deadline_ms, command_json, payload_hash, status, outcome_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending_approval', NULL)`,
+        namespace.localActionId,
+        operationId,
+        `knowledge-gold-page:${operationId}`,
+        command.kind,
+        workspaceId,
+        stagedCommand.operationDeadlineMs,
+        JSON.stringify(stagedCommand),
+        await computeGoldPageActionPayloadHash(managerId, stagedCommand),
+      );
+    } catch (insertCause) {
+      let localActionExists: boolean;
+      try {
+        localActionExists =
+          this.ctx.storage.sql
+            .exec(
+              "SELECT 1 AS present FROM custom_gatekeeper_article_actions WHERE local_action_id = ?",
+              namespace.localActionId,
+            )
+            .toArray().length > 0;
+      } catch (readbackCause) {
+        // oxlint cannot see ErrorOptions on AggregateError; the primary cause is attached below.
+        // oxlint-disable-next-line eslint/preserve-caught-error -- AggregateError options preserve insertCause.
+        throw new AggregateError(
+          [insertCause, readbackCause],
+          "Knowledge Gold page Action insert result could not be determined.",
+          { cause: insertCause },
+        );
+      }
+      if (!localActionExists) {
+        try {
+          await account.clearBronzeAction(managerId, reservation);
+        } catch (clearCause) {
+          // oxlint cannot see ErrorOptions on AggregateError; the primary cause is attached below.
+          // oxlint-disable-next-line eslint/preserve-caught-error -- AggregateError options preserve insertCause.
+          throw new AggregateError(
+            [insertCause, clearCause],
+            "Knowledge Gold page Action insert failed and its exact reservation could not be cleared.",
+            { cause: insertCause },
+          );
+        }
+      }
+      throw insertCause;
+    }
+    try {
+      await queue.submitAction(namespace.localActionId, description);
+    } catch (cause) {
       throw err("result_unknown", cause);
     }
     return { status: "pending_approval", operationId };
@@ -3080,6 +3837,8 @@ export class CustomGatekeeper
         (input) => this.#proposeArticle(queue, account, managerId, input),
         (input) => this.#proposeArticlePolicy(queue, account, managerId, input),
         (input) => this.#proposeGoldJobControl(queue, account, managerId, input),
+        (input) => this.#proposeGoldPageEdit(queue, account, managerId, input),
+        (input) => this.#proposeGoldCleanReplacement(queue, account, managerId, input),
       );
     } catch (cause) {
       try {
@@ -3184,6 +3943,194 @@ export class CustomGatekeeper
     return command;
   }
 
+  async #validateGoldPageActionStage(
+    row: KnowledgeArticleActionRow,
+    actionId: number,
+    gatekeeperInstanceId: string,
+    managerId: string,
+    kind: GoldPageActionKind,
+  ): Promise<KnowledgeGoldPageActionCommand> {
+    if (!isNonEmptyBoundedText(row.workspace_id, 512)) throw err("corrupt_state");
+    const command = decodeStoredGoldPageActionStage(
+      row.command_json,
+      actionId,
+      gatekeeperInstanceId,
+      kind,
+    );
+    if (
+      row.operation_id !== command.operationId ||
+      row.workspace_id !== command.namespace.workspaceId ||
+      row.operation_deadline_ms !== command.operationDeadlineMs ||
+      row.payload_hash !== (await computeGoldPageActionPayloadHash(managerId, command))
+    )
+      throw err("corrupt_state");
+    return command;
+  }
+
+  async #applyGoldPageAction(
+    actionId: number,
+    row: KnowledgeArticleActionRow,
+    kind: GoldPageActionKind,
+  ): Promise<void> {
+    const managerId = validateProps(this.ctx.props).managerId;
+    if (!isNonEmptyBoundedText(row.workspace_id, 512)) throw err("corrupt_state");
+    const namespace: KnowledgeBronzeNamespace = {
+      workspaceId: row.workspace_id,
+      gatekeeperInstanceId: this.ctx.id.toString(),
+      localActionId: actionId,
+    };
+    const account = this.#accountAccess();
+    if (row.status === "rejected") throw err("conflict");
+    if (row.status === "applied") {
+      const result = parseStoredGoldPageActionSavedResult(row.outcome_json, row.operation_id, kind);
+      if (!boundedInt(row.operation_deadline_ms, 1, Number.MAX_SAFE_INTEGER))
+        throw err("corrupt_state");
+      await account.clearBronzeAction(managerId, {
+        ...namespace,
+        operationId: result.operationId,
+        operationDeadlineMs: row.operation_deadline_ms,
+      });
+      return;
+    }
+    if (row.status !== "pending_approval" && row.status !== "applying")
+      throw err(row.status === "rejecting" ? "result_unknown" : "invalid_input");
+    if (typeof row.command_json !== "string" || row.command_json.length === 0)
+      throw err("corrupt_state");
+    let command = await this.#validateGoldPageActionStage(
+      row,
+      actionId,
+      namespace.gatekeeperInstanceId,
+      managerId,
+      kind,
+    );
+    const controller = await account.getGoldPageController(managerId);
+    if (row.status === "pending_approval") {
+      const operationDeadlineMs =
+        command.operationDeadlineMs === 0
+          ? Date.now() + KNOWLEDGE_BRONZE_ADMISSION_WINDOW_MS
+          : command.operationDeadlineMs;
+      if (!Number.isSafeInteger(operationDeadlineMs) || operationDeadlineMs < 1)
+        throw err("invalid_input");
+      command = { ...command, operationDeadlineMs };
+      const payloadHash = await computeGoldPageActionPayloadHash(managerId, command);
+      const started = this.ctx.storage.sql.exec(
+        `UPDATE custom_gatekeeper_article_actions
+         SET status = 'applying', operation_deadline_ms = ?, command_json = ?, payload_hash = ?
+         WHERE local_action_id = ? AND status = 'pending_approval'`,
+        operationDeadlineMs,
+        JSON.stringify(command),
+        payloadHash,
+        actionId,
+      );
+      if (started.rowsWritten !== 1) throw err("result_unknown");
+    } else if (
+      !boundedInt(command.operationDeadlineMs, 1, Number.MAX_SAFE_INTEGER) ||
+      row.operation_deadline_ms !== command.operationDeadlineMs
+    ) {
+      throw err("corrupt_state");
+    }
+
+    await account.activateBronzeAction(
+      managerId,
+      {
+        workspaceId: command.namespace.workspaceId,
+        gatekeeperInstanceId: command.namespace.gatekeeperInstanceId,
+        localActionId: command.namespace.localActionId,
+        operationId: command.operationId,
+      },
+      command.operationDeadlineMs,
+    );
+    let rawEnvelope: unknown;
+    try {
+      rawEnvelope =
+        command.kind === "gold_page_edit"
+          ? await controller.editPage(command)
+          : await controller.requestProtectionReleaseAndCleanReplacement(command);
+    } catch (cause) {
+      throw err("result_unknown", cause);
+    }
+    const envelope = parseKnowledgeEnvelope(rawEnvelope);
+    if (!envelope.ok) {
+      if (envelope.code !== "result_unknown" && envelope.code !== "corrupt_state") {
+        this.ctx.storage.sql.exec(
+          `UPDATE custom_gatekeeper_article_actions SET status = 'pending_approval'
+           WHERE local_action_id = ? AND status = 'applying'`,
+          actionId,
+        );
+      }
+      throw err(envelope.code);
+    }
+    const result = parseGoldPageActionSavedResult(envelope.value, command);
+    const completed = this.ctx.storage.sql.exec(
+      `UPDATE custom_gatekeeper_article_actions
+       SET status = 'applied', command_json = '', outcome_json = ?
+       WHERE local_action_id = ? AND status = 'applying'`,
+      JSON.stringify(result),
+      actionId,
+    );
+    if (completed.rowsWritten !== 1) throw err("result_unknown");
+    await account.clearBronzeAction(managerId, {
+      ...command.namespace,
+      operationId: command.operationId,
+      operationDeadlineMs: command.operationDeadlineMs,
+    });
+  }
+
+  async #rejectGoldPageAction(
+    actionId: number,
+    row: KnowledgeArticleActionRow,
+    kind: GoldPageActionKind,
+  ): Promise<void> {
+    if (row.status === "rejected") return;
+    if (row.status === "applied") {
+      await this.#applyGoldPageAction(actionId, row, kind);
+      throw err("conflict");
+    }
+    if (row.status === "applying") throw err("result_unknown");
+    if (row.status !== "pending_approval" && row.status !== "rejecting") throw err("corrupt_state");
+    if (typeof row.command_json !== "string" || row.command_json.length === 0)
+      throw err("corrupt_state");
+    const managerId = validateProps(this.ctx.props).managerId;
+    const command = await this.#validateGoldPageActionStage(
+      row,
+      actionId,
+      this.ctx.id.toString(),
+      managerId,
+      kind,
+    );
+    const account = this.#accountAccess();
+    if (row.status === "pending_approval") {
+      const claimed = this.ctx.storage.sql.exec(
+        `UPDATE custom_gatekeeper_article_actions SET status = 'rejecting'
+         WHERE local_action_id = ? AND status = 'pending_approval'`,
+        actionId,
+      );
+      if (claimed.rowsWritten !== 1) return this.rejectAction(actionId);
+    }
+    await account.clearBronzeAction(managerId, {
+      ...command.namespace,
+      operationId: command.operationId,
+      operationDeadlineMs: command.operationDeadlineMs,
+    });
+    const rejected = this.ctx.storage.sql.exec(
+      `UPDATE custom_gatekeeper_article_actions
+       SET status = 'rejected', command_json = '', outcome_json = ?
+       WHERE local_action_id = ? AND status = 'rejecting'`,
+      JSON.stringify({ status: "rejected", operationId: command.operationId }),
+      actionId,
+    );
+    if (rejected.rowsWritten !== 1) {
+      const current = this.ctx.storage.sql
+        .exec<{ status: string }>(
+          `SELECT status FROM custom_gatekeeper_article_actions WHERE local_action_id = ?`,
+          actionId,
+        )
+        .toArray();
+      if (current.length === 1 && current[0]!.status === "rejected") return;
+      throw err("result_unknown");
+    }
+  }
+
   async #applyGoldJobControlAction(
     actionId: number,
     row: KnowledgeArticleActionRow,
@@ -3219,6 +4166,13 @@ export class CustomGatekeeper
         const { retainedBytesReserved: _retainedBytes, ...binding } = reservation;
         await account.clearKnowledgeSafeControl(managerId, binding);
       }
+      await account.clearBronzeAction(managerId, {
+        workspaceId: row.workspace_id,
+        gatekeeperInstanceId: namespace.gatekeeperInstanceId,
+        localActionId: actionId,
+        operationId: row.operation_id,
+        operationDeadlineMs: row.operation_deadline_ms,
+      });
       // A retry after the local applied write repairs only its exact leftover slot. A newer
       // same-target reservation has a different Action or operation ID and stays untouched.
       return;
@@ -3259,48 +4213,62 @@ export class CustomGatekeeper
       throw err("corrupt_state");
     }
 
-    const binding = this.#goldSafeControlBinding(command);
-    const currentReservation = await account.findKnowledgeSafeControlReservation(
-      managerId,
-      binding.target,
-    );
-    if (
-      currentReservation !== undefined &&
-      sameKnowledgeSafeControlBinding(currentReservation, {
-        ...binding,
-        operationDeadlineMs: currentReservation.operationDeadlineMs,
-      }) &&
-      (currentReservation.operationDeadlineMs === 0 ||
-        currentReservation.operationDeadlineMs === command.operationDeadlineMs)
-    ) {
-      await account.activateKnowledgeSafeControl(
+    const system1Recovery = command.intent.system1Recovery !== undefined;
+    if (system1Recovery) {
+      await account.activateBronzeAction(
         managerId,
         {
-          target: binding.target,
-          workspaceId: binding.workspaceId,
-          gatekeeperInstanceId: binding.gatekeeperInstanceId,
-          localActionId: binding.localActionId,
-          operationId: binding.operationId,
-          expectedJobFence: binding.expectedJobFence,
-          expectedControlRevision: binding.expectedControlRevision,
+          workspaceId: command.namespace.workspaceId,
+          gatekeeperInstanceId: command.namespace.gatekeeperInstanceId,
+          localActionId: command.namespace.localActionId,
+          operationId: command.operationId,
         },
         command.operationDeadlineMs,
       );
     } else {
-      // A later saved control may have already reconciled an Action whose response was lost.
-      // Only a trusted current snapshot for this exact job can prove that the old reservation is
-      // obsolete; in that case let Knowledge classify the old command as conflict without
-      // recreating or clearing any reservation, including a newer operation's slot.
-      const inspection = parseKnowledgeEnvelope(await controller.inspect());
-      if (!inspection.ok) throw err(inspection.code);
-      const current = readKnowledgeGoldControlHead(inspection.value);
+      const binding = this.#goldSafeControlBinding(command);
+      const currentReservation = await account.findKnowledgeSafeControlReservation(
+        managerId,
+        binding.target,
+      );
       if (
-        current.job === null ||
-        current.job.jobId !== command.intent.jobId ||
-        current.controlRevision <= command.intent.expectedControlRevision ||
-        current.job.fence <= command.intent.expectedJobFence
-      )
-        throw err("result_unknown");
+        currentReservation !== undefined &&
+        sameKnowledgeSafeControlBinding(currentReservation, {
+          ...binding,
+          operationDeadlineMs: currentReservation.operationDeadlineMs,
+        }) &&
+        (currentReservation.operationDeadlineMs === 0 ||
+          currentReservation.operationDeadlineMs === command.operationDeadlineMs)
+      ) {
+        await account.activateKnowledgeSafeControl(
+          managerId,
+          {
+            target: binding.target,
+            workspaceId: binding.workspaceId,
+            gatekeeperInstanceId: binding.gatekeeperInstanceId,
+            localActionId: binding.localActionId,
+            operationId: binding.operationId,
+            expectedJobFence: binding.expectedJobFence,
+            expectedControlRevision: binding.expectedControlRevision,
+          },
+          command.operationDeadlineMs,
+        );
+      } else {
+        // A later saved control may have already reconciled an Action whose response was lost.
+        // Only a trusted current snapshot for this exact job can prove that the old reservation is
+        // obsolete; in that case let Knowledge classify the old command as conflict without
+        // recreating or clearing any reservation, including a newer operation's slot.
+        const inspection = parseKnowledgeEnvelope(await controller.inspect());
+        if (!inspection.ok) throw err(inspection.code);
+        const current = readKnowledgeGoldControlHead(inspection.value);
+        if (
+          current.job === null ||
+          current.job.jobId !== command.intent.jobId ||
+          current.controlRevision <= command.intent.expectedControlRevision ||
+          current.job.fence <= command.intent.expectedJobFence
+        )
+          throw err("result_unknown");
+      }
     }
     let rawEnvelope: unknown;
     try {
@@ -3313,7 +4281,13 @@ export class CustomGatekeeper
       // A typed conflict is definitive and deliberately leaves the native Action pending. A
       // later exact retry can prove the saved receipt, or a trusted inspect can reconcile a
       // superseded reservation before a new proposal; caller versions never clear the slot.
-      if (
+      if (system1Recovery && envelope.code === "conflict") {
+        this.ctx.storage.sql.exec(
+          `UPDATE custom_gatekeeper_article_actions SET status = 'pending_approval'
+           WHERE local_action_id = ? AND status = 'applying'`,
+          actionId,
+        );
+      } else if (
         envelope.code !== "result_unknown" &&
         envelope.code !== "corrupt_state" &&
         envelope.code !== "conflict"
@@ -3335,7 +4309,15 @@ export class CustomGatekeeper
       actionId,
     );
     if (completed.rowsWritten !== 1) throw err("result_unknown");
-    await account.clearKnowledgeSafeControl(managerId, this.#goldSafeControlBinding(command));
+    if (system1Recovery) {
+      await account.clearBronzeAction(managerId, {
+        ...command.namespace,
+        operationId: command.operationId,
+        operationDeadlineMs: command.operationDeadlineMs,
+      });
+    } else {
+      await account.clearKnowledgeSafeControl(managerId, this.#goldSafeControlBinding(command));
+    }
   }
 
   async #rejectGoldJobControlAction(
@@ -3361,7 +4343,12 @@ export class CustomGatekeeper
       this.ctx.id.toString(),
       validateProps(this.ctx.props).managerId,
     );
-    if (command.operationDeadlineMs !== 0) throw err("result_unknown");
+    const system1Recovery = command.intent.system1Recovery !== undefined;
+    if (
+      (!system1Recovery && command.operationDeadlineMs !== 0) ||
+      (system1Recovery && row.status === "applying")
+    )
+      throw err("result_unknown");
     const managerId = validateProps(this.ctx.props).managerId;
     const claimed = this.ctx.storage.sql.exec(
       `UPDATE custom_gatekeeper_article_actions SET status = 'rejecting'
@@ -3370,10 +4357,18 @@ export class CustomGatekeeper
       row.status,
     );
     if (claimed.rowsWritten !== 1) throw err("result_unknown");
-    await this.#accountAccess().clearKnowledgeSafeControl(
-      managerId,
-      this.#goldSafeControlBinding(command),
-    );
+    if (system1Recovery) {
+      await this.#accountAccess().clearBronzeAction(managerId, {
+        ...command.namespace,
+        operationId: command.operationId,
+        operationDeadlineMs: command.operationDeadlineMs,
+      });
+    } else {
+      await this.#accountAccess().clearKnowledgeSafeControl(
+        managerId,
+        this.#goldSafeControlBinding(command),
+      );
+    }
     const rejected = this.ctx.storage.sql.exec(
       `UPDATE custom_gatekeeper_article_actions
        SET status = 'rejected', command_json = '', outcome_json = ?
@@ -3512,6 +4507,8 @@ export class CustomGatekeeper
     const row = rows[0]!;
     if (row.kind === "silver_policy") return this.#applySilverPolicyAction(actionId, row);
     if (row.kind === "gold_job_control") return this.#applyGoldJobControlAction(actionId, row);
+    if (row.kind === "gold_page_edit" || row.kind === "gold_page_clean_request")
+      return this.#applyGoldPageAction(actionId, row, row.kind);
     const managerId = validateProps(this.ctx.props).managerId;
     if (!isNonEmptyBoundedText(row.workspace_id, 512)) throw err("corrupt_state");
     const namespace: KnowledgeBronzeNamespace = {
@@ -3773,6 +4770,8 @@ export class CustomGatekeeper
     if (bronze?.kind === "silver_policy") return this.#rejectSilverPolicyAction(actionId, bronze);
     if (bronze?.kind === "gold_job_control")
       return this.#rejectGoldJobControlAction(actionId, bronze);
+    if (bronze?.kind === "gold_page_edit" || bronze?.kind === "gold_page_clean_request")
+      return this.#rejectGoldPageAction(actionId, bronze, bronze.kind);
     if (bronze !== undefined) {
       const managerId = validateProps(this.ctx.props).managerId;
       if (!isNonEmptyBoundedText(bronze.workspace_id, 512)) throw err("corrupt_state");
@@ -4198,6 +5197,26 @@ export class CustomAccount extends WorkerEntrypoint<Cloudflare.Env> implements G
     const access = this.ctx.exports.KnowledgeAccountAccess.getByName(managerIdValue);
     await access.bindGoldController(managerIdValue, controller);
   }
+  @skipRpcValidation() async inspectGoldPageRole(
+    managerIdValue: string,
+  ): Promise<KnowledgeGoldRoles> {
+    const p = validateProps(this.ctx.props);
+    if (!isManagerId(managerIdValue) || p.managerId !== managerIdValue)
+      throw new TypeError("Knowledge account is bound to another Manager.");
+    return this.ctx.exports.KnowledgeAccountAccess.getByName(managerIdValue).inspectGoldPageRole(
+      managerIdValue,
+    );
+  }
+  @skipRpcValidation() async installGoldPageRole(
+    managerIdValue: string,
+    controller: KnowledgeGoldPageController,
+  ): Promise<void> {
+    const p = validateProps(this.ctx.props);
+    if (!isManagerId(managerIdValue) || p.managerId !== managerIdValue)
+      throw new TypeError("Knowledge account is bound to another Manager.");
+    const access = this.ctx.exports.KnowledgeAccountAccess.getByName(managerIdValue);
+    await access.bindGoldPageController(managerIdValue, controller);
+  }
   async getSingletonGatekeeperClass(): Promise<DurableObjectClass<Gatekeeper<KnowledgeBase>>> {
     return this.ctx.exports.CustomGatekeeper({ props: validateProps(this.ctx.props) });
   }
@@ -4270,6 +5289,14 @@ export type KnowledgeBase = {
     usePolicy: "included" | "excluded";
     expectedMetadataRevision: number;
   }): Promise<{
+    status: "pending_approval";
+    operationId: string;
+  }>;
+  proposeGoldPageEdit(input: { intent: KnowledgeGoldPageEditIntent }): Promise<{
+    status: "pending_approval";
+    operationId: string;
+  }>;
+  proposeGoldCleanReplacement(input: { intent: KnowledgeGoldPageActionIntent }): Promise<{
     status: "pending_approval";
     operationId: string;
   }>;
@@ -4382,6 +5409,12 @@ export type KnowledgeSearchResult =
       coverage: KnowledgeSilverSearchCoverage;
     };
 export type KnowledgeReadResult =
+  | {
+      kind: "navigation";
+      path: "articles" | "index.md";
+      sourceMarkdown: string;
+      goldStatus: "disabled" | "enabled" | "paused";
+    }
   | {
       bundleId: string;
       versionId: string;

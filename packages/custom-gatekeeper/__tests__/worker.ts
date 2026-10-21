@@ -3,10 +3,13 @@ import type {
   AccountDescription,
   AgentCatalog,
   ApprovalQueue,
+  Gatekeeper,
+  GitCache,
   ObservationAuthorizer,
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { CustomGatekeeper, KnowledgeSession } from "../src/custom.js";
+import type { KnowledgeBase } from "../src/custom.js";
 import type { GatekeeperClient, Overseer } from "@gadgets/workshop-shared/api";
 import type { RpcStub as CapnwebRpcStub } from "capnweb";
 
@@ -29,6 +32,8 @@ const SOURCE_ID = "74444444-4444-4444-8444-444444444444";
 const REVISION_ID = "84444444-4444-4444-8444-444444444444";
 const OTHER_ID = "94444444-4444-4444-8444-444444444444";
 const NOW = "2026-01-01T00:00:00.000Z";
+const GOLD_JOB_CONTROL_CONTRACT = "cybernest-knowledge-gold-job-control-v1";
+const GOLD_PAGE_CONTROL_CONTRACT = "cybernest-knowledge-gold-page-control-v1";
 
 type KnowledgeState = "provisioning" | "ready" | "blocked";
 type ListMode = "valid" | "empty" | "failure" | "malformed" | "extra" | "rpc_failure";
@@ -295,6 +300,7 @@ type FixtureGatekeeper = {
   rejectAction(actionId: number): Promise<void | { restart?: boolean }>;
   getAutoApprovableActions(): Promise<unknown>;
   inspectBronzeRow(operationId: string): Promise<Record<string, unknown> | null>;
+  inspectArticleRow(operationId: string): Promise<Record<string, unknown> | null>;
   tamperBronzeRow(operationId: string, field: BronzeTamperField): Promise<void>;
   probeActionCollision(): Promise<{
     applyError: string | null;
@@ -303,6 +309,33 @@ type FixtureGatekeeper = {
     bronzeRows: number;
   }>;
 };
+
+type GoldPageProposalScenario =
+  | "job_role_only"
+  | "edit_retry"
+  | "clean_approve"
+  | "reject_then_resubmit"
+  | "conflict_reject_resubmit";
+type GoldPageProposalSession = Readonly<{
+  proposeGoldPageEdit(input: unknown): Promise<unknown>;
+  proposeGoldCleanReplacement(input: unknown): Promise<unknown>;
+  [Symbol.dispose](): void;
+}>;
+type GoldPageProposalResult = Readonly<{
+  jobRole: "absent" | "installed" | "incompatible";
+  pageRole: "absent" | "installed" | "incompatible";
+  proposals: unknown[];
+  proposalErrors: string[];
+  submissions: Array<{ action: number; description: unknown }>;
+  rows: Array<Record<string, unknown> | null>;
+  beforeDecisionCallbacks: Awaited<ReturnType<FixtureGoldController["goldPageCallbackSnapshot"]>>;
+  callbacks: Awaited<ReturnType<FixtureGoldController["goldPageCallbackSnapshot"]>>;
+  applyErrors: string[];
+  rejectErrors: string[];
+  autoApprovable: unknown;
+  proposalNowMs: number | null;
+  approvalNowMs: number | null;
+}>;
 
 type FixtureGatekeeperProbe = {
   probeMalformedSession(): Promise<{ duplicateCount: number; error: string | null }>;
@@ -341,7 +374,37 @@ type FixtureGatekeeperProbe = {
 type FixtureAccount = {
   describe(): Promise<AccountDescription>;
   inspectManagerBinding(managerId: string): Promise<"legacy" | "bound">;
+  inspectGoldRole(managerId: string): Promise<"absent" | "installed" | "incompatible">;
+  installGoldRole(managerId: string, controller: unknown): Promise<void>;
+  inspectGoldPageRole(managerId: string): Promise<"absent" | "installed" | "incompatible">;
+  installGoldPageRole(managerId: string, controller: unknown): Promise<void>;
   getSingletonGatekeeperClass(): Promise<DurableObjectClass<CustomGatekeeper>>;
+};
+
+type FixtureGoldControllerProps = Pick<FixtureAccessProps, "managerId" | "token"> & {
+  marker: string;
+  pageEditMode?: "normal" | "response_loss_once" | "conflict_once";
+  goldControlHead?: unknown;
+  goldControlApplyMode?: "saved_recovery" | "conflict_recovery";
+};
+
+type FixtureGoldController = {
+  assertBoundTo(managerId: string): Promise<string>;
+  inspectPage(input: unknown): Promise<unknown>;
+  admitPageAction(input: unknown): Promise<unknown>;
+  editPage(input: unknown): Promise<unknown>;
+  requestProtectionReleaseAndCleanReplacement(input: unknown): Promise<unknown>;
+  inspect(): Promise<unknown>;
+  apply(input: unknown): Promise<unknown>;
+  goldJobControlCallbackSnapshot(): Promise<{ applyInputs: unknown[] }>;
+  boundInputLog(): Promise<string[]>;
+  goldPageCallbackSnapshot(): Promise<{
+    inspectPageInputs: unknown[];
+    admitPageActionInputs: unknown[];
+    editPageInputs: unknown[];
+    cleanRequestInputs: unknown[];
+    savedEditReceipt: unknown | null;
+  }>;
 };
 
 type WorkerExports = {
@@ -349,10 +412,20 @@ type WorkerExports = {
     managerIdForTest(): Promise<string>;
     tokenForTest(): Promise<string>;
   };
+  TestGoldController(options: { props: FixtureGoldControllerProps }): FixtureGoldController;
   KnowledgeAccountAccess: {
     getByName(managerId: string): {
       bind(managerId: string, capability: unknown): Promise<void>;
       getAccess(): Promise<unknown>;
+      findKnowledgeSafeControlReservation(
+        managerId: string,
+        target: { kind: "gold_job"; id: string },
+      ): Promise<unknown>;
+      findBronzeActionReservation(
+        managerId: string,
+        gatekeeperInstanceId: string,
+        localActionId: number,
+      ): Promise<unknown>;
     };
   };
   CustomGatekeeper(options: { props: { managerId: string } }): DurableObjectClass<CustomGatekeeper>;
@@ -385,6 +458,12 @@ type AccessLog = {
   adoptionInputs: unknown[];
   adoptionOutcomeInputs: unknown[];
   adoptionOutcomeMode?: AdoptionOutcomeMode;
+  goldPageInspectInputs: unknown[];
+  goldPageAdmissionInputs: unknown[];
+  goldPageEditInputs: unknown[];
+  goldPageCleanRequestInputs: unknown[];
+  goldPageSavedEditReceipt?: unknown;
+  goldJobApplyInputs: unknown[];
 };
 
 const accessLogs = new Map<string, AccessLog>();
@@ -403,6 +482,11 @@ const accessLog = (props: FixtureAccessProps): AccessLog => {
     outcomeInputs: [],
     adoptionInputs: [],
     adoptionOutcomeInputs: [],
+    goldPageInspectInputs: [],
+    goldPageAdmissionInputs: [],
+    goldPageEditInputs: [],
+    goldPageCleanRequestInputs: [],
+    goldJobApplyInputs: [],
   };
   accessLogs.set(key, created);
   return created;
@@ -410,6 +494,9 @@ const accessLog = (props: FixtureAccessProps): AccessLog => {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
+
+const proposalOperationId = (proposal: unknown): string | null =>
+  isRecord(proposal) && typeof proposal.operationId === "string" ? proposal.operationId : null;
 
 const hashText = async (content: string): Promise<string> => {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content));
@@ -771,6 +858,10 @@ class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
     return this.#observationEntered;
   }
 
+  async getWorkspaceId(): Promise<string> {
+    return "fixture-gl06-workspace";
+  }
+
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.#calls += 1;
     this.observations.push({ ...description });
@@ -975,7 +1066,12 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }
 
   async applyAction(actionId: number): Promise<void> {
-    return this.#gatekeeper.applyAction(actionId);
+    const cache = new RpcStub<GitCache>(new UnusedGatekeeperGitCache());
+    try {
+      await (this.#gatekeeper as Gatekeeper<KnowledgeBase>).applyAction(actionId, cache);
+    } finally {
+      cache[Symbol.dispose]();
+    }
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
@@ -1324,6 +1420,201 @@ class TestObservationAuthorizer extends RpcTarget implements ObservationAuthoriz
 }
 
 class TestVerifier extends RpcTarget {}
+
+class UnusedGatekeeperGitCache extends RpcTarget implements GitCache {
+  async get(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async has(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async stat(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async put(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async advertiseCommit(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async buildPack(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async consumePack(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async isAncestor(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+}
+
+export class TestGoldController extends WorkerEntrypoint<
+  Cloudflare.Env,
+  FixtureGoldControllerProps
+> {
+  async assertBoundTo(managerId: string): Promise<string> {
+    accessLog(this.ctx.props).boundInputs.push(managerId);
+    if (managerId !== this.ctx.props.managerId)
+      throw new Error("Fixture Gold page capability is bound to another Manager.");
+    return this.ctx.props.marker;
+  }
+
+  async inspectPage(input: unknown): Promise<unknown> {
+    if (this.ctx.props.pageEditMode === undefined)
+      throw new Error("Unexpected Gold page inspect callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldPageInspectInputs.push(structuredClone(input));
+    const path = isRecord(input) && typeof input.path === "string" ? input.path : "index.md";
+    return {
+      ok: true,
+      value: {
+        pageId: "fixture-gold-page",
+        path,
+        contentHash: "a".repeat(64),
+        pageVersion: 0,
+        protectionVersion: 0,
+        ownership: "manual",
+        generated: false,
+        protected: true,
+        lineage: "manual",
+        sourceDependencies: [
+          {
+            articleId: "fixture-article",
+            revisionId: "fixture-revision",
+            bodyHash: "b".repeat(64),
+          },
+        ],
+        baselineProof: null,
+        currentPrivateBody: null,
+        retiredPrivateBodies: [],
+        pendingCleanRequest: null,
+        latestReceipt: null,
+      },
+    };
+  }
+
+  async admitPageAction(input: unknown): Promise<unknown> {
+    if (this.ctx.props.pageEditMode === undefined)
+      throw new Error("Unexpected Gold page admission callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldPageAdmissionInputs.push(structuredClone(input));
+    const pageId =
+      isRecord(input) && isRecord(input.intent) && typeof input.intent.pageId === "string"
+        ? input.intent.pageId
+        : "fixture-gold-page";
+    return { ok: true, value: { status: "admitted", pageId } };
+  }
+
+  async editPage(input: unknown): Promise<unknown> {
+    if (this.ctx.props.pageEditMode === undefined)
+      throw new Error("Unexpected Gold page edit callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldPageEditInputs.push(structuredClone(input));
+    if (this.ctx.props.pageEditMode === "conflict_once" && log.goldPageEditInputs.length === 1)
+      return { ok: false, code: "conflict" };
+    const command = isRecord(input) ? input : {};
+    const intent = isRecord(command.intent) ? command.intent : {};
+    const savedReceipt = {
+      status: "saved",
+      operation: "edit",
+      operationId: command.operationId,
+      pageId: intent.pageId,
+      pageVersion:
+        typeof intent.expectedPageVersion === "number" ? intent.expectedPageVersion + 1 : undefined,
+      protectionVersion: intent.expectedProtectionVersion,
+      controlRevision:
+        typeof intent.expectedControlRevision === "number"
+          ? intent.expectedControlRevision + 1
+          : undefined,
+    };
+    log.goldPageSavedEditReceipt ??= savedReceipt;
+    if (this.ctx.props.pageEditMode === "response_loss_once" && log.goldPageEditInputs.length === 1)
+      throw new Error("fixture response lost after Gold page edit save");
+    return { ok: true, value: log.goldPageSavedEditReceipt };
+  }
+
+  async requestProtectionReleaseAndCleanReplacement(input: unknown): Promise<unknown> {
+    if (this.ctx.props.pageEditMode === undefined)
+      throw new Error("Unexpected Gold page clean-replacement callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldPageCleanRequestInputs.push(structuredClone(input));
+    const command = isRecord(input) ? input : {};
+    const intent = isRecord(command.intent) ? command.intent : {};
+    return {
+      ok: true,
+      value: {
+        status: "saved",
+        operation: "clean_replacement",
+        operationId: command.operationId,
+        pageId: intent.pageId,
+        pageVersion: intent.expectedPageVersion,
+        protectionVersion: intent.expectedProtectionVersion,
+        controlRevision:
+          typeof intent.expectedControlRevision === "number"
+            ? intent.expectedControlRevision + 1
+            : undefined,
+      },
+    };
+  }
+
+  async inspect(): Promise<unknown> {
+    if (this.ctx.props.goldControlHead === undefined)
+      throw new Error("Unexpected Gold job inspect callback.");
+    return { ok: true, value: structuredClone(this.ctx.props.goldControlHead) };
+  }
+
+  async apply(_input: unknown): Promise<unknown> {
+    const mode = this.ctx.props.goldControlApplyMode;
+    if (mode !== "saved_recovery" && mode !== "conflict_recovery")
+      throw new Error("Unexpected Gold job apply callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldJobApplyInputs.push(structuredClone(_input));
+    if (!isRecord(_input) || !isRecord(_input.intent))
+      throw new Error("Malformed recovery command in Gold apply fixture.");
+    const intent = _input.intent;
+    if (
+      intent.operation !== "resume" ||
+      !isRecord(intent.system1Recovery) ||
+      typeof _input.operationId !== "string" ||
+      typeof intent.jobId !== "string" ||
+      typeof intent.expectedJobState !== "string" ||
+      typeof intent.expectedJobFence !== "number" ||
+      typeof intent.expectedControlRevision !== "number"
+    )
+      throw new Error("Unexpected command in Gold recovery apply fixture.");
+    if (mode === "conflict_recovery") return { ok: false, code: "conflict" };
+    return {
+      ok: true,
+      value: {
+        status: "saved",
+        operationId: _input.operationId,
+        jobId: intent.jobId,
+        state: intent.expectedJobState,
+        fence: intent.expectedJobFence,
+        controlRevision: intent.expectedControlRevision,
+      },
+    };
+  }
+
+  async goldJobControlCallbackSnapshot(): Promise<{ applyInputs: unknown[] }> {
+    return { applyInputs: structuredClone(accessLog(this.ctx.props).goldJobApplyInputs) };
+  }
+
+  async boundInputLog(): Promise<string[]> {
+    return [...accessLog(this.ctx.props).boundInputs];
+  }
+
+  async goldPageCallbackSnapshot() {
+    const log = accessLog(this.ctx.props);
+    return structuredClone({
+      inspectPageInputs: log.goldPageInspectInputs,
+      admitPageActionInputs: log.goldPageAdmissionInputs,
+      editPageInputs: log.goldPageEditInputs,
+      cleanRequestInputs: log.goldPageCleanRequestInputs,
+      savedEditReceipt: log.goldPageSavedEditReceipt ?? null,
+    });
+  }
+}
 
 export class TestGatekeeperFactory extends DurableObject {
   #exports(): WorkerExports {
@@ -2359,6 +2650,321 @@ export class TestGatekeeperFactory extends DurableObject {
     };
   }
 
+  async runGoldJobControlProposal(
+    scenario:
+      | "system1_recovery"
+      | "system1_recovery_apply"
+      | "system1_recovery_zero_revision_apply"
+      | "system1_recovery_conflict_reject"
+      | "wrong_fixed_amount"
+      | "caller_selected_next_id"
+      | "normal_resume",
+  ): Promise<{
+    proposals: unknown[];
+    proposalErrors: string[];
+    submissions: Array<{ action: number; description: unknown }>;
+    rows: Array<Record<string, unknown> | null>;
+    safeControlBefore: unknown | null;
+    safeControlAfter: unknown | null;
+    applyError: string | null;
+    appliedRow: Record<string, unknown> | null;
+    normalReservationBefore: unknown | null;
+    normalReservationAfter: unknown | null;
+    normalReservationAfterConflict: unknown | null;
+    rejectedRow: Record<string, unknown> | null;
+    goldJobApplyInputs: unknown[];
+  }> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
+    });
+    const account = await workerExports
+      .GatekeeperVendor({})
+      .createManagerAccount(managerId, access);
+    const jobId = "73444444-4444-4444-8444-444444444444";
+    const expectedJobFence = 4;
+    const expectedControlRevision = scenario === "system1_recovery_zero_revision_apply" ? 0 : 9;
+    const normalResume = scenario === "normal_resume";
+    const jobState = normalResume ? "paused_deterministic" : "published";
+    const mode = normalResume ? "paused" : "enabled";
+    const controller = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_JOB_CONTROL_CONTRACT,
+        goldControlHead: {
+          mode,
+          controlRevision: expectedControlRevision,
+          job: { jobId, state: jobState, fence: expectedJobFence },
+        },
+        ...(scenario === "system1_recovery_apply" ||
+        scenario === "system1_recovery_zero_revision_apply"
+          ? { goldControlApplyMode: "saved_recovery" as const }
+          : scenario === "system1_recovery_conflict_reject"
+            ? { goldControlApplyMode: "conflict_recovery" as const }
+            : {}),
+      },
+    });
+    await account.installGoldRole(managerId, controller);
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { managerId } });
+    const facetName = "fixture-gold-job-system1-recovery-" + crypto.randomUUID();
+    const gatekeeper = this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as FixtureGatekeeper;
+    const queueTarget = new TestApprovalQueue();
+    const queue = new RpcStub<ApprovalQueue>(queueTarget);
+    const session = (await gatekeeper.startSession(queue)) as unknown as {
+      proposeGoldJobControl(input: unknown): Promise<unknown>;
+      [Symbol.dispose](): void;
+    };
+    const proposals: unknown[] = [];
+    const proposalErrors: string[] = [];
+    const rows: Array<Record<string, unknown> | null> = [];
+    const propose = async (intent: unknown): Promise<string | null> => {
+      try {
+        const proposal = await session.proposeGoldJobControl({ intent });
+        proposals.push(proposal);
+        const operationId =
+          isRecord(proposal) && typeof proposal.operationId === "string"
+            ? proposal.operationId
+            : null;
+        if (operationId !== null) rows.push(await gatekeeper.inspectArticleRow(operationId));
+        return operationId;
+      } catch (cause) {
+        proposalErrors.push(messageOf(cause));
+        return null;
+      }
+    };
+    const reservationStore = workerExports.KnowledgeAccountAccess.getByName(managerId);
+    const findSafeControl = () =>
+      reservationStore.findKnowledgeSafeControlReservation(managerId, {
+        kind: "gold_job",
+        id: jobId,
+      });
+    const ordinaryControl = {
+      jobId,
+      expectedJobState: jobState,
+      expectedJobFence,
+      expectedControlRevision,
+    };
+    let safeControlBefore: unknown | null = null;
+    let applyError: string | null = null;
+    let appliedRow: Record<string, unknown> | null = null;
+    let normalReservationBefore: unknown | null = null;
+    let normalReservationAfter: unknown | null = null;
+    let normalReservationAfterConflict: unknown | null = null;
+    let rejectedRow: Record<string, unknown> | null = null;
+    let goldJobApplyInputs: unknown[] = [];
+    try {
+      if (!normalResume) {
+        await propose({ operation: "stop", ...ordinaryControl });
+        safeControlBefore = (await findSafeControl()) ?? null;
+      }
+      let intent: Record<string, unknown>;
+      if (normalResume) {
+        intent = { operation: "resume", ...ordinaryControl };
+      } else {
+        const descriptor: Record<string, unknown> = {
+          decisionKeyHash: "a".repeat(64),
+          expectedRequestId: "64444444-4444-4444-8444-444444444444",
+          additionalMaxMicroUsd: scenario === "wrong_fixed_amount" ? 5_001 : 5_000,
+        };
+        if (scenario === "caller_selected_next_id") descriptor.nextRequestId = crypto.randomUUID();
+        intent = {
+          operation: "resume",
+          ...ordinaryControl,
+          system1Recovery: descriptor,
+        };
+      }
+      await propose(intent);
+      if (
+        scenario === "system1_recovery_apply" ||
+        scenario === "system1_recovery_zero_revision_apply" ||
+        scenario === "system1_recovery_conflict_reject"
+      ) {
+        const submittedRecovery = queueTarget.snapshot().submissions[1];
+        const recoveryOperationId =
+          isRecord(proposals[1]) && typeof proposals[1].operationId === "string"
+            ? proposals[1].operationId
+            : null;
+        if (submittedRecovery === undefined || recoveryOperationId === null)
+          throw new Error("Missing staged recovery Action.");
+        const staged = await gatekeeper.inspectArticleRow(recoveryOperationId);
+        if (typeof staged?.command_json !== "string")
+          throw new Error("Missing staged recovery command.");
+        const stagedCommand = JSON.parse(staged.command_json) as {
+          namespace?: { gatekeeperInstanceId?: string; localActionId?: number };
+          system1RecoveryNextRequestId?: string;
+        };
+        if (
+          typeof stagedCommand.namespace?.gatekeeperInstanceId !== "string" ||
+          typeof stagedCommand.namespace.localActionId !== "number" ||
+          typeof stagedCommand.system1RecoveryNextRequestId !== "string"
+        )
+          throw new Error("Malformed staged recovery binding.");
+        const gatekeeperInstanceId = stagedCommand.namespace.gatekeeperInstanceId;
+        const localActionId = stagedCommand.namespace.localActionId;
+        const findNormalReservation = () =>
+          reservationStore.findBronzeActionReservation(
+            managerId,
+            gatekeeperInstanceId,
+            localActionId,
+          );
+        normalReservationBefore = (await findNormalReservation()) ?? null;
+        try {
+          await gatekeeper.applyAction(submittedRecovery.action);
+        } catch (cause) {
+          applyError = messageOf(cause);
+        }
+        appliedRow = await gatekeeper.inspectArticleRow(recoveryOperationId);
+        if (scenario === "system1_recovery_conflict_reject") {
+          normalReservationAfterConflict = (await findNormalReservation()) ?? null;
+          await gatekeeper.rejectAction(submittedRecovery.action);
+          rejectedRow = await gatekeeper.inspectArticleRow(recoveryOperationId);
+        }
+        normalReservationAfter = (await findNormalReservation()) ?? null;
+        if (scenario === "system1_recovery_zero_revision_apply")
+          await gatekeeper.applyAction(submittedRecovery.action);
+        goldJobApplyInputs = (await controller.goldJobControlCallbackSnapshot()).applyInputs;
+      }
+      const safeControlAfter = (await findSafeControl()) ?? null;
+      return {
+        proposals,
+        proposalErrors,
+        submissions: queueTarget.snapshot().submissions,
+        rows,
+        safeControlBefore,
+        safeControlAfter,
+        applyError,
+        appliedRow,
+        normalReservationBefore,
+        normalReservationAfter,
+        normalReservationAfterConflict,
+        rejectedRow,
+        goldJobApplyInputs,
+      };
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
+  }
+
+  async runGoldPageRoleIsolation(): Promise<{
+    jobRole: "absent" | "installed" | "incompatible";
+    pageRoleBefore: "absent" | "installed" | "incompatible";
+    foreignInstallError: string | null;
+    pageRoleAfterForeign: "absent" | "installed" | "incompatible";
+    wrongMarkerInstallError: string | null;
+    pageRoleAfterWrongMarker: "absent" | "installed" | "incompatible";
+  }> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
+    });
+    const account = await workerExports
+      .GatekeeperVendor({})
+      .createManagerAccount(managerId, access);
+
+    const jobController = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_JOB_CONTROL_CONTRACT,
+      },
+    });
+    await account.installGoldRole(managerId, jobController);
+    const jobRole = await account.inspectGoldRole(managerId);
+    const pageRoleBefore = await account.inspectGoldPageRole(managerId);
+
+    let foreignInstallError: string | null = null;
+    try {
+      const foreignController = workerExports.TestGoldController({
+        props: {
+          managerId: crypto.randomUUID(),
+          token: crypto.randomUUID(),
+          marker: GOLD_PAGE_CONTROL_CONTRACT,
+        },
+      });
+      await account.installGoldPageRole(managerId, foreignController);
+    } catch (cause) {
+      foreignInstallError = messageOf(cause);
+    }
+    const pageRoleAfterForeign = await account.inspectGoldPageRole(managerId);
+
+    let wrongMarkerInstallError: string | null = null;
+    try {
+      const wrongMarkerController = workerExports.TestGoldController({
+        props: {
+          managerId,
+          token: crypto.randomUUID(),
+          marker: GOLD_JOB_CONTROL_CONTRACT,
+        },
+      });
+      await account.installGoldPageRole(managerId, wrongMarkerController);
+    } catch (cause) {
+      wrongMarkerInstallError = messageOf(cause);
+    }
+    const pageRoleAfterWrongMarker = await account.inspectGoldPageRole(managerId);
+
+    return {
+      jobRole,
+      pageRoleBefore,
+      foreignInstallError,
+      pageRoleAfterForeign,
+      wrongMarkerInstallError,
+      pageRoleAfterWrongMarker,
+    };
+  }
+
+  async runGoldPageRoleBinding(): Promise<{
+    pageRoleAfterInstall: "absent" | "installed" | "incompatible";
+    pageRoleAfterRetry: "absent" | "installed" | "incompatible";
+    firstControllerChecks: number;
+    firstControllerChecksAfterRetry: number;
+    firstControllerChecksAfterReadback: number;
+  }> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
+    });
+    const account = await workerExports
+      .GatekeeperVendor({})
+      .createManagerAccount(managerId, access);
+    const firstController = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_PAGE_CONTROL_CONTRACT,
+      },
+    });
+    await account.installGoldPageRole(managerId, firstController);
+    const pageRoleAfterInstall = await account.inspectGoldPageRole(managerId);
+    const firstControllerChecks = (await firstController.boundInputLog()).length;
+
+    const retryController = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_PAGE_CONTROL_CONTRACT,
+      },
+    });
+    await account.installGoldPageRole(managerId, retryController);
+    const firstControllerChecksAfterRetry = (await firstController.boundInputLog()).length;
+    const pageRoleAfterRetry = await account.inspectGoldPageRole(managerId);
+
+    return {
+      pageRoleAfterInstall,
+      pageRoleAfterRetry,
+      firstControllerChecks,
+      firstControllerChecksAfterRetry,
+      firstControllerChecksAfterReadback: (await firstController.boundInputLog()).length,
+    };
+  }
+
   async runConcurrentAccountBinding(): Promise<{
     bindResults: Array<"fulfilled" | "rejected">;
     firstStored: string;
@@ -2455,6 +3061,195 @@ export class TestGatekeeperFactory extends DurableObject {
       return { binding: await account.inspectManagerBinding(MANAGER_ID), error: null };
     } catch (cause) {
       return { binding: null, error: messageOf(cause) };
+    }
+  }
+
+  async runGoldPageProposal(scenario: GoldPageProposalScenario): Promise<GoldPageProposalResult> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
+    });
+    const account = await workerExports
+      .GatekeeperVendor({})
+      .createManagerAccount(managerId, access);
+    const pageController = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_PAGE_CONTROL_CONTRACT,
+        pageEditMode:
+          scenario === "edit_retry"
+            ? "response_loss_once"
+            : scenario === "conflict_reject_resubmit"
+              ? "conflict_once"
+              : "normal",
+      },
+    });
+    if (scenario === "job_role_only") {
+      const jobController = workerExports.TestGoldController({
+        props: {
+          managerId,
+          token: crypto.randomUUID(),
+          marker: GOLD_JOB_CONTROL_CONTRACT,
+        },
+      });
+      await account.installGoldRole(managerId, jobController);
+    } else {
+      await account.installGoldPageRole(managerId, pageController);
+    }
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { managerId } });
+    const facetName = "fixture-gl06-gold-page-action-" + crypto.randomUUID();
+    const gatekeeper = this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as FixtureGatekeeper;
+    const queueTarget = new TestApprovalQueue();
+    const queue = new RpcStub<ApprovalQueue>(queueTarget);
+    const session = (await gatekeeper.startSession(queue)) as unknown as GoldPageProposalSession;
+    const sourceContext: NativeGoldPageSourceContext[] = [
+      {
+        articleId: "fixture-article",
+        revisionId: "fixture-revision",
+        bodyHash: "b".repeat(64),
+        metadataRevision: 1,
+        projectionVersions: {
+          projectionRuleVersion: "silver-v1",
+          processedVersion: "c".repeat(64),
+          relationVersion: "d".repeat(64),
+        },
+      },
+    ];
+    const intent: NativeGoldPageActionBinding = {
+      path: "index.md",
+      pageId: "fixture-gold-page",
+      expectedPageVersion: 0,
+      expectedProtectionVersion: 0,
+      expectedControlRevision: 0,
+      sourceContext,
+    };
+    const editInput: NativeGoldPageEditProposal = {
+      intent: { ...intent, content: "# Owner reviewed edit\n" },
+    };
+    const cleanInput: NativeGoldCleanReplacementProposal = { intent };
+    const proposals: unknown[] = [];
+    const proposalErrors: string[] = [];
+    const applyErrors: string[] = [];
+    const rejectErrors: string[] = [];
+    const rows: Array<Record<string, unknown> | null> = [];
+    let proposalNowMs: number | null = null;
+    let approvalNowMs: number | null = null;
+    const propose = async (kind: "edit" | "clean"): Promise<string | null> => {
+      try {
+        const proposal =
+          kind === "edit"
+            ? await session.proposeGoldPageEdit(editInput)
+            : await session.proposeGoldCleanReplacement(cleanInput);
+        proposals.push(proposal);
+        const operationId = proposalOperationId(proposal);
+        if (operationId !== null) rows.push(await gatekeeper.inspectArticleRow(operationId));
+        return operationId;
+      } catch (cause) {
+        proposalErrors.push(messageOf(cause));
+        return null;
+      }
+    };
+
+    let beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+    try {
+      if (scenario === "job_role_only") {
+        await propose("edit");
+      } else if (scenario === "edit_retry") {
+        const originalDateNow = Date.now;
+        let logicalNow = originalDateNow();
+        Date.now = () => logicalNow;
+        try {
+          proposalNowMs = logicalNow;
+          const operationId = await propose("edit");
+          beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+          logicalNow += 300_001;
+          approvalNowMs = logicalNow;
+          const action = queueTarget.submissions[0];
+          if (operationId !== null && action !== undefined) {
+            try {
+              await gatekeeper.applyAction(action.action);
+            } catch (cause) {
+              applyErrors.push(messageOf(cause));
+            }
+            try {
+              await gatekeeper.applyAction(action.action);
+            } catch (cause) {
+              applyErrors.push(messageOf(cause));
+            }
+            rows.push(await gatekeeper.inspectArticleRow(operationId));
+          }
+        } finally {
+          Date.now = originalDateNow;
+        }
+      } else if (scenario === "clean_approve") {
+        const operationId = await propose("clean");
+        beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+        const action = queueTarget.submissions[0];
+        if (operationId !== null && action !== undefined) {
+          try {
+            await gatekeeper.applyAction(action.action);
+          } catch (cause) {
+            applyErrors.push(messageOf(cause));
+          }
+          rows.push(await gatekeeper.inspectArticleRow(operationId));
+        }
+      } else if (scenario === "reject_then_resubmit") {
+        const firstOperationId = await propose("edit");
+        beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+        const firstAction = queueTarget.submissions[0];
+        if (firstOperationId !== null && firstAction !== undefined) {
+          await gatekeeper.rejectAction(firstAction.action);
+          rows[0] = await gatekeeper.inspectArticleRow(firstOperationId);
+        }
+        const secondOperationId = await propose("edit");
+        if (secondOperationId !== null)
+          rows.push(await gatekeeper.inspectArticleRow(secondOperationId));
+      } else {
+        const operationId = await propose("edit");
+        beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+        const action = queueTarget.submissions[0];
+        if (operationId !== null && action !== undefined) {
+          try {
+            await gatekeeper.applyAction(action.action);
+          } catch (cause) {
+            applyErrors.push(messageOf(cause));
+          }
+          rows.push(await gatekeeper.inspectArticleRow(operationId));
+          try {
+            await gatekeeper.rejectAction(action.action);
+          } catch (cause) {
+            rejectErrors.push(messageOf(cause));
+          }
+          rows.push(await gatekeeper.inspectArticleRow(operationId));
+        }
+        const secondOperationId = await propose("edit");
+        if (secondOperationId !== null)
+          rows.push(await gatekeeper.inspectArticleRow(secondOperationId));
+      }
+
+      return {
+        jobRole: await account.inspectGoldRole(managerId),
+        pageRole: await account.inspectGoldPageRole(managerId),
+        proposals,
+        proposalErrors,
+        submissions: queueTarget.snapshot().submissions,
+        rows,
+        beforeDecisionCallbacks,
+        callbacks: await pageController.goldPageCallbackSnapshot(),
+        applyErrors,
+        rejectErrors,
+        autoApprovable: await gatekeeper.getAutoApprovableActions(),
+        proposalNowMs,
+        approvalNowMs,
+      };
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
     }
   }
 
@@ -2712,6 +3507,31 @@ type NativeOwnerExports = {
 };
 
 type NativeOwnerGatekeeper = CapnwebRpcStub<GatekeeperClient<KnowledgeSession>>;
+type NativeGoldPageSourceContext = Readonly<{
+  articleId: string;
+  revisionId: string;
+  bodyHash: string;
+  metadataRevision: number;
+  projectionVersions: Readonly<{
+    projectionRuleVersion: string;
+    processedVersion: string;
+    relationVersion: string;
+  }>;
+}>;
+type NativeGoldPageActionBinding = Readonly<{
+  path: string;
+  pageId: string;
+  expectedPageVersion: number;
+  expectedProtectionVersion: number;
+  expectedControlRevision: number;
+  sourceContext: readonly NativeGoldPageSourceContext[];
+}>;
+type NativeGoldPageEditProposal = Readonly<{
+  intent: NativeGoldPageActionBinding & Readonly<{ content: string }>;
+}>;
+type NativeGoldCleanReplacementProposal = Readonly<{
+  intent: NativeGoldPageActionBinding;
+}>;
 
 // Every operation opens and closes a real pinned Overseer owner session inside this Durable
 // Object event. That keeps the native notifyClosed callback alive until its completion is observed.
@@ -2773,6 +3593,47 @@ export class NativeApprovalOwner extends DurableObject<Cloudflare.Env> {
     return page.entries;
   }
 
+  async readKnowledgeSession(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    path: string,
+  ): Promise<unknown> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      const gatekeeper = (await owner.getGatekeeperById(
+        gatekeeperId,
+      )) as unknown as NativeOwnerGatekeeper;
+      try {
+        const session = await gatekeeper.openSession();
+        try {
+          return await session.read({ path });
+        } finally {
+          session[Symbol.dispose]();
+        }
+      } finally {
+        gatekeeper[Symbol.dispose]();
+      }
+    });
+  }
+
+  async readKnowledgeSessionOutcome(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    path: string,
+  ): Promise<Readonly<{ ok: true; value: unknown } | { ok: false; code: "not_found" }>> {
+    try {
+      return {
+        ok: true,
+        value: await this.readKnowledgeSession(managerId, workspaceId, gatekeeperId, path),
+      };
+    } catch (cause) {
+      if (cause instanceof Error && cause.message === "Knowledge Base not_found.")
+        return { ok: false, code: "not_found" };
+      throw cause;
+    }
+  }
+
   async proposeArticle(
     managerId: string,
     workspaceId: string,
@@ -2811,6 +3672,70 @@ export class NativeApprovalOwner extends DurableObject<Cloudflare.Env> {
         try {
           try {
             return await session.proposeGoldJobControl(input);
+          } catch (cause) {
+            return { error: messageOf(cause) };
+          }
+        } finally {
+          session[Symbol.dispose]();
+        }
+      } finally {
+        gatekeeper[Symbol.dispose]();
+      }
+    });
+  }
+
+  async proposeGoldPageEdit(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    input: NativeGoldPageEditProposal,
+  ): Promise<unknown> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      const gatekeeper = (await owner.getGatekeeperById(
+        gatekeeperId,
+      )) as unknown as NativeOwnerGatekeeper;
+      try {
+        const session = await gatekeeper.openSession();
+        try {
+          try {
+            return await (
+              session as typeof session & {
+                proposeGoldPageEdit(input: NativeGoldPageEditProposal): Promise<unknown>;
+              }
+            ).proposeGoldPageEdit(input);
+          } catch (cause) {
+            return { error: messageOf(cause) };
+          }
+        } finally {
+          session[Symbol.dispose]();
+        }
+      } finally {
+        gatekeeper[Symbol.dispose]();
+      }
+    });
+  }
+
+  async proposeGoldCleanReplacement(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    input: NativeGoldCleanReplacementProposal,
+  ): Promise<unknown> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      const gatekeeper = (await owner.getGatekeeperById(
+        gatekeeperId,
+      )) as unknown as NativeOwnerGatekeeper;
+      try {
+        const session = await gatekeeper.openSession();
+        try {
+          try {
+            return await (
+              session as typeof session & {
+                proposeGoldCleanReplacement(
+                  input: NativeGoldCleanReplacementProposal,
+                ): Promise<unknown>;
+              }
+            ).proposeGoldCleanReplacement(input);
           } catch (cause) {
             return { error: messageOf(cause) };
           }

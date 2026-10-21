@@ -909,6 +909,7 @@ const driverScript = await build({
               search: await knowledgeSessionA.search({ query: "cobalt", offset: 0, limit: 16 }),
               foreignSearch: await knowledgeSessionA.search({ query: "amber", offset: 0, limit: 16 }),
               read: await knowledgeSessionA.read({ path: "concepts/shared.md" }),
+              articles: await knowledgeSessionA.read({ path: "articles" }),
             };
             let foreignPageReadError;
             try {
@@ -1688,9 +1689,11 @@ function createMiniflareOptions(
       {
         ...common,
         name: "knowledge",
-        script: workerScripts.knowledge ?? knowledgeScript,
+        ...(workerScripts.knowledge === undefined
+          ? { rootPath: knowledgeRuntimeDirectory, scriptPath: "knowledge.mjs" }
+          : { script: workerScripts.knowledge }),
         compatibilityDate: "2026-10-01",
-        compatibilityFlags,
+        compatibilityFlags: [...compatibilityFlags, "new_module_registry"],
         bindings: { APP_ENV: "dev", APP_ORIGIN: "https://knowledge.d03.invalid" },
         durableObjects: knowledgeDurableObjects,
         r2Buckets: ["KNOWLEDGE_BRONZE_BUCKET"],
@@ -2477,6 +2480,7 @@ test(
         profileReady: true,
         provenanceConfirmed: true,
         accountState: "absent",
+        bronzeRoles: { sourceReader: "absent", writer: "absent" },
       },
     });
     assert.deepEqual(result.installB, { ok: true, value: { managerId: identities.B.managerId } });
@@ -2487,6 +2491,7 @@ test(
         profileReady: true,
         provenanceConfirmed: true,
         accountState: "bound",
+        bronzeRoles: { sourceReader: "installed", writer: "installed" },
       },
     });
     assert.deepEqual(result.preflightAAfterProof, {
@@ -2496,6 +2501,7 @@ test(
         profileReady: true,
         provenanceConfirmed: true,
         accountState: "absent",
+        bronzeRoles: { sourceReader: "absent", writer: "absent" },
       },
     });
     assert.equal(typeof result.crossManagerInstallError, "string");
@@ -2509,6 +2515,7 @@ test(
         profileReady: true,
         provenanceConfirmed: true,
         accountState: "bound",
+        bronzeRoles: { sourceReader: "installed", writer: "installed" },
       },
     });
     assert.equal(result.crossManagerConnectCode, "WORKSPACE_ACCESS_DENIED");
@@ -2533,6 +2540,16 @@ test(
     assert.equal(result.readsA.read.path, "concepts/shared.md");
     assert.equal(result.readsA.read.sourceMarkdown, d01Fixtures.A_SHARED_SOURCE);
     assert.deepEqual(result.readsA.read.metadata, d01Fixtures.A_SHARED_METADATA);
+    assert.deepEqual(Object.keys(result.readsA.articles).sort(), [
+      "goldStatus",
+      "kind",
+      "path",
+      "sourceMarkdown",
+    ]);
+    assert.equal(result.readsA.articles.kind, "navigation");
+    assert.equal(result.readsA.articles.path, "articles");
+    assert.equal(result.readsA.articles.goldStatus, "disabled");
+    assert.equal(typeof result.readsA.articles.sourceMarkdown, "string");
     assert.equal(result.foreignPageReadError, "Knowledge Base page_not_found.");
 
     assert.deepEqual(
