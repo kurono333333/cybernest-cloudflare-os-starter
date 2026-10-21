@@ -2,13 +2,15 @@ import { DurableObject, RpcStub, RpcTarget, WorkerEntrypoint } from "cloudflare:
 import type {
   AccountDescription,
   AgentCatalog,
-  AgentCatalogRequest,
   ApprovalQueue,
+  Gatekeeper,
+  GitCache,
   ObservationAuthorizer,
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
-import { CustomGatekeeper } from "../src/custom.js";
-import type { Overseer } from "@gadgets/workshop-shared/api";
+import { CustomGatekeeper, KnowledgeSession } from "../src/custom.js";
+import type { KnowledgeBase } from "../src/custom.js";
+import type { GatekeeperClient, Overseer } from "@gadgets/workshop-shared/api";
 import type { RpcStub as CapnwebRpcStub } from "capnweb";
 
 export { default } from "../src/index.js";
@@ -30,15 +32,11 @@ const SOURCE_ID = "74444444-4444-4444-8444-444444444444";
 const REVISION_ID = "84444444-4444-4444-8444-444444444444";
 const OTHER_ID = "94444444-4444-4444-8444-444444444444";
 const NOW = "2026-01-01T00:00:00.000Z";
+const GOLD_JOB_CONTROL_CONTRACT = "cybernest-knowledge-gold-job-control-v1";
+const GOLD_PAGE_CONTROL_CONTRACT = "cybernest-knowledge-gold-page-control-v1";
 
 type KnowledgeState = "provisioning" | "ready" | "blocked";
-type ListMode =
-  | "valid"
-  | "empty"
-  | "failure"
-  | "malformed"
-  | "extra"
-  | "rpc_failure";
+type ListMode = "valid" | "empty" | "failure" | "malformed" | "extra" | "rpc_failure";
 type BronzeMode =
   | "current"
   | "historical"
@@ -103,6 +101,9 @@ type AdoptionOutcomeMode =
 type FixtureAccessProps = {
   managerId: string;
   token?: string;
+  d04ReaderMode?: boolean;
+  d04ArticleRead?: boolean;
+  receiptSchedule?: "stable" | "renewal_during_observation";
   createMode?: CreateMode;
   outcomeMode?: OutcomeMode;
   states?: KnowledgeState[];
@@ -110,6 +111,7 @@ type FixtureAccessProps = {
   bronzeMode?: BronzeMode;
   nextCursor?: NextCursorMode;
   assertMode?: AssertMode;
+  bindDelayMs?: number;
   adoptionMode?: AdoptionMode;
   adoptionOutcomeMode?: AdoptionOutcomeMode;
   reviewDisplayName?: string;
@@ -122,6 +124,124 @@ type BronzeCall = {
   revisionId?: string;
 };
 
+type D04ListInput = { offset: number; limit: number };
+type D04SearchInput =
+  | { query: string; offset: number; limit: number }
+  | {
+      kind: "articles";
+      filters?: { type?: string; title?: string; description?: string; tag?: string };
+      cursor?: string;
+      limit: number;
+    }
+  | {
+      kind: "article-links";
+      articleId: string;
+      direction: "links" | "backlinks";
+      maxDepth: number;
+      candidateBudget: number;
+    };
+type D04ReadInput = { path: string };
+type D04ReaderResult = {
+  list: {
+    bundleId: string;
+    versionId: string;
+    items: Array<{ path: string }>;
+  };
+  search: {
+    bundleId: string;
+    versionId: string;
+    hits: Array<{ path: string; line: number; snippet: string }>;
+  };
+  read: {
+    bundleId: string;
+    versionId: string;
+    path: string;
+    sourceMarkdown: string;
+    metadata: Record<string, unknown>;
+  };
+};
+type D04ArticleReadResult = {
+  kind: "article";
+  articleId: string;
+  revisionId: string;
+  bodyHash: string;
+  path: string;
+  sourceMarkdown: string;
+  metadata: Record<string, unknown>;
+};
+const D04_BUNDLE_ID = "a".repeat(64);
+const D04_VERSION_ID = "94444444-4444-4444-8444-444444444444";
+const D04_READER_RESULT: D04ReaderResult = {
+  list: {
+    bundleId: D04_BUNDLE_ID,
+    versionId: D04_VERSION_ID,
+    items: [{ path: "index.md" }],
+  },
+  search: {
+    bundleId: D04_BUNDLE_ID,
+    versionId: D04_VERSION_ID,
+    hits: [{ path: "index.md", line: 1, snippet: "Private Knowledge fixture." }],
+  },
+  read: {
+    bundleId: D04_BUNDLE_ID,
+    versionId: D04_VERSION_ID,
+    path: "index.md",
+    sourceMarkdown: "# Private Knowledge fixture\n",
+    metadata: { type: "Concept" },
+  },
+};
+const D04_ARTICLE_READ_RESULT: D04ArticleReadResult = {
+  kind: "article",
+  articleId: "a",
+  revisionId: "silver-revision-7",
+  bodyHash: "b".repeat(64),
+  path: "articles/YQ.md",
+  sourceMarkdown: "# Private Knowledge article\n",
+  metadata: { type: "Concept" },
+};
+const D04_SILVER_COVERAGE = {
+  metadata: { status: "complete", reasons: [] },
+  internalLinks: { status: "complete", reasons: [] },
+  sources: { status: "complete", reasons: [] },
+} as const;
+const D04_SILVER_ITEM = {
+  articleId: "a",
+  currentRevisionId: "r",
+  usePolicy: "included",
+  currentPath: "articles/YQ.md",
+  exactRevisionPath: "articles/YQ/revisions/cg.md",
+  bodyHash: "b".repeat(64),
+  state: "indexed",
+  projection: {
+    articleId: "a",
+    inputRevisionId: "r",
+    projectionRuleVersion: "silver-v1",
+    processedVersion: "c".repeat(64),
+    relationVersion: "d".repeat(64),
+    metadata: { type: "Source", title: "Article A" },
+    literalLinks: [],
+    backlinks: [],
+    sources: [],
+    coverage: D04_SILVER_COVERAGE,
+  },
+  coverage: D04_SILVER_COVERAGE,
+} as const;
+const D04_ARTICLES_SEARCH_RESULT = {
+  kind: "articles",
+  items: [D04_SILVER_ITEM],
+  nextCursor: "a",
+  coverage: D04_SILVER_COVERAGE,
+};
+const D04_ARTICLE_LINKS_SEARCH_RESULT = {
+  kind: "article-links",
+  items: [{ depth: 0, item: D04_SILVER_ITEM }],
+  coverage: D04_SILVER_COVERAGE,
+};
+const d04SuccessReceipt = <A>(value: A, expiresAt: number) => ({
+  ok: true as const,
+  value: { value, expiresAt },
+});
+
 type FixtureAccessInspector = {
   readInputLog(): Promise<unknown[]>;
   boundInputLog(): Promise<string[]>;
@@ -130,6 +250,12 @@ type FixtureAccessInspector = {
   adoptionInputLog(): Promise<unknown[]>;
   adoptionOutcomeInputLog(): Promise<unknown[]>;
   setAdoptionOutcomeMode(mode: AdoptionOutcomeMode): Promise<void>;
+  d04ReaderSnapshot(): Promise<{
+    listInputs: unknown[];
+    searchInputs: unknown[];
+    readInputs: unknown[];
+    readExpirySnapshots: number[];
+  }>;
 };
 
 type FixtureKnowledge = {
@@ -155,6 +281,8 @@ type FixturePage = {
 };
 
 type FixtureSession = {
+  // This test-only compatibility surface is used solely by suites below that are retired in D04.
+  // It does not describe or exercise the Agent-facing KnowledgeSession implementation.
   list(options?: { cursor?: string; limit?: number }): Promise<FixturePage>;
   proposeKnowledgeCreate(input: unknown): Promise<unknown>;
   readCreationOutcome(input: unknown): Promise<unknown | null>;
@@ -165,18 +293,14 @@ type BronzeTamperField = "document" | "content_hash" | "action_ref" | "fingerpri
 
 type FixtureGatekeeper = {
   startSession(queue: RpcStub<ApprovalQueue>): Promise<FixtureSession>;
-  getAgentCatalog(
-    request: AgentCatalogRequest,
-    authorizer: RpcStub<ObservationAuthorizer>,
-  ): Promise<AgentCatalog>;
-  addObserver(
-    observerId: string,
-    user: unknown,
-  ): Promise<void>;
+  getTypeScriptTypes(): Promise<string>;
+  getAgentCatalog(...args: unknown[]): Promise<AgentCatalog>;
+  addObserver(observerId: string, user: unknown): Promise<void>;
   applyAction(actionId: number): Promise<void>;
   rejectAction(actionId: number): Promise<void | { restart?: boolean }>;
   getAutoApprovableActions(): Promise<unknown>;
   inspectBronzeRow(operationId: string): Promise<Record<string, unknown> | null>;
+  inspectArticleRow(operationId: string): Promise<Record<string, unknown> | null>;
   tamperBronzeRow(operationId: string, field: BronzeTamperField): Promise<void>;
   probeActionCollision(): Promise<{
     applyError: string | null;
@@ -185,6 +309,33 @@ type FixtureGatekeeper = {
     bronzeRows: number;
   }>;
 };
+
+type GoldPageProposalScenario =
+  | "job_role_only"
+  | "edit_retry"
+  | "clean_approve"
+  | "reject_then_resubmit"
+  | "conflict_reject_resubmit";
+type GoldPageProposalSession = Readonly<{
+  proposeGoldPageEdit(input: unknown): Promise<unknown>;
+  proposeGoldCleanReplacement(input: unknown): Promise<unknown>;
+  [Symbol.dispose](): void;
+}>;
+type GoldPageProposalResult = Readonly<{
+  jobRole: "absent" | "installed" | "incompatible";
+  pageRole: "absent" | "installed" | "incompatible";
+  proposals: unknown[];
+  proposalErrors: string[];
+  submissions: Array<{ action: number; description: unknown }>;
+  rows: Array<Record<string, unknown> | null>;
+  beforeDecisionCallbacks: Awaited<ReturnType<FixtureGoldController["goldPageCallbackSnapshot"]>>;
+  callbacks: Awaited<ReturnType<FixtureGoldController["goldPageCallbackSnapshot"]>>;
+  applyErrors: string[];
+  rejectErrors: string[];
+  autoApprovable: unknown;
+  proposalNowMs: number | null;
+  approvalNowMs: number | null;
+}>;
 
 type FixtureGatekeeperProbe = {
   probeMalformedSession(): Promise<{ duplicateCount: number; error: string | null }>;
@@ -211,20 +362,76 @@ type FixtureGatekeeperProbe = {
     errors: string[];
   }>;
   probeApplyRejectRace(): Promise<{ createInputs: unknown[]; errors: string[] }>;
-  probeResponseLoss(): Promise<{ createInputs: unknown[]; outcomeInputs: unknown[]; status: string; errors: string[] }>;
+  probeResponseLoss(): Promise<{
+    createInputs: unknown[];
+    outcomeInputs: unknown[];
+    status: string;
+    errors: string[];
+  }>;
   probeActionRefFingerprintMismatch(): Promise<{ observations: number; error: string | null }>;
 };
 
 type FixtureAccount = {
   describe(): Promise<AccountDescription>;
   inspectManagerBinding(managerId: string): Promise<"legacy" | "bound">;
+  inspectGoldRole(managerId: string): Promise<"absent" | "installed" | "incompatible">;
+  installGoldRole(managerId: string, controller: unknown): Promise<void>;
+  inspectGoldPageRole(managerId: string): Promise<"absent" | "installed" | "incompatible">;
+  installGoldPageRole(managerId: string, controller: unknown): Promise<void>;
   getSingletonGatekeeperClass(): Promise<DurableObjectClass<CustomGatekeeper>>;
 };
 
+type FixtureGoldControllerProps = Pick<FixtureAccessProps, "managerId" | "token"> & {
+  marker: string;
+  pageEditMode?: "normal" | "response_loss_once" | "conflict_once";
+  goldControlHead?: unknown;
+  goldControlApplyMode?: "saved_recovery" | "conflict_recovery";
+};
+
+type FixtureGoldController = {
+  assertBoundTo(managerId: string): Promise<string>;
+  inspectPage(input: unknown): Promise<unknown>;
+  admitPageAction(input: unknown): Promise<unknown>;
+  editPage(input: unknown): Promise<unknown>;
+  requestProtectionReleaseAndCleanReplacement(input: unknown): Promise<unknown>;
+  inspect(): Promise<unknown>;
+  apply(input: unknown): Promise<unknown>;
+  goldJobControlCallbackSnapshot(): Promise<{ applyInputs: unknown[] }>;
+  boundInputLog(): Promise<string[]>;
+  goldPageCallbackSnapshot(): Promise<{
+    inspectPageInputs: unknown[];
+    admitPageActionInputs: unknown[];
+    editPageInputs: unknown[];
+    cleanRequestInputs: unknown[];
+    savedEditReceipt: unknown | null;
+  }>;
+};
+
 type WorkerExports = {
-  TestKnowledgeAccess(options: { props: FixtureAccessProps }): FixtureAccessInspector & { managerIdForTest(): Promise<string> };
+  TestKnowledgeAccess(options: { props: FixtureAccessProps }): FixtureAccessInspector & {
+    managerIdForTest(): Promise<string>;
+    tokenForTest(): Promise<string>;
+  };
+  TestGoldController(options: { props: FixtureGoldControllerProps }): FixtureGoldController;
+  KnowledgeAccountAccess: {
+    getByName(managerId: string): {
+      bind(managerId: string, capability: unknown): Promise<void>;
+      getAccess(): Promise<unknown>;
+      findKnowledgeSafeControlReservation(
+        managerId: string,
+        target: { kind: "gold_job"; id: string },
+      ): Promise<unknown>;
+      findBronzeActionReservation(
+        managerId: string,
+        gatekeeperInstanceId: string,
+        localActionId: number,
+      ): Promise<unknown>;
+    };
+  };
   CustomGatekeeper(options: { props: { managerId: string } }): DurableObjectClass<CustomGatekeeper>;
-  InspectableCustomGatekeeper(options: { props: { managerId: string } }): DurableObjectClass<InspectableCustomGatekeeper>;
+  InspectableCustomGatekeeper(options: {
+    props: { managerId: string };
+  }): DurableObjectClass<InspectableCustomGatekeeper>;
   CustomAccount(options: { props?: unknown }): FixtureAccount;
   GatekeeperVendor(options: { props?: unknown }): {
     createManagerAccount(managerId: string, capability: unknown): Promise<FixtureAccount>;
@@ -232,14 +439,31 @@ type WorkerExports = {
   CustomVerifier(options: { props?: unknown }): unknown;
 };
 
+type D04AgentReaderSession = {
+  list(input: D04ListInput): Promise<unknown>;
+  search(input: D04SearchInput): Promise<unknown>;
+  read(input: D04ReadInput): Promise<unknown>;
+  [Symbol.dispose](): void;
+};
+
 type AccessLog = {
   readInputs: BronzeCall[];
+  d04ListInputs: unknown[];
+  d04SearchInputs: unknown[];
+  d04ReadInputs: unknown[];
+  d04ReadExpirySnapshots: number[];
   boundInputs: string[];
   createInputs: unknown[];
   outcomeInputs: unknown[];
   adoptionInputs: unknown[];
   adoptionOutcomeInputs: unknown[];
   adoptionOutcomeMode?: AdoptionOutcomeMode;
+  goldPageInspectInputs: unknown[];
+  goldPageAdmissionInputs: unknown[];
+  goldPageEditInputs: unknown[];
+  goldPageCleanRequestInputs: unknown[];
+  goldPageSavedEditReceipt?: unknown;
+  goldJobApplyInputs: unknown[];
 };
 
 const accessLogs = new Map<string, AccessLog>();
@@ -249,11 +473,20 @@ const accessLog = (props: FixtureAccessProps): AccessLog => {
   if (existing !== undefined) return existing;
   const created: AccessLog = {
     readInputs: [],
+    d04ListInputs: [],
+    d04SearchInputs: [],
+    d04ReadInputs: [],
+    d04ReadExpirySnapshots: [],
     boundInputs: [],
     createInputs: [],
     outcomeInputs: [],
     adoptionInputs: [],
     adoptionOutcomeInputs: [],
+    goldPageInspectInputs: [],
+    goldPageAdmissionInputs: [],
+    goldPageEditInputs: [],
+    goldPageCleanRequestInputs: [],
+    goldJobApplyInputs: [],
   };
   accessLogs.set(key, created);
   return created;
@@ -262,14 +495,12 @@ const accessLog = (props: FixtureAccessProps): AccessLog => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
+const proposalOperationId = (proposal: unknown): string | null =>
+  isRecord(proposal) && typeof proposal.operationId === "string" ? proposal.operationId : null;
+
 const hashText = async (content: string): Promise<string> => {
-  const digest = await crypto.subtle.digest(
-    "SHA-256",
-    new TextEncoder().encode(content),
-  );
-  return Array.from(new Uint8Array(digest), (byte) =>
-    byte.toString(16).padStart(2, "0"),
-  ).join("");
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(content));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 };
 
 const makeSummary = (
@@ -279,8 +510,7 @@ const makeSummary = (
 ): FixtureSummary => ({
   knowledgeId: KNOWLEDGE_IDS[index] ?? KNOWLEDGE_IDS[0],
   generation: 1,
-  displayName:
-    reviewDisplayName ?? (index === 0 ? "Initial Knowledge" : "Additional Knowledge"),
+  displayName: reviewDisplayName ?? (index === 0 ? "Initial Knowledge" : "Additional Knowledge"),
   role: index === 0 ? "initial" : "additional",
   state,
   createdAt: NOW,
@@ -312,29 +542,33 @@ const invalidInputResult = (mode: InvalidInputMode): Record<string, unknown> => 
     : { _tag: "invalid_input", issues };
 };
 
-export class TestKnowledgeAccess extends WorkerEntrypoint<
-  Cloudflare.Env,
-  FixtureAccessProps
-> {
+export class TestKnowledgeAccess extends WorkerEntrypoint<Cloudflare.Env, FixtureAccessProps> {
   #adoptionOutcomeMode: AdoptionOutcomeMode | undefined;
 
   async managerIdForTest(): Promise<string> {
     return this.ctx.props.managerId;
   }
-  async assertBoundTo(managerId: string): Promise<void> {
+  async tokenForTest(): Promise<string> {
+    return this.ctx.props.token ?? "";
+  }
+  async assertBoundTo(managerId: string): Promise<"cybernest-knowledge-read-v1"> {
     accessLog(this.ctx.props).boundInputs.push(managerId);
+    if (this.ctx.props.bindDelayMs !== undefined)
+      await new Promise((resolve) => setTimeout(resolve, this.ctx.props.bindDelayMs));
     if (this.ctx.props.assertMode === "rpc_failure") {
       throw new Error("fixture capability RPC failure");
     }
-    if (
-      this.ctx.props.assertMode === "wrong_manager" ||
-      managerId !== this.ctx.props.managerId
-    ) {
+    if (this.ctx.props.assertMode === "wrong_manager" || managerId !== this.ctx.props.managerId) {
       throw new Error("fixture capability is bound to another Manager");
     }
+    return "cybernest-knowledge-read-v1";
   }
 
-  async list(input?: { cursor?: string; limit?: number }): Promise<unknown> {
+  async list(input?: { cursor?: string; limit?: number } | D04ListInput): Promise<unknown> {
+    if (this.ctx.props.d04ReaderMode) {
+      accessLog(this.ctx.props).d04ListInputs.push(structuredClone(input));
+      return d04SuccessReceipt(D04_READER_RESULT.list, Date.now() + 3_599_000);
+    }
     const mode = this.ctx.props.listMode ?? "valid";
     if (mode === "rpc_failure") throw new Error("fixture list RPC failure");
     if (mode === "failure") return { _tag: "forbidden" };
@@ -351,6 +585,32 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
     if (nextCursor === "string") page.nextCursor = "next-page";
     if (mode === "extra") page.extra = true;
     return page;
+  }
+
+  async search(input: D04SearchInput): Promise<unknown> {
+    accessLog(this.ctx.props).d04SearchInputs.push(structuredClone(input));
+    const result =
+      "kind" in input
+        ? input.kind === "articles"
+          ? D04_ARTICLES_SEARCH_RESULT
+          : D04_ARTICLE_LINKS_SEARCH_RESULT
+        : D04_READER_RESULT.search;
+    return d04SuccessReceipt(result, Date.now() + 3_599_000);
+  }
+
+  async read(input: D04ReadInput): Promise<unknown> {
+    const log = accessLog(this.ctx.props);
+    log.d04ReadInputs.push(structuredClone(input));
+    const readIndex = log.d04ReadInputs.length;
+    const expiry =
+      this.ctx.props.receiptSchedule === "renewal_during_observation" && readIndex === 1
+        ? Date.now() + 2_000
+        : Date.now() + 3_599_000;
+    log.d04ReadExpirySnapshots.push(expiry);
+    return d04SuccessReceipt(
+      this.ctx.props.d04ArticleRead ? D04_ARTICLE_READ_RESULT : D04_READER_RESULT.read,
+      expiry,
+    );
   }
 
   async readBronze(input: BronzeCall): Promise<unknown> {
@@ -405,8 +665,7 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
         return invalidInputResult(this.ctx.props.createMode);
       if (this.ctx.props.createMode === "dependency_unavailable")
         return { _tag: "dependency_unavailable", dependency: "knowledge-agent" };
-      if (this.ctx.props.createMode === "deadline_exceeded")
-        return { _tag: "deadline_exceeded" };
+      if (this.ctx.props.createMode === "deadline_exceeded") return { _tag: "deadline_exceeded" };
       const value = input as { operationId: string; displayName: string };
       const correlationMode = this.ctx.props.createMode;
       return {
@@ -481,11 +740,13 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
       return { _tag: "dependency_unavailable", dependency: "knowledge-agent" };
     if (mode === "deadline_exceeded") return { _tag: "deadline_exceeded" };
     if (mode === "malformed") return { _tag: "committed", extra: true };
-    const adoption = log.adoptionInputs[0] as {
-      knowledgeId: string;
-      generation: 1;
-      document: string;
-    } | undefined;
+    const adoption = log.adoptionInputs[0] as
+      | {
+          knowledgeId: string;
+          generation: 1;
+          document: string;
+        }
+      | undefined;
     const operationId = (input as { operationId: string }).operationId;
     const contentHash = await hashText(adoption?.document ?? "");
     return {
@@ -563,27 +824,56 @@ export class TestKnowledgeAccess extends WorkerEntrypoint<
     accessLog(this.ctx.props).adoptionOutcomeMode = mode;
   }
 
+  async d04ReaderSnapshot() {
+    const log = accessLog(this.ctx.props);
+    return {
+      listInputs: structuredClone(log.d04ListInputs),
+      searchInputs: structuredClone(log.d04SearchInputs),
+      readInputs: structuredClone(log.d04ReadInputs),
+      readExpirySnapshots: [...log.d04ReadExpirySnapshots],
+    };
+  }
 }
 
 class TestApprovalQueue extends RpcTarget implements ApprovalQueue {
   readonly observations: ObservationDescription[] = [];
   #calls = 0;
   #disposals = 0;
+  #observationEntered: Promise<void>;
+  #resolveObservationEntered!: () => void;
   readonly submissions: Array<{ action: number; description: unknown }> = [];
 
   constructor(
     private readonly rejectAt: number | null = null,
     private readonly submitFailure = false,
+    private readonly observationBarrier?: Promise<void>,
   ) {
     super();
+    this.#observationEntered = new Promise((resolve) => {
+      this.#resolveObservationEntered = resolve;
+    });
+  }
+
+  waitForObservation(): Promise<void> {
+    return this.#observationEntered;
+  }
+
+  async getWorkspaceId(): Promise<string> {
+    return "fixture-gl06-workspace";
   }
 
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.#calls += 1;
     this.observations.push({ ...description });
+    this.#resolveObservationEntered();
+    if (this.observationBarrier !== undefined) await this.observationBarrier;
     if (this.rejectAt !== null && this.#calls === this.rejectAt) {
       throw new Error("fixture observation denied");
     }
+  }
+
+  async getGitCache(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge fixture.");
   }
 
   async submitAction(action: number, description: unknown): Promise<void> {
@@ -645,8 +935,9 @@ export class InspectableCustomGatekeeper extends DurableObject {
     return this.#gatekeeper.revertAction();
   }
   async #access(): Promise<FixtureAccessInspector> {
-    return await this.ctx.exports.KnowledgeAccountAccess.getByName(this.#managerId)
-      .getAccess() as unknown as FixtureAccessInspector;
+    return (await this.ctx.exports.KnowledgeAccountAccess.getByName(
+      this.#managerId,
+    ).getAccess()) as unknown as FixtureAccessInspector;
   }
   async inspectBronzeRow(operationId: string): Promise<Record<string, unknown> | null> {
     const row = this.ctx.storage.sql
@@ -704,7 +995,6 @@ export class InspectableCustomGatekeeper extends DurableObject {
       operationId,
     );
   }
-
 
   async probeActionCollision(): Promise<{
     applyError: string | null;
@@ -776,7 +1066,12 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }
 
   async applyAction(actionId: number): Promise<void> {
-    return this.#gatekeeper.applyAction(actionId);
+    const cache = new RpcStub<GitCache>(new UnusedGatekeeperGitCache());
+    try {
+      await (this.#gatekeeper as Gatekeeper<KnowledgeBase>).applyAction(actionId, cache);
+    } finally {
+      cache[Symbol.dispose]();
+    }
   }
 
   async rejectAction(actionId: number): Promise<void | { restart?: boolean }> {
@@ -787,7 +1082,6 @@ export class InspectableCustomGatekeeper extends DurableObject {
     return this.#gatekeeper.getAutoApprovableActions();
   }
   async probeMalformedSession(): Promise<{ duplicateCount: number; error: string | null }> {
-
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
     let duplicateCount = 0;
@@ -819,12 +1113,14 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     let outcome: unknown | null = null;
     let operationId: string | null = null;
     try {
-      const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
+      const proposal = (await session.proposeKnowledgeCreate({ displayName: "Team Notes" })) as {
+        operationId: string;
+      };
       operationId = proposal.operationId;
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native submission");
@@ -871,12 +1167,14 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     let outcome: unknown | null = null;
     let operationId: string | null = null;
     try {
-      const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
+      const proposal = (await session.proposeKnowledgeCreate({ displayName: "Team Notes" })) as {
+        operationId: string;
+      };
       operationId = proposal.operationId;
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native submission");
@@ -924,7 +1222,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     let outcome: unknown | null = null;
     let bronzeRow: Record<string, unknown> | null = null;
@@ -933,14 +1231,14 @@ export class InspectableCustomGatekeeper extends DurableObject {
       const page = await session.list({ limit: 1 });
       const handle = page.items[0]?.access;
       if (handle === undefined) throw new Error("missing native Bronze handle");
-      const proposal = await handle.proposeBronzeAdoption({
+      const proposal = (await handle.proposeBronzeAdoption({
         document: "# Exact concept\n",
         provenance: {
           sourceKind: "explicit_user_input",
           reference: "s16-sync-fixture",
           capturedAt: NOW,
         },
-      }) as { operationId: string };
+      })) as { operationId: string };
       operationId = proposal.operationId;
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native Bronze submission");
@@ -983,10 +1281,12 @@ export class InspectableCustomGatekeeper extends DurableObject {
   async probeStoredOutcomeUnknown(): Promise<{ observations: number; error: string | null }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     let error: string | null = null;
     try {
-      const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
+      const proposal = (await session.proposeKnowledgeCreate({ displayName: "Team Notes" })) as {
+        operationId: string;
+      };
       const stored = JSON.stringify({
         operationId: proposal.operationId,
         status: "failed",
@@ -1013,7 +1313,7 @@ export class InspectableCustomGatekeeper extends DurableObject {
   async probeApplyRejectRace(): Promise<{ createInputs: unknown[]; errors: string[] }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     try {
       await session.proposeKnowledgeCreate({ displayName: "Team Notes" });
@@ -1032,7 +1332,6 @@ export class InspectableCustomGatekeeper extends DurableObject {
     }
   }
 
-
   async probeResponseLoss(): Promise<{
     createInputs: unknown[];
     outcomeInputs: unknown[];
@@ -1041,10 +1340,12 @@ export class InspectableCustomGatekeeper extends DurableObject {
   }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     const errors: string[] = [];
     try {
-      const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
+      const proposal = (await session.proposeKnowledgeCreate({ displayName: "Team Notes" })) as {
+        operationId: string;
+      };
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native submission");
       try {
@@ -1075,14 +1376,18 @@ export class InspectableCustomGatekeeper extends DurableObject {
     }
   }
 
-
-  async probeActionRefFingerprintMismatch(): Promise<{ observations: number; error: string | null }> {
+  async probeActionRefFingerprintMismatch(): Promise<{
+    observations: number;
+    error: string | null;
+  }> {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
-    const session = await this.#gatekeeper.startSession(queue);
+    const session = await this.startSession(queue);
     let error: string | null = null;
     try {
-      const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
+      const proposal = (await session.proposeKnowledgeCreate({ displayName: "Team Notes" })) as {
+        operationId: string;
+      };
       this.ctx.storage.sql.exec(
         "UPDATE custom_gatekeeper_staged_actions SET action_ref = ? WHERE operation_id = ?",
         "54444444-4444-4444-8444-444444444444",
@@ -1100,7 +1405,6 @@ export class InspectableCustomGatekeeper extends DurableObject {
     }
     return { observations: target.snapshot().observations.length, error };
   }
-
 }
 
 class TestObservationAuthorizer extends RpcTarget implements ObservationAuthorizer {
@@ -1109,9 +1413,208 @@ class TestObservationAuthorizer extends RpcTarget implements ObservationAuthoriz
   async authorizeObservation(description: ObservationDescription): Promise<void> {
     this.observations.push({ ...description });
   }
+
+  async getGitCache(): Promise<never> {
+    throw new Error("Unexpected GitCache access in catalog fixture.");
+  }
 }
 
 class TestVerifier extends RpcTarget {}
+
+class UnusedGatekeeperGitCache extends RpcTarget implements GitCache {
+  async get(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async has(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async stat(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async put(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async advertiseCommit(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async buildPack(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async consumePack(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+  async isAncestor(): Promise<never> {
+    throw new Error("Unexpected GitCache access in Knowledge page Action fixture.");
+  }
+}
+
+export class TestGoldController extends WorkerEntrypoint<
+  Cloudflare.Env,
+  FixtureGoldControllerProps
+> {
+  async assertBoundTo(managerId: string): Promise<string> {
+    accessLog(this.ctx.props).boundInputs.push(managerId);
+    if (managerId !== this.ctx.props.managerId)
+      throw new Error("Fixture Gold page capability is bound to another Manager.");
+    return this.ctx.props.marker;
+  }
+
+  async inspectPage(input: unknown): Promise<unknown> {
+    if (this.ctx.props.pageEditMode === undefined)
+      throw new Error("Unexpected Gold page inspect callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldPageInspectInputs.push(structuredClone(input));
+    const path = isRecord(input) && typeof input.path === "string" ? input.path : "index.md";
+    return {
+      ok: true,
+      value: {
+        pageId: "fixture-gold-page",
+        path,
+        contentHash: "a".repeat(64),
+        pageVersion: 0,
+        protectionVersion: 0,
+        ownership: "manual",
+        generated: false,
+        protected: true,
+        lineage: "manual",
+        sourceDependencies: [
+          {
+            articleId: "fixture-article",
+            revisionId: "fixture-revision",
+            bodyHash: "b".repeat(64),
+          },
+        ],
+        baselineProof: null,
+        currentPrivateBody: null,
+        retiredPrivateBodies: [],
+        pendingCleanRequest: null,
+        latestReceipt: null,
+      },
+    };
+  }
+
+  async admitPageAction(input: unknown): Promise<unknown> {
+    if (this.ctx.props.pageEditMode === undefined)
+      throw new Error("Unexpected Gold page admission callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldPageAdmissionInputs.push(structuredClone(input));
+    const pageId =
+      isRecord(input) && isRecord(input.intent) && typeof input.intent.pageId === "string"
+        ? input.intent.pageId
+        : "fixture-gold-page";
+    return { ok: true, value: { status: "admitted", pageId } };
+  }
+
+  async editPage(input: unknown): Promise<unknown> {
+    if (this.ctx.props.pageEditMode === undefined)
+      throw new Error("Unexpected Gold page edit callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldPageEditInputs.push(structuredClone(input));
+    if (this.ctx.props.pageEditMode === "conflict_once" && log.goldPageEditInputs.length === 1)
+      return { ok: false, code: "conflict" };
+    const command = isRecord(input) ? input : {};
+    const intent = isRecord(command.intent) ? command.intent : {};
+    const savedReceipt = {
+      status: "saved",
+      operation: "edit",
+      operationId: command.operationId,
+      pageId: intent.pageId,
+      pageVersion:
+        typeof intent.expectedPageVersion === "number" ? intent.expectedPageVersion + 1 : undefined,
+      protectionVersion: intent.expectedProtectionVersion,
+      controlRevision:
+        typeof intent.expectedControlRevision === "number"
+          ? intent.expectedControlRevision + 1
+          : undefined,
+    };
+    log.goldPageSavedEditReceipt ??= savedReceipt;
+    if (this.ctx.props.pageEditMode === "response_loss_once" && log.goldPageEditInputs.length === 1)
+      throw new Error("fixture response lost after Gold page edit save");
+    return { ok: true, value: log.goldPageSavedEditReceipt };
+  }
+
+  async requestProtectionReleaseAndCleanReplacement(input: unknown): Promise<unknown> {
+    if (this.ctx.props.pageEditMode === undefined)
+      throw new Error("Unexpected Gold page clean-replacement callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldPageCleanRequestInputs.push(structuredClone(input));
+    const command = isRecord(input) ? input : {};
+    const intent = isRecord(command.intent) ? command.intent : {};
+    return {
+      ok: true,
+      value: {
+        status: "saved",
+        operation: "clean_replacement",
+        operationId: command.operationId,
+        pageId: intent.pageId,
+        pageVersion: intent.expectedPageVersion,
+        protectionVersion: intent.expectedProtectionVersion,
+        controlRevision:
+          typeof intent.expectedControlRevision === "number"
+            ? intent.expectedControlRevision + 1
+            : undefined,
+      },
+    };
+  }
+
+  async inspect(): Promise<unknown> {
+    if (this.ctx.props.goldControlHead === undefined)
+      throw new Error("Unexpected Gold job inspect callback.");
+    return { ok: true, value: structuredClone(this.ctx.props.goldControlHead) };
+  }
+
+  async apply(_input: unknown): Promise<unknown> {
+    const mode = this.ctx.props.goldControlApplyMode;
+    if (mode !== "saved_recovery" && mode !== "conflict_recovery")
+      throw new Error("Unexpected Gold job apply callback.");
+    const log = accessLog(this.ctx.props);
+    log.goldJobApplyInputs.push(structuredClone(_input));
+    if (!isRecord(_input) || !isRecord(_input.intent))
+      throw new Error("Malformed recovery command in Gold apply fixture.");
+    const intent = _input.intent;
+    if (
+      intent.operation !== "resume" ||
+      !isRecord(intent.system1Recovery) ||
+      typeof _input.operationId !== "string" ||
+      typeof intent.jobId !== "string" ||
+      typeof intent.expectedJobState !== "string" ||
+      typeof intent.expectedJobFence !== "number" ||
+      typeof intent.expectedControlRevision !== "number"
+    )
+      throw new Error("Unexpected command in Gold recovery apply fixture.");
+    if (mode === "conflict_recovery") return { ok: false, code: "conflict" };
+    return {
+      ok: true,
+      value: {
+        status: "saved",
+        operationId: _input.operationId,
+        jobId: intent.jobId,
+        state: intent.expectedJobState,
+        fence: intent.expectedJobFence,
+        controlRevision: intent.expectedControlRevision,
+      },
+    };
+  }
+
+  async goldJobControlCallbackSnapshot(): Promise<{ applyInputs: unknown[] }> {
+    return { applyInputs: structuredClone(accessLog(this.ctx.props).goldJobApplyInputs) };
+  }
+
+  async boundInputLog(): Promise<string[]> {
+    return [...accessLog(this.ctx.props).boundInputs];
+  }
+
+  async goldPageCallbackSnapshot() {
+    const log = accessLog(this.ctx.props);
+    return structuredClone({
+      inspectPageInputs: log.goldPageInspectInputs,
+      admitPageActionInputs: log.goldPageAdmissionInputs,
+      editPageInputs: log.goldPageEditInputs,
+      cleanRequestInputs: log.goldPageCleanRequestInputs,
+      savedEditReceipt: log.goldPageSavedEditReceipt ?? null,
+    });
+  }
+}
 
 export class TestGatekeeperFactory extends DurableObject {
   #exports(): WorkerExports {
@@ -1143,7 +1646,7 @@ export class TestGatekeeperFactory extends DurableObject {
     };
   }
 
-  async runMalformedSession(): Promise<{ duplicateCount: number; error: string | null }> {
+  async runMalformedSession(): Promise<{ error: string | null }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
@@ -1156,7 +1659,13 @@ export class TestGatekeeperFactory extends DurableObject {
       class: gatekeeperClass,
       id: facetName,
     })) as unknown as FixtureGatekeeperProbe;
-    return gatekeeper.probeMalformedSession();
+    try {
+      await gatekeeper.probeMalformedSession();
+      return { error: "session probe unexpectedly completed" };
+    } catch (cause) {
+      // Invalid props reject the Durable Object constructor before the session probe can run.
+      return { error: messageOf(cause) };
+    }
   }
 
   async runStoredOutcomeUnknown(): Promise<{ observations: number; error: string | null }> {
@@ -1164,7 +1673,9 @@ export class TestGatekeeperFactory extends DurableObject {
     const access = workerExports.TestKnowledgeAccess({
       props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-stored-outcome-unknown-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1173,14 +1684,16 @@ export class TestGatekeeperFactory extends DurableObject {
     return gatekeeper.probeStoredOutcomeUnknown();
   }
 
-  async runRead(options: {
-    listMode?: ListMode;
-    bronzeMode?: BronzeMode;
-    states?: KnowledgeState[];
-    nextCursor?: NextCursorMode;
-    listOptions?: { cursor?: string; limit?: number };
-    rejectObservationAt?: number | null;
-  } = {}): Promise<{
+  async runRead(
+    options: {
+      listMode?: ListMode;
+      bronzeMode?: BronzeMode;
+      states?: KnowledgeState[];
+      nextCursor?: NextCursorMode;
+      listOptions?: { cursor?: string; limit?: number };
+      rejectObservationAt?: number | null;
+    } = {},
+  ): Promise<{
     page: Array<Record<string, unknown>> | null;
     nextCursor: string | null;
     read: unknown;
@@ -1238,13 +1751,227 @@ export class TestGatekeeperFactory extends DurableObject {
     };
   }
 
-  async runProposal(options: {
-    input?: unknown;
-    createMode?: "ready" | "malformed" | "throw" | "throw_once" | "delay" | "initial" | "blocked" | "wrong_display";
-    outcomeMode?: "ready" | "malformed" | "throw" | "failure" | "initial" | "blocked" | "wrong_display";
-    submitFailure?: boolean;
-    decision?: "none" | "approve" | "retry" | "reject";
-  } = {}): Promise<{
+  async runD04ReaderSurface(
+    options: {
+      articleRead?: boolean;
+      searchMode?: "articles" | "article-links";
+    } = {},
+  ): Promise<{
+    typesCode: string;
+    catalog: AgentCatalog | null;
+    list: unknown;
+    search: unknown;
+    read: unknown;
+    errors: { list: string | null; search: string | null; read: string | null };
+    observations: ObservationDescription[];
+    readerSnapshot: Awaited<ReturnType<FixtureAccessInspector["d04ReaderSnapshot"]>>;
+  }> {
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
+      token: crypto.randomUUID(),
+      d04ReaderMode: true,
+      d04ArticleRead: options.articleRead === true,
+    });
+    const typesCode = await gatekeeper.getTypeScriptTypes();
+    let catalog: AgentCatalog | null = null;
+    catalog = await gatekeeper.getAgentCatalog();
+
+    const target = new TestApprovalQueue();
+    const queue = new RpcStub<ApprovalQueue>(target);
+    const session = await gatekeeper.startSession(queue);
+    const reader = session as unknown as D04AgentReaderSession;
+    let list: unknown;
+    let search: unknown;
+    let read: unknown;
+    const errors: { list: string | null; search: string | null; read: string | null } = {
+      list: null,
+      search: null,
+      read: null,
+    };
+    try {
+      try {
+        list = await reader.list({ offset: 0, limit: 16 });
+      } catch (cause) {
+        errors.list = messageOf(cause);
+      }
+      try {
+        const searchInput: D04SearchInput =
+          options.searchMode === "articles"
+            ? {
+                kind: "articles",
+                filters: { type: "Source", tag: "research" },
+                cursor: "0",
+                limit: 16,
+              }
+            : options.searchMode === "article-links"
+              ? {
+                  kind: "article-links",
+                  articleId: "a",
+                  direction: "links",
+                  maxDepth: 4,
+                  candidateBudget: 32,
+                }
+              : { query: "private", offset: 0, limit: 16 };
+        search = await reader.search(searchInput);
+      } catch (cause) {
+        errors.search = messageOf(cause);
+      }
+      try {
+        read = await reader.read({
+          path: options.articleRead ? D04_ARTICLE_READ_RESULT.path : "index.md",
+        });
+      } catch (cause) {
+        errors.read = messageOf(cause);
+      }
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
+    return {
+      typesCode,
+      catalog,
+      list,
+      search,
+      read,
+      errors,
+      observations: target.observations.map((observation) => ({ ...observation })),
+      readerSnapshot: await access.d04ReaderSnapshot(),
+    };
+  }
+
+  async runD04ObservationReject(): Promise<{
+    result: unknown;
+    error: string | null;
+    observationCount: number;
+  }> {
+    const { gatekeeper } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
+      token: crypto.randomUUID(),
+      d04ReaderMode: true,
+    });
+    const target = new TestApprovalQueue(1);
+    const queue = new RpcStub<ApprovalQueue>(target);
+    const session = await gatekeeper.startSession(queue);
+    const reader = session as unknown as D04AgentReaderSession;
+    let result: unknown;
+    let error: string | null = null;
+    try {
+      result = await reader.read({ path: "index.md" });
+    } catch (cause) {
+      error = messageOf(cause);
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
+    return { result, error, observationCount: target.snapshot().calls };
+  }
+
+  async runD04ConcurrentReceiptExpiry(): Promise<{
+    first: { value?: unknown; error?: string };
+    second: unknown;
+    secondError: string | null;
+    firstExpiry: number | null;
+    secondExpiry: number | null;
+    firstObservationReached: boolean;
+  }> {
+    const { gatekeeper, access } = await this.#newBinding({
+      managerId: crypto.randomUUID(),
+      token: crypto.randomUUID(),
+      d04ReaderMode: true,
+      receiptSchedule: "renewal_during_observation",
+    });
+    let releaseObservation!: () => void;
+    const observationBarrier = new Promise<void>((resolve) => {
+      releaseObservation = resolve;
+    });
+    const firstTarget = new TestApprovalQueue(null, false, observationBarrier);
+    const firstQueue = new RpcStub<ApprovalQueue>(firstTarget);
+    const firstSession = await gatekeeper.startSession(firstQueue);
+    const firstReader = firstSession as unknown as D04AgentReaderSession;
+    const firstSettled = firstReader.read({ path: "index.md" }).then(
+      (value) => ({ value }),
+      (cause) => ({ error: messageOf(cause) }),
+    );
+    const firstObservationReached = await Promise.race([
+      firstTarget.waitForObservation().then(() => true),
+      firstSettled.then(() => false),
+    ]);
+    if (!firstObservationReached) {
+      releaseObservation();
+      firstSession[Symbol.dispose]();
+      firstQueue[Symbol.dispose]();
+      return {
+        first: await firstSettled,
+        second: null,
+        secondError: null,
+        firstExpiry: null,
+        secondExpiry: null,
+        firstObservationReached,
+      };
+    }
+
+    const afterRenewalTarget = new TestApprovalQueue();
+    const afterRenewalQueue = new RpcStub<ApprovalQueue>(afterRenewalTarget);
+    const afterRenewalSession = await gatekeeper.startSession(afterRenewalQueue);
+    const afterRenewalReader = afterRenewalSession as unknown as D04AgentReaderSession;
+    let second: unknown;
+    try {
+      let secondError: string | null = null;
+      try {
+        second = await afterRenewalReader.read({ path: "index.md" });
+      } catch (cause) {
+        secondError = messageOf(cause);
+      }
+      const receipts = (await access.d04ReaderSnapshot()).readExpirySnapshots;
+      const firstExpiry = receipts[0] ?? null;
+      const secondExpiry = receipts[1] ?? null;
+      if (firstExpiry !== null) {
+        const waitMs = Math.max(0, firstExpiry - Date.now() + 5);
+        if (waitMs > 0) await new Promise((resolve) => setTimeout(resolve, waitMs));
+      }
+      releaseObservation();
+      const first = await firstSettled;
+      return {
+        first,
+        second,
+        secondError,
+        firstExpiry,
+        secondExpiry,
+        firstObservationReached,
+      };
+    } finally {
+      releaseObservation();
+      firstSession[Symbol.dispose]();
+      firstQueue[Symbol.dispose]();
+      afterRenewalSession[Symbol.dispose]();
+      afterRenewalQueue[Symbol.dispose]();
+    }
+  }
+
+  async runProposal(
+    options: {
+      input?: unknown;
+      createMode?:
+        | "ready"
+        | "malformed"
+        | "throw"
+        | "throw_once"
+        | "delay"
+        | "initial"
+        | "blocked"
+        | "wrong_display";
+      outcomeMode?:
+        | "ready"
+        | "malformed"
+        | "throw"
+        | "failure"
+        | "initial"
+        | "blocked"
+        | "wrong_display";
+      submitFailure?: boolean;
+      decision?: "none" | "approve" | "retry" | "reject";
+    } = {},
+  ): Promise<{
     proposal: unknown | null;
     outcome: unknown | null;
     error: string | null;
@@ -1267,16 +1994,26 @@ export class TestGatekeeperFactory extends DurableObject {
     let outcome: unknown | null = null;
     let error: string | null = null;
     try {
-      proposal = await session.proposeKnowledgeCreate(options.input ?? { displayName: "Team Notes" });
+      proposal = await session.proposeKnowledgeCreate(
+        options.input ?? { displayName: "Team Notes" },
+      );
       const submission = target.submissions[0];
-      if (submission && options.decision === "approve") await gatekeeper.applyAction(submission.action);
+      if (submission && options.decision === "approve")
+        await gatekeeper.applyAction(submission.action);
       if (submission && options.decision === "retry") {
-        try { await gatekeeper.applyAction(submission.action); } catch { /* response-loss fixture */ }
+        try {
+          await gatekeeper.applyAction(submission.action);
+        } catch {
+          /* response-loss fixture */
+        }
         await gatekeeper.applyAction(submission.action);
       }
-      if (submission && options.decision === "reject") await gatekeeper.rejectAction(submission.action);
+      if (submission && options.decision === "reject")
+        await gatekeeper.rejectAction(submission.action);
       if (proposal && typeof proposal === "object" && "operationId" in proposal) {
-        outcome = await session.readCreationOutcome({ operationId: (proposal as { operationId: string }).operationId });
+        outcome = await session.readCreationOutcome({
+          operationId: (proposal as { operationId: string }).operationId,
+        });
       }
     } catch (cause) {
       error = messageOf(cause);
@@ -1298,23 +2035,25 @@ export class TestGatekeeperFactory extends DurableObject {
     };
   }
 
-  async runBronzeProposal(options: {
-    document?: string;
-    provenance?: {
-      sourceKind: "conversation" | "user_document" | "explicit_user_input";
-      reference: string;
-      capturedAt: string;
-    };
-    adoptionMode?: AdoptionMode;
-    outcomeMode?: AdoptionOutcomeMode;
-    secondOutcomeMode?: AdoptionOutcomeMode;
-    readOutcomeTwice?: boolean;
-    decision?: "none" | "approve" | "retry" | "reject";
-    wrongHandle?: boolean;
-    displayName?: string;
-    submitFailure?: boolean;
-    tamper?: BronzeTamperField;
-  } = {}): Promise<{
+  async runBronzeProposal(
+    options: {
+      document?: string;
+      provenance?: {
+        sourceKind: "conversation" | "user_document" | "explicit_user_input";
+        reference: string;
+        capturedAt: string;
+      };
+      adoptionMode?: AdoptionMode;
+      outcomeMode?: AdoptionOutcomeMode;
+      secondOutcomeMode?: AdoptionOutcomeMode;
+      readOutcomeTwice?: boolean;
+      decision?: "none" | "approve" | "retry" | "reject";
+      wrongHandle?: boolean;
+      displayName?: string;
+      submitFailure?: boolean;
+      tamper?: BronzeTamperField;
+    } = {},
+  ): Promise<{
     proposal: unknown | null;
     outcome: unknown | null;
     error: string | null;
@@ -1336,7 +2075,9 @@ export class TestGatekeeperFactory extends DurableObject {
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-s16-bronze-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1400,19 +2141,18 @@ export class TestGatekeeperFactory extends DurableObject {
         if (submission !== undefined && options.decision === "reject") {
           await gatekeeper.rejectAction(submission.action);
         }
-        if (
-          options.decision !== "reject" &&
-          operationId !== null
-        ) {
+        if (options.decision !== "reject" && operationId !== null) {
           try {
             outcome = await outcomeHandle.readAdoptionOutcome({ operationId });
           } catch (cause) {
             error ??= messageOf(cause);
           }
           if (options.secondOutcomeMode !== undefined) {
-            await (access as unknown as {
-              setAdoptionOutcomeMode(mode: AdoptionOutcomeMode): Promise<void>;
-            }).setAdoptionOutcomeMode(options.secondOutcomeMode);
+            await (
+              access as unknown as {
+                setAdoptionOutcomeMode(mode: AdoptionOutcomeMode): Promise<void>;
+              }
+            ).setAdoptionOutcomeMode(options.secondOutcomeMode);
           }
           if (options.readOutcomeTwice || options.secondOutcomeMode !== undefined) {
             try {
@@ -1463,7 +2203,9 @@ export class TestGatekeeperFactory extends DurableObject {
     const access = workerExports.TestKnowledgeAccess({
       props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-s16-access-failure-recovery-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1486,7 +2228,9 @@ export class TestGatekeeperFactory extends DurableObject {
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-s16-combined-capacity-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1539,7 +2283,9 @@ export class TestGatekeeperFactory extends DurableObject {
     const access = workerExports.TestKnowledgeAccess({
       props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-s16-action-collision-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1562,7 +2308,9 @@ export class TestGatekeeperFactory extends DurableObject {
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-s16-capacity-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1591,8 +2339,7 @@ export class TestGatekeeperFactory extends DurableObject {
         successes: results.filter((result) => result.status === "fulfilled").length,
         capacityFailures: results.filter(
           (result) =>
-            result.status === "rejected" &&
-            messageOf(result.reason).includes("capacity_exceeded"),
+            result.status === "rejected" && messageOf(result.reason).includes("capacity_exceeded"),
         ).length,
         submissions: target.snapshot().submissions.length,
         adoptionInputs: await access.adoptionInputLog(),
@@ -1618,7 +2365,9 @@ export class TestGatekeeperFactory extends DurableObject {
     let error: string | null = null;
     let outcome: unknown | null = null;
     try {
-      const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
+      const proposal = (await session.proposeKnowledgeCreate({ displayName: "Team Notes" })) as {
+        operationId: string;
+      };
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native submission");
       try {
@@ -1660,7 +2409,8 @@ export class TestGatekeeperFactory extends DurableObject {
       return {
         successes: results.filter((result) => result.status === "fulfilled").length,
         capacityFailures: results.filter(
-          (result) => result.status === "rejected" && messageOf(result.reason).includes("capacity_exceeded"),
+          (result) =>
+            result.status === "rejected" && messageOf(result.reason).includes("capacity_exceeded"),
         ).length,
         submissions: target.snapshot().submissions.length,
       };
@@ -1710,7 +2460,9 @@ export class TestGatekeeperFactory extends DurableObject {
     const access = workerExports.TestKnowledgeAccess({
       props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-apply-reject-race-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1727,9 +2479,15 @@ export class TestGatekeeperFactory extends DurableObject {
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId: crypto.randomUUID(), createMode: "throw_once", token: crypto.randomUUID() },
+      props: {
+        managerId: crypto.randomUUID(),
+        createMode: "throw_once",
+        token: crypto.randomUUID(),
+      },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-response-loss-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1757,7 +2515,9 @@ export class TestGatekeeperFactory extends DurableObject {
         token: crypto.randomUUID(),
       },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-create-failure-recovery-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1777,7 +2537,9 @@ export class TestGatekeeperFactory extends DurableObject {
     const access = workerExports.TestKnowledgeAccess({
       props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-access-failure-recovery-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1791,7 +2553,9 @@ export class TestGatekeeperFactory extends DurableObject {
     const access = workerExports.TestKnowledgeAccess({
       props: { managerId: crypto.randomUUID(), token: crypto.randomUUID() },
     });
-    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: await this.#props(access) });
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({
+      props: await this.#props(access),
+    });
     const facetName = "fixture-action-ref-fingerprint-" + crypto.randomUUID();
     const gatekeeper = this.ctx.facets.get(facetName, () => ({
       class: gatekeeperClass,
@@ -1800,9 +2564,7 @@ export class TestGatekeeperFactory extends DurableObject {
     return gatekeeper.probeActionRefFingerprintMismatch();
   }
 
-  async runOutcomeFailureRecovery(
-    outcomeMode: "failure" | InvalidInputMode = "failure",
-  ): Promise<{
+  async runOutcomeFailureRecovery(outcomeMode: "failure" | InvalidInputMode = "failure"): Promise<{
     createInputs: unknown[];
     outcomeInputs: unknown[];
     outcome: unknown | null;
@@ -1819,7 +2581,9 @@ export class TestGatekeeperFactory extends DurableObject {
     const errors: string[] = [];
     let outcome: unknown | null = null;
     try {
-      const proposal = await session.proposeKnowledgeCreate({ displayName: "Team Notes" }) as { operationId: string };
+      const proposal = (await session.proposeKnowledgeCreate({ displayName: "Team Notes" })) as {
+        operationId: string;
+      };
       const submission = target.submissions[0];
       if (submission === undefined) throw new Error("missing native submission");
       for (let i = 0; i < 2; i += 1) {
@@ -1845,13 +2609,13 @@ export class TestGatekeeperFactory extends DurableObject {
   async runAccount(managerId = MANAGER_ID): Promise<{
     description: AccountDescription;
     binding: "legacy" | "bound";
-    page: Array<Record<string, unknown>>;
+    page: Record<string, unknown>;
     observations: ObservationDescription[];
     boundInputs: string[];
   }> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
-      props: { managerId, token: crypto.randomUUID() },
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
     });
     const vendor = workerExports.GatekeeperVendor({});
     const account = await vendor.createManagerAccount(managerId, access);
@@ -1866,15 +2630,12 @@ export class TestGatekeeperFactory extends DurableObject {
     const target = new TestApprovalQueue();
     const queue = new RpcStub<ApprovalQueue>(target);
     const session = await gatekeeper.startSession(queue);
-    let page: Array<Record<string, unknown>> = [];
+    let page: Record<string, unknown> = {};
     try {
-      const result = await session.list({});
-      page = result.items.map((item) => {
-        const summary: Record<string, unknown> = { ...item };
-        delete summary.access;
-        summary.hasAccess = item.access !== undefined;
-        return summary;
-      });
+      page = (await (session as unknown as D04AgentReaderSession).list({
+        offset: 0,
+        limit: 16,
+      })) as Record<string, unknown>;
     } finally {
       session[Symbol.dispose]();
       queue[Symbol.dispose]();
@@ -1889,12 +2650,385 @@ export class TestGatekeeperFactory extends DurableObject {
     };
   }
 
-  async runAccountError(options: {
-    requestedManagerId?: string;
-    capabilityManagerId?: string;
-    assertMode?: AssertMode;
-    extraProps?: boolean;
-  } = {}): Promise<string | null> {
+  async runGoldJobControlProposal(
+    scenario:
+      | "system1_recovery"
+      | "system1_recovery_apply"
+      | "system1_recovery_zero_revision_apply"
+      | "system1_recovery_conflict_reject"
+      | "wrong_fixed_amount"
+      | "caller_selected_next_id"
+      | "normal_resume",
+  ): Promise<{
+    proposals: unknown[];
+    proposalErrors: string[];
+    submissions: Array<{ action: number; description: unknown }>;
+    rows: Array<Record<string, unknown> | null>;
+    safeControlBefore: unknown | null;
+    safeControlAfter: unknown | null;
+    applyError: string | null;
+    appliedRow: Record<string, unknown> | null;
+    normalReservationBefore: unknown | null;
+    normalReservationAfter: unknown | null;
+    normalReservationAfterConflict: unknown | null;
+    rejectedRow: Record<string, unknown> | null;
+    goldJobApplyInputs: unknown[];
+  }> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
+    });
+    const account = await workerExports
+      .GatekeeperVendor({})
+      .createManagerAccount(managerId, access);
+    const jobId = "73444444-4444-4444-8444-444444444444";
+    const expectedJobFence = 4;
+    const expectedControlRevision = scenario === "system1_recovery_zero_revision_apply" ? 0 : 9;
+    const normalResume = scenario === "normal_resume";
+    const jobState = normalResume ? "paused_deterministic" : "published";
+    const mode = normalResume ? "paused" : "enabled";
+    const controller = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_JOB_CONTROL_CONTRACT,
+        goldControlHead: {
+          mode,
+          controlRevision: expectedControlRevision,
+          job: { jobId, state: jobState, fence: expectedJobFence },
+        },
+        ...(scenario === "system1_recovery_apply" ||
+        scenario === "system1_recovery_zero_revision_apply"
+          ? { goldControlApplyMode: "saved_recovery" as const }
+          : scenario === "system1_recovery_conflict_reject"
+            ? { goldControlApplyMode: "conflict_recovery" as const }
+            : {}),
+      },
+    });
+    await account.installGoldRole(managerId, controller);
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { managerId } });
+    const facetName = "fixture-gold-job-system1-recovery-" + crypto.randomUUID();
+    const gatekeeper = this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as FixtureGatekeeper;
+    const queueTarget = new TestApprovalQueue();
+    const queue = new RpcStub<ApprovalQueue>(queueTarget);
+    const session = (await gatekeeper.startSession(queue)) as unknown as {
+      proposeGoldJobControl(input: unknown): Promise<unknown>;
+      [Symbol.dispose](): void;
+    };
+    const proposals: unknown[] = [];
+    const proposalErrors: string[] = [];
+    const rows: Array<Record<string, unknown> | null> = [];
+    const propose = async (intent: unknown): Promise<string | null> => {
+      try {
+        const proposal = await session.proposeGoldJobControl({ intent });
+        proposals.push(proposal);
+        const operationId =
+          isRecord(proposal) && typeof proposal.operationId === "string"
+            ? proposal.operationId
+            : null;
+        if (operationId !== null) rows.push(await gatekeeper.inspectArticleRow(operationId));
+        return operationId;
+      } catch (cause) {
+        proposalErrors.push(messageOf(cause));
+        return null;
+      }
+    };
+    const reservationStore = workerExports.KnowledgeAccountAccess.getByName(managerId);
+    const findSafeControl = () =>
+      reservationStore.findKnowledgeSafeControlReservation(managerId, {
+        kind: "gold_job",
+        id: jobId,
+      });
+    const ordinaryControl = {
+      jobId,
+      expectedJobState: jobState,
+      expectedJobFence,
+      expectedControlRevision,
+    };
+    let safeControlBefore: unknown | null = null;
+    let applyError: string | null = null;
+    let appliedRow: Record<string, unknown> | null = null;
+    let normalReservationBefore: unknown | null = null;
+    let normalReservationAfter: unknown | null = null;
+    let normalReservationAfterConflict: unknown | null = null;
+    let rejectedRow: Record<string, unknown> | null = null;
+    let goldJobApplyInputs: unknown[] = [];
+    try {
+      if (!normalResume) {
+        await propose({ operation: "stop", ...ordinaryControl });
+        safeControlBefore = (await findSafeControl()) ?? null;
+      }
+      let intent: Record<string, unknown>;
+      if (normalResume) {
+        intent = { operation: "resume", ...ordinaryControl };
+      } else {
+        const descriptor: Record<string, unknown> = {
+          decisionKeyHash: "a".repeat(64),
+          expectedRequestId: "64444444-4444-4444-8444-444444444444",
+          additionalMaxMicroUsd: scenario === "wrong_fixed_amount" ? 5_001 : 5_000,
+        };
+        if (scenario === "caller_selected_next_id") descriptor.nextRequestId = crypto.randomUUID();
+        intent = {
+          operation: "resume",
+          ...ordinaryControl,
+          system1Recovery: descriptor,
+        };
+      }
+      await propose(intent);
+      if (
+        scenario === "system1_recovery_apply" ||
+        scenario === "system1_recovery_zero_revision_apply" ||
+        scenario === "system1_recovery_conflict_reject"
+      ) {
+        const submittedRecovery = queueTarget.snapshot().submissions[1];
+        const recoveryOperationId =
+          isRecord(proposals[1]) && typeof proposals[1].operationId === "string"
+            ? proposals[1].operationId
+            : null;
+        if (submittedRecovery === undefined || recoveryOperationId === null)
+          throw new Error("Missing staged recovery Action.");
+        const staged = await gatekeeper.inspectArticleRow(recoveryOperationId);
+        if (typeof staged?.command_json !== "string")
+          throw new Error("Missing staged recovery command.");
+        const stagedCommand = JSON.parse(staged.command_json) as {
+          namespace?: { gatekeeperInstanceId?: string; localActionId?: number };
+          system1RecoveryNextRequestId?: string;
+        };
+        if (
+          typeof stagedCommand.namespace?.gatekeeperInstanceId !== "string" ||
+          typeof stagedCommand.namespace.localActionId !== "number" ||
+          typeof stagedCommand.system1RecoveryNextRequestId !== "string"
+        )
+          throw new Error("Malformed staged recovery binding.");
+        const gatekeeperInstanceId = stagedCommand.namespace.gatekeeperInstanceId;
+        const localActionId = stagedCommand.namespace.localActionId;
+        const findNormalReservation = () =>
+          reservationStore.findBronzeActionReservation(
+            managerId,
+            gatekeeperInstanceId,
+            localActionId,
+          );
+        normalReservationBefore = (await findNormalReservation()) ?? null;
+        try {
+          await gatekeeper.applyAction(submittedRecovery.action);
+        } catch (cause) {
+          applyError = messageOf(cause);
+        }
+        appliedRow = await gatekeeper.inspectArticleRow(recoveryOperationId);
+        if (scenario === "system1_recovery_conflict_reject") {
+          normalReservationAfterConflict = (await findNormalReservation()) ?? null;
+          await gatekeeper.rejectAction(submittedRecovery.action);
+          rejectedRow = await gatekeeper.inspectArticleRow(recoveryOperationId);
+        }
+        normalReservationAfter = (await findNormalReservation()) ?? null;
+        if (scenario === "system1_recovery_zero_revision_apply")
+          await gatekeeper.applyAction(submittedRecovery.action);
+        goldJobApplyInputs = (await controller.goldJobControlCallbackSnapshot()).applyInputs;
+      }
+      const safeControlAfter = (await findSafeControl()) ?? null;
+      return {
+        proposals,
+        proposalErrors,
+        submissions: queueTarget.snapshot().submissions,
+        rows,
+        safeControlBefore,
+        safeControlAfter,
+        applyError,
+        appliedRow,
+        normalReservationBefore,
+        normalReservationAfter,
+        normalReservationAfterConflict,
+        rejectedRow,
+        goldJobApplyInputs,
+      };
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
+  }
+
+  async runGoldPageRoleIsolation(): Promise<{
+    jobRole: "absent" | "installed" | "incompatible";
+    pageRoleBefore: "absent" | "installed" | "incompatible";
+    foreignInstallError: string | null;
+    pageRoleAfterForeign: "absent" | "installed" | "incompatible";
+    wrongMarkerInstallError: string | null;
+    pageRoleAfterWrongMarker: "absent" | "installed" | "incompatible";
+  }> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
+    });
+    const account = await workerExports
+      .GatekeeperVendor({})
+      .createManagerAccount(managerId, access);
+
+    const jobController = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_JOB_CONTROL_CONTRACT,
+      },
+    });
+    await account.installGoldRole(managerId, jobController);
+    const jobRole = await account.inspectGoldRole(managerId);
+    const pageRoleBefore = await account.inspectGoldPageRole(managerId);
+
+    let foreignInstallError: string | null = null;
+    try {
+      const foreignController = workerExports.TestGoldController({
+        props: {
+          managerId: crypto.randomUUID(),
+          token: crypto.randomUUID(),
+          marker: GOLD_PAGE_CONTROL_CONTRACT,
+        },
+      });
+      await account.installGoldPageRole(managerId, foreignController);
+    } catch (cause) {
+      foreignInstallError = messageOf(cause);
+    }
+    const pageRoleAfterForeign = await account.inspectGoldPageRole(managerId);
+
+    let wrongMarkerInstallError: string | null = null;
+    try {
+      const wrongMarkerController = workerExports.TestGoldController({
+        props: {
+          managerId,
+          token: crypto.randomUUID(),
+          marker: GOLD_JOB_CONTROL_CONTRACT,
+        },
+      });
+      await account.installGoldPageRole(managerId, wrongMarkerController);
+    } catch (cause) {
+      wrongMarkerInstallError = messageOf(cause);
+    }
+    const pageRoleAfterWrongMarker = await account.inspectGoldPageRole(managerId);
+
+    return {
+      jobRole,
+      pageRoleBefore,
+      foreignInstallError,
+      pageRoleAfterForeign,
+      wrongMarkerInstallError,
+      pageRoleAfterWrongMarker,
+    };
+  }
+
+  async runGoldPageRoleBinding(): Promise<{
+    pageRoleAfterInstall: "absent" | "installed" | "incompatible";
+    pageRoleAfterRetry: "absent" | "installed" | "incompatible";
+    firstControllerChecks: number;
+    firstControllerChecksAfterRetry: number;
+    firstControllerChecksAfterReadback: number;
+  }> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
+    });
+    const account = await workerExports
+      .GatekeeperVendor({})
+      .createManagerAccount(managerId, access);
+    const firstController = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_PAGE_CONTROL_CONTRACT,
+      },
+    });
+    await account.installGoldPageRole(managerId, firstController);
+    const pageRoleAfterInstall = await account.inspectGoldPageRole(managerId);
+    const firstControllerChecks = (await firstController.boundInputLog()).length;
+
+    const retryController = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_PAGE_CONTROL_CONTRACT,
+      },
+    });
+    await account.installGoldPageRole(managerId, retryController);
+    const firstControllerChecksAfterRetry = (await firstController.boundInputLog()).length;
+    const pageRoleAfterRetry = await account.inspectGoldPageRole(managerId);
+
+    return {
+      pageRoleAfterInstall,
+      pageRoleAfterRetry,
+      firstControllerChecks,
+      firstControllerChecksAfterRetry,
+      firstControllerChecksAfterReadback: (await firstController.boundInputLog()).length,
+    };
+  }
+
+  async runConcurrentAccountBinding(): Promise<{
+    bindResults: Array<"fulfilled" | "rejected">;
+    firstStored: string;
+    afterRebind: string;
+    foreignError: string | null;
+    afterForeign: string;
+  }> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const firstToken = "parallel-bind-first";
+    const secondToken = "parallel-bind-second";
+    const first = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: firstToken, bindDelayMs: 15, d04ReaderMode: true },
+    });
+    const second = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: secondToken, bindDelayMs: 15, d04ReaderMode: true },
+    });
+    const store = workerExports.KnowledgeAccountAccess.getByName(managerId);
+    const results = await Promise.allSettled([
+      store.bind(managerId, first),
+      store.bind(managerId, second),
+    ]);
+    const storedToken = async (): Promise<string> => {
+      const capability = (await store.getAccess()) as {
+        tokenForTest(): Promise<string>;
+      };
+      return capability.tokenForTest();
+    };
+    const firstStored = await storedToken();
+    const laterCapability = firstStored === firstToken ? second : first;
+    await store.bind(managerId, laterCapability);
+    const afterRebind = await storedToken();
+
+    const foreign = workerExports.TestKnowledgeAccess({
+      props: {
+        managerId: crypto.randomUUID(),
+        token: "parallel-bind-foreign",
+        d04ReaderMode: true,
+      },
+    });
+    let foreignError: string | null = null;
+    try {
+      await store.bind(managerId, foreign);
+    } catch (cause) {
+      foreignError = messageOf(cause);
+    }
+    const afterForeign = await storedToken();
+    return {
+      bindResults: results.map((result) => result.status),
+      firstStored,
+      afterRebind,
+      foreignError,
+      afterForeign,
+    };
+  }
+
+  async runAccountError(
+    options: {
+      requestedManagerId?: string;
+      capabilityManagerId?: string;
+      assertMode?: AssertMode;
+      extraProps?: boolean;
+    } = {},
+  ): Promise<string | null> {
     const workerExports = this.#exports();
     const access = workerExports.TestKnowledgeAccess({
       props: {
@@ -1902,9 +3036,7 @@ export class TestGatekeeperFactory extends DurableObject {
         assertMode: options.assertMode,
       },
     });
-    const capability = options.extraProps
-      ? { access, unexpected: true }
-      : access;
+    const capability = options.extraProps ? { access, unexpected: true } : access;
     try {
       if (options.extraProps) {
         const account = workerExports.CustomAccount({ props: capability });
@@ -1932,21 +3064,202 @@ export class TestGatekeeperFactory extends DurableObject {
     }
   }
 
+  async runGoldPageProposal(scenario: GoldPageProposalScenario): Promise<GoldPageProposalResult> {
+    const workerExports = this.#exports();
+    const managerId = crypto.randomUUID();
+    const access = workerExports.TestKnowledgeAccess({
+      props: { managerId, token: crypto.randomUUID(), d04ReaderMode: true },
+    });
+    const account = await workerExports
+      .GatekeeperVendor({})
+      .createManagerAccount(managerId, access);
+    const pageController = workerExports.TestGoldController({
+      props: {
+        managerId,
+        token: crypto.randomUUID(),
+        marker: GOLD_PAGE_CONTROL_CONTRACT,
+        pageEditMode:
+          scenario === "edit_retry"
+            ? "response_loss_once"
+            : scenario === "conflict_reject_resubmit"
+              ? "conflict_once"
+              : "normal",
+      },
+    });
+    if (scenario === "job_role_only") {
+      const jobController = workerExports.TestGoldController({
+        props: {
+          managerId,
+          token: crypto.randomUUID(),
+          marker: GOLD_JOB_CONTROL_CONTRACT,
+        },
+      });
+      await account.installGoldRole(managerId, jobController);
+    } else {
+      await account.installGoldPageRole(managerId, pageController);
+    }
+    const gatekeeperClass = workerExports.InspectableCustomGatekeeper({ props: { managerId } });
+    const facetName = "fixture-gl06-gold-page-action-" + crypto.randomUUID();
+    const gatekeeper = this.ctx.facets.get(facetName, () => ({
+      class: gatekeeperClass,
+      id: facetName,
+    })) as unknown as FixtureGatekeeper;
+    const queueTarget = new TestApprovalQueue();
+    const queue = new RpcStub<ApprovalQueue>(queueTarget);
+    const session = (await gatekeeper.startSession(queue)) as unknown as GoldPageProposalSession;
+    const sourceContext: NativeGoldPageSourceContext[] = [
+      {
+        articleId: "fixture-article",
+        revisionId: "fixture-revision",
+        bodyHash: "b".repeat(64),
+        metadataRevision: 1,
+        projectionVersions: {
+          projectionRuleVersion: "silver-v1",
+          processedVersion: "c".repeat(64),
+          relationVersion: "d".repeat(64),
+        },
+      },
+    ];
+    const intent: NativeGoldPageActionBinding = {
+      path: "index.md",
+      pageId: "fixture-gold-page",
+      expectedPageVersion: 0,
+      expectedProtectionVersion: 0,
+      expectedControlRevision: 0,
+      sourceContext,
+    };
+    const editInput: NativeGoldPageEditProposal = {
+      intent: { ...intent, content: "# Owner reviewed edit\n" },
+    };
+    const cleanInput: NativeGoldCleanReplacementProposal = { intent };
+    const proposals: unknown[] = [];
+    const proposalErrors: string[] = [];
+    const applyErrors: string[] = [];
+    const rejectErrors: string[] = [];
+    const rows: Array<Record<string, unknown> | null> = [];
+    let proposalNowMs: number | null = null;
+    let approvalNowMs: number | null = null;
+    const propose = async (kind: "edit" | "clean"): Promise<string | null> => {
+      try {
+        const proposal =
+          kind === "edit"
+            ? await session.proposeGoldPageEdit(editInput)
+            : await session.proposeGoldCleanReplacement(cleanInput);
+        proposals.push(proposal);
+        const operationId = proposalOperationId(proposal);
+        if (operationId !== null) rows.push(await gatekeeper.inspectArticleRow(operationId));
+        return operationId;
+      } catch (cause) {
+        proposalErrors.push(messageOf(cause));
+        return null;
+      }
+    };
+
+    let beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+    try {
+      if (scenario === "job_role_only") {
+        await propose("edit");
+      } else if (scenario === "edit_retry") {
+        const originalDateNow = Date.now;
+        let logicalNow = originalDateNow();
+        Date.now = () => logicalNow;
+        try {
+          proposalNowMs = logicalNow;
+          const operationId = await propose("edit");
+          beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+          logicalNow += 300_001;
+          approvalNowMs = logicalNow;
+          const action = queueTarget.submissions[0];
+          if (operationId !== null && action !== undefined) {
+            try {
+              await gatekeeper.applyAction(action.action);
+            } catch (cause) {
+              applyErrors.push(messageOf(cause));
+            }
+            try {
+              await gatekeeper.applyAction(action.action);
+            } catch (cause) {
+              applyErrors.push(messageOf(cause));
+            }
+            rows.push(await gatekeeper.inspectArticleRow(operationId));
+          }
+        } finally {
+          Date.now = originalDateNow;
+        }
+      } else if (scenario === "clean_approve") {
+        const operationId = await propose("clean");
+        beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+        const action = queueTarget.submissions[0];
+        if (operationId !== null && action !== undefined) {
+          try {
+            await gatekeeper.applyAction(action.action);
+          } catch (cause) {
+            applyErrors.push(messageOf(cause));
+          }
+          rows.push(await gatekeeper.inspectArticleRow(operationId));
+        }
+      } else if (scenario === "reject_then_resubmit") {
+        const firstOperationId = await propose("edit");
+        beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+        const firstAction = queueTarget.submissions[0];
+        if (firstOperationId !== null && firstAction !== undefined) {
+          await gatekeeper.rejectAction(firstAction.action);
+          rows[0] = await gatekeeper.inspectArticleRow(firstOperationId);
+        }
+        const secondOperationId = await propose("edit");
+        if (secondOperationId !== null)
+          rows.push(await gatekeeper.inspectArticleRow(secondOperationId));
+      } else {
+        const operationId = await propose("edit");
+        beforeDecisionCallbacks = await pageController.goldPageCallbackSnapshot();
+        const action = queueTarget.submissions[0];
+        if (operationId !== null && action !== undefined) {
+          try {
+            await gatekeeper.applyAction(action.action);
+          } catch (cause) {
+            applyErrors.push(messageOf(cause));
+          }
+          rows.push(await gatekeeper.inspectArticleRow(operationId));
+          try {
+            await gatekeeper.rejectAction(action.action);
+          } catch (cause) {
+            rejectErrors.push(messageOf(cause));
+          }
+          rows.push(await gatekeeper.inspectArticleRow(operationId));
+        }
+        const secondOperationId = await propose("edit");
+        if (secondOperationId !== null)
+          rows.push(await gatekeeper.inspectArticleRow(secondOperationId));
+      }
+
+      return {
+        jobRole: await account.inspectGoldRole(managerId),
+        pageRole: await account.inspectGoldPageRole(managerId),
+        proposals,
+        proposalErrors,
+        submissions: queueTarget.snapshot().submissions,
+        rows,
+        beforeDecisionCallbacks,
+        callbacks: await pageController.goldPageCallbackSnapshot(),
+        applyErrors,
+        rejectErrors,
+        autoApprovable: await gatekeeper.getAutoApprovableActions(),
+        proposalNowMs,
+        approvalNowMs,
+      };
+    } finally {
+      session[Symbol.dispose]();
+      queue[Symbol.dispose]();
+    }
+  }
+
   async runCatalog(limit: number): Promise<{
     catalog: AgentCatalog;
     observations: ObservationDescription[];
   }> {
+    void limit;
     const { gatekeeper } = await this.#newBinding({ managerId: crypto.randomUUID() });
-    const target = new TestObservationAuthorizer();
-    const authorizer = new RpcStub<ObservationAuthorizer>(target);
-    try {
-      return {
-        catalog: await gatekeeper.getAgentCatalog({ limit }, authorizer),
-        observations: target.observations.map((observation) => ({ ...observation })),
-      };
-    } finally {
-      authorizer[Symbol.dispose]();
-    }
+    return { catalog: await gatekeeper.getAgentCatalog(), observations: [] };
   }
 
   async runObserverRejection(): Promise<string | null> {
@@ -1962,7 +3275,6 @@ export class TestGatekeeperFactory extends DurableObject {
     }
   }
 }
-
 
 type NativeArticleSaveMode = "normal" | "commit_then_throw_once" | "forbidden_once";
 type NativeArticleStored = {
@@ -1994,8 +3306,10 @@ const newNativeArticleFixtureState = (): NativeArticleFixtureState => ({
 // callback wrapper.
 export class NativeArticleAccess extends DurableObject<Cloudflare.Env> {
   async #readState(): Promise<NativeArticleFixtureState> {
-    return await this.ctx.storage.get<NativeArticleFixtureState>("article-fixture") ??
-      newNativeArticleFixtureState();
+    return (
+      (await this.ctx.storage.get<NativeArticleFixtureState>("article-fixture")) ??
+      newNativeArticleFixtureState()
+    );
   }
 
   async #writeState(state: NativeArticleFixtureState): Promise<void> {
@@ -2015,11 +3329,12 @@ export class NativeArticleAccess extends DurableObject<Cloudflare.Env> {
     await this.ctx.storage.deleteAll();
   }
 
-  async assertBoundTo(managerId: string): Promise<void> {
+  async assertBoundTo(managerId: string): Promise<"cybernest-knowledge-read-v1"> {
     const state = await this.#readState();
     if (state.managerId !== managerId) {
       throw new Error("Article fixture is bound to another Manager.");
     }
+    return "cybernest-knowledge-read-v1";
   }
 
   async setArticleSaveMode(mode: NativeArticleSaveMode): Promise<void> {
@@ -2045,8 +3360,11 @@ export class NativeArticleAccess extends DurableObject<Cloudflare.Env> {
   }
 
   async saveArticle(input: unknown): Promise<unknown> {
-    if (!isRecord(input) || typeof input.commandJson !== "string" ||
-        typeof input.payloadHash !== "string") {
+    if (
+      !isRecord(input) ||
+      typeof input.commandJson !== "string" ||
+      typeof input.payloadHash !== "string"
+    ) {
       throw new TypeError("Invalid test Article save input.");
     }
     const state = await this.#readState();
@@ -2058,9 +3376,13 @@ export class NativeArticleAccess extends DurableObject<Cloudflare.Env> {
     };
     try {
       const parsed: unknown = JSON.parse(input.commandJson);
-      if (!isRecord(parsed) || typeof parsed.operationId !== "string" ||
-          typeof parsed.actionRef !== "string" || !isRecord(parsed.article) ||
-          !Array.isArray(parsed.article.sections)) {
+      if (
+        !isRecord(parsed) ||
+        typeof parsed.operationId !== "string" ||
+        typeof parsed.actionRef !== "string" ||
+        !isRecord(parsed.article) ||
+        !Array.isArray(parsed.article.sections)
+      ) {
         throw new TypeError("Invalid Article command.");
       }
       command = parsed as typeof command;
@@ -2127,15 +3449,17 @@ export class NativeArticleAccess extends DurableObject<Cloudflare.Env> {
   }
 
   async readArticle(input: unknown): Promise<unknown> {
-    if (!isRecord(input) || typeof input.articleId !== "string" ||
-        typeof input.revisionId !== "string") {
+    if (
+      !isRecord(input) ||
+      typeof input.articleId !== "string" ||
+      typeof input.revisionId !== "string"
+    ) {
       throw new TypeError("Invalid test Article read input.");
     }
     const state = await this.#readState();
     state.readInputs.push({ articleId: input.articleId, revisionId: input.revisionId });
     const saved = Object.values(state.articles).find(
-      (article) => article.articleId === input.articleId &&
-        article.revisionId === input.revisionId,
+      (article) => article.articleId === input.articleId && article.revisionId === input.revisionId,
     );
     await this.#writeState(state);
     if (saved === undefined) return { _tag: "not_found" };
@@ -2182,14 +3506,32 @@ type NativeOwnerExports = {
   };
 };
 
-type NativeOwnerGatekeeper = {
-  openSession(): Promise<{
-    proposeArticle(input: { article: unknown }): Promise<unknown>;
-    readArticleOutcome(input: { operationId: string }): Promise<unknown>;
-    [Symbol.dispose](): void;
+type NativeOwnerGatekeeper = CapnwebRpcStub<GatekeeperClient<KnowledgeSession>>;
+type NativeGoldPageSourceContext = Readonly<{
+  articleId: string;
+  revisionId: string;
+  bodyHash: string;
+  metadataRevision: number;
+  projectionVersions: Readonly<{
+    projectionRuleVersion: string;
+    processedVersion: string;
+    relationVersion: string;
   }>;
-  [Symbol.dispose](): void;
-};
+}>;
+type NativeGoldPageActionBinding = Readonly<{
+  path: string;
+  pageId: string;
+  expectedPageVersion: number;
+  expectedProtectionVersion: number;
+  expectedControlRevision: number;
+  sourceContext: readonly NativeGoldPageSourceContext[];
+}>;
+type NativeGoldPageEditProposal = Readonly<{
+  intent: NativeGoldPageActionBinding & Readonly<{ content: string }>;
+}>;
+type NativeGoldCleanReplacementProposal = Readonly<{
+  intent: NativeGoldPageActionBinding;
+}>;
 
 // Every operation opens and closes a real pinned Overseer owner session inside this Durable
 // Object event. That keeps the native notifyClosed callback alive until its completion is observed.
@@ -2229,8 +3571,11 @@ export class NativeApprovalOwner extends DurableObject<Cloudflare.Env> {
       resolveClosed = resolve;
     });
     const notifyClosed = new RpcStub<() => void>(() => resolveClosed?.());
-    const owner = await workerExports.OverseerDurableObject.get(overseerId)
-      .open(userId, managerId, notifyClosed);
+    const owner = await workerExports.OverseerDurableObject.get(overseerId).open(
+      userId,
+      managerId,
+      notifyClosed,
+    );
     try {
       return await callback(owner);
     } finally {
@@ -2244,7 +3589,49 @@ export class NativeApprovalOwner extends DurableObject<Cloudflare.Env> {
   }
 
   async listActions(managerId: string, workspaceId: string): Promise<unknown[]> {
-    return this.#withOwner(managerId, workspaceId, (owner) => owner.listActions());
+    const page = await this.#withOwner(managerId, workspaceId, (owner) => owner.listActions());
+    return page.entries;
+  }
+
+  async readKnowledgeSession(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    path: string,
+  ): Promise<unknown> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      const gatekeeper = (await owner.getGatekeeperById(
+        gatekeeperId,
+      )) as unknown as NativeOwnerGatekeeper;
+      try {
+        const session = await gatekeeper.openSession();
+        try {
+          return await session.read({ path });
+        } finally {
+          session[Symbol.dispose]();
+        }
+      } finally {
+        gatekeeper[Symbol.dispose]();
+      }
+    });
+  }
+
+  async readKnowledgeSessionOutcome(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    path: string,
+  ): Promise<Readonly<{ ok: true; value: unknown } | { ok: false; code: "not_found" }>> {
+    try {
+      return {
+        ok: true,
+        value: await this.readKnowledgeSession(managerId, workspaceId, gatekeeperId, path),
+      };
+    } catch (cause) {
+      if (cause instanceof Error && cause.message === "Knowledge Base not_found.")
+        return { ok: false, code: "not_found" };
+      throw cause;
+    }
   }
 
   async proposeArticle(
@@ -2254,11 +3641,104 @@ export class NativeApprovalOwner extends DurableObject<Cloudflare.Env> {
     article: unknown,
   ): Promise<unknown> {
     return this.#withOwner(managerId, workspaceId, async (owner) => {
-      const gatekeeper = await owner.getGatekeeperById(gatekeeperId) as unknown as NativeOwnerGatekeeper;
+      const gatekeeper = (await owner.getGatekeeperById(
+        gatekeeperId,
+      )) as unknown as NativeOwnerGatekeeper;
       try {
         const session = await gatekeeper.openSession();
         try {
           return await session.proposeArticle({ article });
+        } finally {
+          session[Symbol.dispose]();
+        }
+      } finally {
+        gatekeeper[Symbol.dispose]();
+      }
+    });
+  }
+
+  async proposeGoldJobControl(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    input: unknown,
+  ): Promise<unknown> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      const gatekeeper = (await owner.getGatekeeperById(
+        gatekeeperId,
+      )) as unknown as NativeOwnerGatekeeper;
+      try {
+        const session = await gatekeeper.openSession();
+        try {
+          try {
+            return await session.proposeGoldJobControl(input);
+          } catch (cause) {
+            return { error: messageOf(cause) };
+          }
+        } finally {
+          session[Symbol.dispose]();
+        }
+      } finally {
+        gatekeeper[Symbol.dispose]();
+      }
+    });
+  }
+
+  async proposeGoldPageEdit(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    input: NativeGoldPageEditProposal,
+  ): Promise<unknown> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      const gatekeeper = (await owner.getGatekeeperById(
+        gatekeeperId,
+      )) as unknown as NativeOwnerGatekeeper;
+      try {
+        const session = await gatekeeper.openSession();
+        try {
+          try {
+            return await (
+              session as typeof session & {
+                proposeGoldPageEdit(input: NativeGoldPageEditProposal): Promise<unknown>;
+              }
+            ).proposeGoldPageEdit(input);
+          } catch (cause) {
+            return { error: messageOf(cause) };
+          }
+        } finally {
+          session[Symbol.dispose]();
+        }
+      } finally {
+        gatekeeper[Symbol.dispose]();
+      }
+    });
+  }
+
+  async proposeGoldCleanReplacement(
+    managerId: string,
+    workspaceId: string,
+    gatekeeperId: number,
+    input: NativeGoldCleanReplacementProposal,
+  ): Promise<unknown> {
+    return this.#withOwner(managerId, workspaceId, async (owner) => {
+      const gatekeeper = (await owner.getGatekeeperById(
+        gatekeeperId,
+      )) as unknown as NativeOwnerGatekeeper;
+      try {
+        const session = await gatekeeper.openSession();
+        try {
+          try {
+            return await (
+              session as typeof session & {
+                proposeGoldCleanReplacement(
+                  input: NativeGoldCleanReplacementProposal,
+                ): Promise<unknown>;
+              }
+            ).proposeGoldCleanReplacement(input);
+          } catch (cause) {
+            return { error: messageOf(cause) };
+          }
         } finally {
           session[Symbol.dispose]();
         }
@@ -2275,11 +3755,17 @@ export class NativeApprovalOwner extends DurableObject<Cloudflare.Env> {
     operationId: string,
   ): Promise<unknown> {
     return this.#withOwner(managerId, workspaceId, async (owner) => {
-      const gatekeeper = await owner.getGatekeeperById(gatekeeperId) as unknown as NativeOwnerGatekeeper;
+      const gatekeeper = (await owner.getGatekeeperById(
+        gatekeeperId,
+      )) as unknown as NativeOwnerGatekeeper;
       try {
         const session = await gatekeeper.openSession();
         try {
-          return await session.readArticleOutcome({ operationId });
+          return await (
+            session as typeof session & {
+              readArticleOutcome(input: { operationId: string }): Promise<unknown>;
+            }
+          ).readArticleOutcome({ operationId });
         } finally {
           session[Symbol.dispose]();
         }

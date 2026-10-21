@@ -6,9 +6,10 @@
   "main": "./src/index.ts",
   "scripts": {
     "types:check": "tsc --noEmit",
-    "types:test": "tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution bundler --lib ESNext --types ./worker-configuration.d.ts,@cloudflare/vitest-pool-workers/types --skipLibCheck __tests__/worker.ts __tests__/native-approval.test.ts src/env.d.ts",
+    "types:test": "tsc --ignoreConfig --noEmit --strict --target ES2022 --module ESNext --moduleResolution bundler --lib ESNext --types ./worker-configuration.d.ts,@cloudflare/vitest-pool-workers/types --skipLibCheck __tests__/worker.ts __tests__/native-approval.test.ts src/env.d.ts",
     "test:native:prepare": "pnpm --dir ../../cloudflare-os exec vp run -F @gadgets/typed-storage --no-cache build && pnpm --dir ../../cloudflare-os/packages/workshop-backend exec node scripts/build-browser-runtime.ts && pnpm --dir ../../cloudflare-os/packages/workshop-backend exec node scripts/build-bundled-blueprints.ts",
     "test:native": "pnpm run test:native:prepare && vitest run --config vitest.native-approval.config.ts",
+    "test:native:os": "node --test __tests__/os-native-worker.test.mjs",
     "test:run": "vitest run",
     "test:legacy": "pnpm run types:test && vitest run && pnpm exec capnweb-validate build --out .wrangler/validate && pnpm run test:native && node --test __tests__/cross-worker-facet.test.mjs"
   },

@@ -1,41 +1,110 @@
-const TYPES_CODE = `interface KnowledgeSummary { knowledgeId: string; generation: 1; displayName: string; role: "initial" | "additional"; state: "provisioning" | "ready" | "blocked"; createdAt: string; updatedAt: string; access?: Knowledge; }
-interface KnowledgeCreationSummary { knowledgeId: string; generation: 1; displayName: string; role: "additional"; state: "provisioning" | "ready" | "blocked"; createdAt: string; updatedAt: string; }
-type CreationFailure = "service_not_ready" | "capacity_exceeded" | "forbidden" | "invalid_input" | "operation_conflict" | "integrity_failure" | "deadline_exceeded" | "outcome_unknown" | "dependency_unavailable";
-type CreationTerminalFailure = "service_not_ready" | "capacity_exceeded" | "forbidden" | "invalid_input" | "operation_conflict" | "integrity_failure";
-type KnowledgeCreationOutcome =
-  | { operationId: string; status: "pending_approval"; }
-  | { operationId: string; status: "outcome_unknown"; reason: "outcome_unknown"; }
-  | { operationId: string; status: "failed"; reason: CreationTerminalFailure; }
-  | { operationId: string; status: "applied"; outcome: "ready" | "already_ready" | "provisioning" | "blocked"; knowledge: KnowledgeCreationSummary; };
-interface KnowledgePage { items: KnowledgeSummary[]; nextCursor: string | null; }
-interface BronzeProvenance { sourceKind: "conversation" | "user_document" | "explicit_user_input"; reference: string; capturedAt: string; }
-type BronzeReceipt = { receiptId: string; knowledgeId: string; generation: 1; operationId: string; sourceId: string; revisionId: string; revisionNumber: 1; contentHash: string; committedAt: string; }
-type BronzeAdoptionProposal = { operationId: string; status: "pending_approval"; }
-type KnowledgeAdoptionOutcome =
-  | { operationId: string; status: "pending_approval"; }
-  | { operationId: string; status: "outcome_unknown"; reason: "outcome_unknown"; }
-  | { operationId: string; status: "failed"; reason: "service_not_ready" | "not_found" | "provisioning" | "blocked" | "forbidden" | "invalid_input" | "payload_too_large" | "operation_conflict"; }
-  | { operationId: string; status: "applied"; outcome: "committed" | "already_committed"; receipt: BronzeReceipt; };
-type ArticleMeaning = "proposal" | "inference" | "explicit_decision" | "observed_result";
-type ArticleSourceKind = "conversation" | "tool_result" | "explicit_user_input" | "user_document" | "artifact";
-type ArticleActorKind = "user" | "assistant" | "tool" | "system";
-interface ActivityArticleSection { text: string; meaning: ArticleMeaning; sourceIds: string[]; }
-interface ActivityArticleSource { sourceId: string; kind: ArticleSourceKind; reference: string; version?: string; contentHash?: string; actor: { kind: ArticleActorKind; reference?: string; }; recordedAt: string; eventAt?: string; excerpt?: string; }
-interface ActivityArticle { sections: ActivityArticleSection[]; sources: ActivityArticleSource[]; }
-type ArticleFailure = "service_not_ready" | "capacity_exceeded" | "forbidden" | "invalid_input" | "article_too_large" | "operation_conflict" | "integrity_failure";
-type ArticleReceipt = { receiptId: string; knowledgeId: string; generation: 1; operationId: string; actionRef: string; payloadHash: string; articleId: string; revisionId: string; revisionNumber: 1; committedAt: string; };
-type KnowledgeArticleOutcome =
-  | { operationId: string; status: "pending_approval"; }
-  | { operationId: string; status: "outcome_unknown"; reason: "outcome_unknown"; }
-  | { operationId: string; status: "failed"; reason: ArticleFailure; }
-  | { operationId: string; status: "applied"; outcome: "committed" | "already_committed"; receipt: ArticleReceipt; };
-type KnowledgeArticleProposal = { operationId: string; status: "pending_approval"; };
-interface Knowledge {
-  readBronze(input: { sourceId: string; revisionId?: string }): Promise<KnowledgeRevision | null>;
-  proposeBronzeAdoption(input: { document: string; provenance: BronzeProvenance }): Promise<BronzeAdoptionProposal>;
-  readAdoptionOutcome(input: { operationId: string }): Promise<KnowledgeAdoptionOutcome | null>;
+const D04_TYPES_CODE = `interface KnowledgeListInput { offset: number; limit: number; }
+type KnowledgeComputerSearchInput = { query: string; offset: number; limit: number; };
+type KnowledgeArticleSearchInput = { kind: "articles"; filters?: { type?: string; title?: string; description?: string; tag?: string; }; cursor?: string; limit: number; };
+type KnowledgeArticleLinksSearchInput = { kind: "article-links"; articleId: string; direction: "links" | "backlinks"; maxDepth: number; candidateBudget: number; };
+type KnowledgeSearchInput = KnowledgeComputerSearchInput | KnowledgeArticleSearchInput | KnowledgeArticleLinksSearchInput;
+interface KnowledgeReadInput { path: string; }
+type KnowledgeArticleSourceSelector =
+  | { kind: "chat_message"; chatId: number; sequence: number }
+  | { kind: "os_observation"; actionId: number; gatekeeperId: number };
+type KnowledgeArticleProposal =
+  | {
+      kind: "adopt";
+      body: string;
+      sourceSelector: KnowledgeArticleSourceSelector;
+      observedTargetDescription: string;
+      sourceRelationshipClaim: string;
+      initialUsePolicy: "included" | "excluded";
+      expectedCurrentRevision: null;
+    }
+  | {
+      kind: "revise";
+      articleId: string;
+      body: string;
+      sourceSelector: KnowledgeArticleSourceSelector;
+      observedTargetDescription: string;
+      sourceRelationshipClaim: string;
+      expectedCurrentRevision: string;
+    };
+type KnowledgeGoldJobControlIntent = {
+  operation: "stop" | "resume";
+  jobId: string;
+  expectedJobState: "disabled" | "clean" | "dirty" | "running" | "candidate" | "published" | "partial" | "retry_wait" | "budget_wait" | "paused_user" | "paused_deterministic" | "paused_unknown" | "needs_reconciliation";
+  expectedJobFence: number;
+  expectedControlRevision: number;
+  system1Recovery?: { decisionKeyHash: string; expectedRequestId: string; additionalMaxMicroUsd: 5000; };
+};
+type KnowledgeGoldPageSourceContextEntry = {
+  articleId: string;
+  revisionId: string;
+  bodyHash: string;
+  metadataRevision: number;
+  projectionVersions: {
+    projectionRuleVersion: string;
+    processedVersion: string;
+    relationVersion: string;
+  };
+};
+type KnowledgeGoldPageActionIntent = {
+  path: string;
+  pageId: string;
+  expectedPageVersion: number;
+  expectedProtectionVersion: number;
+  expectedControlRevision: number;
+  sourceContext: KnowledgeGoldPageSourceContextEntry[];
+};
+type KnowledgeGoldPageEditIntent = KnowledgeGoldPageActionIntent & { content: string; };
+interface KnowledgeListResult { bundleId: string; versionId: string; items: Array<{ path: string }>; nextOffset?: number; }
+type KnowledgeSilverFacetCoverage = { status: "complete" | "partial"; reasons: string[]; };
+type KnowledgeSilverSearchCoverage = { metadata: KnowledgeSilverFacetCoverage; internalLinks: KnowledgeSilverFacetCoverage; sources: KnowledgeSilverFacetCoverage; };
+type KnowledgeSilverMetadataUnknownCoverage = KnowledgeSilverSearchCoverage & { metadata: { status: "partial"; reasons: string[]; }; };
+type KnowledgeSilverProjectionLink =
+  | { rawDestination: string; targetPath: string; fragment: string | null; resolution: "resolved_current"; targetArticleId: string; }
+  | { rawDestination: string; targetPath: string; fragment: string | null; resolution: "resolved_exact"; targetArticleId: string; targetRevisionId: string; targetBodyHash: string; }
+  | { rawDestination: string; targetPath: string; fragment: string | null; resolution: "unresolved" | "external_or_scope"; };
+type KnowledgeSilverProjectionSource =
+  | { descriptor: unknown; resolution: "resolved_current"; targetArticleId: string; }
+  | { descriptor: unknown; resolution: "resolved_exact"; targetArticleId: string; targetRevisionId: string; targetBodyHash: string; }
+  | { descriptor: unknown; resolution: "unresolved" | "external_or_scope"; };
+type KnowledgeSilverProjectionResult = {
+  articleId: string; inputRevisionId: string; projectionRuleVersion: string; processedVersion: string; relationVersion: string;
+  metadata: Record<string, unknown> | null; literalLinks: KnowledgeSilverProjectionLink[];
+  backlinks: Array<{ sourceArticleId: string; sourceRevisionId: string; targetRevisionId: string | null; targetBodyHash: string | null; }>;
+  sources: KnowledgeSilverProjectionSource[]; coverage: KnowledgeSilverSearchCoverage;
+};
+type KnowledgeArticleSearchItemCommon = {
+  articleId: string; currentRevisionId: string; usePolicy: "included"; currentPath: string; exactRevisionPath: string;
+  bodyHash: string; coverage: KnowledgeSilverSearchCoverage;
+};
+type KnowledgeArticleSearchItem =
+  | (KnowledgeArticleSearchItemCommon & { state: "indexed"; projection: KnowledgeSilverProjectionResult; })
+  | (Omit<KnowledgeArticleSearchItemCommon, "coverage"> & { state: "metadata_unknown"; projection: KnowledgeSilverProjectionResult; coverage: KnowledgeSilverMetadataUnknownCoverage; })
+  | (KnowledgeArticleSearchItemCommon & { state: "pending"; projection: null; });
+type KnowledgeSearchResult =
+  | { bundleId: string; versionId: string; hits: Array<{ path: string; line: number; snippet: string }>; nextOffset?: number; }
+  | { kind: "articles"; items: KnowledgeArticleSearchItem[]; nextCursor?: string; coverage: KnowledgeSilverSearchCoverage; }
+  | { kind: "article-links"; items: Array<{ depth: number; item: KnowledgeArticleSearchItem; }>; coverage: KnowledgeSilverSearchCoverage; };
+type KnowledgeReadResult =
+  | { kind: "navigation"; path: "articles" | "index.md"; sourceMarkdown: string; goldStatus: "disabled" | "enabled" | "paused"; }
+  | { bundleId: string; versionId: string; path: string; sourceMarkdown: string; metadata: Record<string, unknown>; }
+  | {
+      kind: "article";
+      articleId: string;
+      revisionId: string;
+      bodyHash: string;
+      path: string;
+      sourceMarkdown: string;
+      metadata: Record<string, unknown>;
+    };
+interface KnowledgeBase {
+  list(input: KnowledgeListInput): Promise<KnowledgeListResult>;
+  search(input: KnowledgeSearchInput): Promise<KnowledgeSearchResult>;
+  read(input: KnowledgeReadInput): Promise<KnowledgeReadResult>;
+  proposeArticle(input: { article: KnowledgeArticleProposal }): Promise<{ status: "pending_approval"; operationId: string }>;
+  proposeArticlePolicy(input: { articleId: string; usePolicy: "included" | "excluded"; expectedMetadataRevision: number; }): Promise<{ status: "pending_approval"; operationId: string; }>;
+  proposeGoldJobControl(input: { intent: KnowledgeGoldJobControlIntent; }): Promise<{ status: "pending_approval"; operationId: string; }>;
+  proposeGoldPageEdit(input: { intent: KnowledgeGoldPageEditIntent; }): Promise<{ status: "pending_approval"; operationId: string; }>;
+  proposeGoldCleanReplacement(input: { intent: KnowledgeGoldPageActionIntent; }): Promise<{ status: "pending_approval"; operationId: string; }>;
 }
-interface KnowledgeRevision { knowledgeId: string; generation: 1; sourceId: string; revisionId: string; revisionNumber: 1; baseRevisionId: string | null; document: string; contentHash: string; type: "Source"; title: string; description: string; provenance: { sourceKind: "conversation" | "user_document" | "explicit_user_input"; reference: string; capturedAt: string }; committedAt: string; }
-interface KnowledgeBase { list(options?: { cursor?: string; limit?: number }): Promise<KnowledgePage>; proposeArticle(input: { article: ActivityArticle }): Promise<KnowledgeArticleProposal>; readArticleOutcome(input: { operationId: string }): Promise<KnowledgeArticleOutcome | null>; proposeKnowledgeCreate(input: { displayName: string }): Promise<{ operationId: string; status: "pending_approval"; }>; readCreationOutcome(input: { operationId: string }): Promise<KnowledgeCreationOutcome | null>; }
 `;
-export default TYPES_CODE;
+export default D04_TYPES_CODE;
