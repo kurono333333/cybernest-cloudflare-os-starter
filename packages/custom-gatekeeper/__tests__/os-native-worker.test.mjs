@@ -909,8 +909,10 @@ const driverScript = await build({
               search: await knowledgeSessionA.search({ query: "cobalt", offset: 0, limit: 16 }),
               foreignSearch: await knowledgeSessionA.search({ query: "amber", offset: 0, limit: 16 }),
               read: await knowledgeSessionA.read({ path: "concepts/shared.md" }),
-              articles: await knowledgeSessionA.read({ path: "articles" }),
             };
+            if (input.includeNavigationPage !== false) {
+              readsA.articles = await knowledgeSessionA.read({ path: "articles" });
+            }
             let foreignPageReadError;
             try {
               await knowledgeSessionA.read({ path: "concepts/only-b.md" });
@@ -2023,7 +2025,11 @@ async function setBr01TestClock(targetMiniflare, now) {
   return now;
 }
 
-async function startBR04Scenario({ workerScripts = {}, resourcePersistencePath } = {}) {
+async function startBR04Scenario({
+  workerScripts = {},
+  resourcePersistencePath,
+  includeNavigationPage = true,
+} = {}) {
   const nativePostgres = await createDisposableRegistrationPostgres();
   let nativeMiniflare;
   let ownerSessionOpened = false;
@@ -2070,6 +2076,7 @@ async function startBR04Scenario({ workerScripts = {}, resourcePersistencePath }
       accessAssertion,
       proof: proofA.proof,
       foreignProof: proofB.proof,
+      includeNavigationPage,
     });
     assert.equal(boot.response.status, 200, JSON.stringify(boot.value));
     assert.deepEqual(boot.value.bronzeInstallB, {
@@ -4640,6 +4647,7 @@ test(
     const v1CapabilityScenario = await startBR04Scenario({
       workerScripts: br04V1WorkerScripts,
       resourcePersistencePath: "temporary",
+      includeNavigationPage: false,
     });
     try {
       const managerId = v1CapabilityScenario.identities.B.managerId;
