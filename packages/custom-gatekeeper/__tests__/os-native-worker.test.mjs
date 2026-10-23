@@ -624,6 +624,12 @@ const driverScript = await build({
       const BR03_REVISED_ARTICLE_BODY = "---\\ntype: article\\ntitle: Observation-backed procedure\\n---\\n# Observation-backed procedure\\n\\nThe shared Knowledge page now records the revised release checklist.\\n";
       const BR03_REJECTED_ARTICLE_BODY = "---\\ntype: article\\ntitle: Rejected observation proposal\\n---\\n# Rejected observation proposal\\n\\nThis body must never be stored.\\n";
 
+      function authenticatedApiFromProofResult(result, mode) {
+        if (mode === "legacy") return result;
+        if (mode === "envelope") return result.authenticatedApi;
+        throw new Error("The native test driver has an unknown OS proof result mode.");
+      }
+
       function hasVerifiedSourceFields(fields, expected) {
         const containsExpectedSource = (value) => {
           if (!value || typeof value !== "object") return false;
@@ -694,11 +700,13 @@ const driverScript = await build({
 
           let socketA;
           let bootstrapA;
+          let proofResultA;
           let authenticatedA;
           let workspaceA;
           let knowledgeSessionA;
           let socketB;
           let bootstrapB;
+          let proofResultB;
           let authenticatedB;
           let workspaceB;
           let knowledgeSessionB;
@@ -824,7 +832,8 @@ const driverScript = await build({
             socketB = responseB.webSocket;
             socketB.accept();
             bootstrapB = newWebSocketRpcSession(socketB);
-            authenticatedB = await bootstrapB.presentProof(input.foreignProof);
+            proofResultB = await bootstrapB.presentProof(input.foreignProof);
+            authenticatedB = authenticatedApiFromProofResult(proofResultB, env.TEST_OS_PROOF_RESULT_MODE);
             const whoamiB = await authenticatedB.whoami();
             const preflightBAfterProof = await env.MANAGER_KNOWLEDGE_BRIDGE.inspectManagerKnowledge(foreignManagerId);
             const installB = await env.CORE_OPERATOR.installKnowledgeGrant({
@@ -849,11 +858,12 @@ const driverScript = await build({
 
             knowledgeSessionB?.[Symbol.dispose]?.();
             workspaceB?.[Symbol.dispose]?.();
-            authenticatedB?.[Symbol.dispose]?.();
+            proofResultB?.[Symbol.dispose]?.();
             bootstrapB?.[Symbol.dispose]?.();
             socketB?.close();
             knowledgeSessionB = undefined;
             workspaceB = undefined;
+            proofResultB = undefined;
             authenticatedB = undefined;
             bootstrapB = undefined;
             socketB = undefined;
@@ -867,7 +877,8 @@ const driverScript = await build({
             socketA = responseA.webSocket;
             socketA.accept();
             bootstrapA = newWebSocketRpcSession(socketA);
-            authenticatedA = await bootstrapA.presentProof(input.proof);
+            proofResultA = await bootstrapA.presentProof(input.proof);
+            authenticatedA = authenticatedApiFromProofResult(proofResultA, env.TEST_OS_PROOF_RESULT_MODE);
             const whoamiA = await authenticatedA.whoami();
             const preflightAAfterProof = await env.MANAGER_KNOWLEDGE_BRIDGE.inspectManagerKnowledge(managerId);
 
@@ -966,12 +977,12 @@ const driverScript = await build({
           } finally {
             knowledgeSessionA?.[Symbol.dispose]?.();
             workspaceA?.[Symbol.dispose]?.();
-            authenticatedA?.[Symbol.dispose]?.();
+            proofResultA?.[Symbol.dispose]?.();
             bootstrapA?.[Symbol.dispose]?.();
             socketA?.close();
             knowledgeSessionB?.[Symbol.dispose]?.();
             workspaceB?.[Symbol.dispose]?.();
-            authenticatedB?.[Symbol.dispose]?.();
+            proofResultB?.[Symbol.dispose]?.();
             bootstrapB?.[Symbol.dispose]?.();
             socketB?.close();
           }
@@ -990,6 +1001,7 @@ const driverScript = await build({
           this.proofPresentations = 0;
           this.socket = undefined;
           this.bootstrap = undefined;
+          this.proofResult = undefined;
           this.authenticated = undefined;
           this.workspace = undefined;
           this.knowledgeGatekeeper = undefined;
@@ -1018,7 +1030,11 @@ const driverScript = await build({
               this.socket = ownerResponse.webSocket;
               this.socket.accept();
               this.bootstrap = newWebSocketRpcSession(this.socket);
-              this.authenticated = await this.bootstrap.presentProof(input.proof);
+              this.proofResult = await this.bootstrap.presentProof(input.proof);
+              this.authenticated = authenticatedApiFromProofResult(
+                this.proofResult,
+                this.env.TEST_OS_PROOF_RESULT_MODE,
+              );
               this.ownerIdentity = await this.authenticated.whoami();
               this.proofPresentations = 1;
               this.workspace = await this.authenticated.openGadget(input.workspaceId);
@@ -1436,7 +1452,7 @@ const driverScript = await build({
               this.knowledgeSession,
               this.knowledgeGatekeeper,
               this.workspace,
-              this.authenticated,
+              this.proofResult,
               this.bootstrap,
             ]) {
               try {
@@ -1458,6 +1474,7 @@ const driverScript = await build({
               this.proofPresentations = 0;
               this.socket = undefined;
               this.bootstrap = undefined;
+              this.proofResult = undefined;
               this.authenticated = undefined;
               this.workspace = undefined;
               this.knowledgeGatekeeper = undefined;
@@ -1609,6 +1626,9 @@ function createMiniflareOptions(
 ) {
   const localHyperdrive = workerHyperdriveUrl(connectionString);
   const customWorkerScript = workerScripts.custom ?? customScript;
+  const proofResultMode = workerScripts.workshop === br04V1WorkerScripts.workshop
+    ? "legacy"
+    : "envelope";
   const coreWorker = {
     ...common,
     name: "core",
@@ -1638,6 +1658,7 @@ function createMiniflareOptions(
         ...common,
         name: "driver",
         script: workerScripts.driver ?? driverScript.outputFiles[0].text,
+        bindings: { TEST_OS_PROOF_RESULT_MODE: proofResultMode },
         durableObjects: {
           BR01_OWNER_SESSION: {
             className: "BR01OwnerSession",
