@@ -272,7 +272,9 @@ async function checkAccount(
       `${where} does not match the account:\n` +
       result.problems.map((problem) => `  - ${problem}`).join("\n"));
   }
-  ctx.out.log("\nCloudflare-side checks passed: Access application, team domain and storage IDs match.");
+  ctx.out.log(config.authenticationMode === "cybernest"
+    ? "\nCloudflare-side resource checks passed."
+    : "\nCloudflare-side checks passed: Access application, team domain and storage IDs match.");
   await warnMissingSecrets(ctx, warnings, pending);
 }
 

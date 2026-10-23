@@ -1,7 +1,6 @@
 // Cloudflare-side checks `cf-os check` and `cf-os deploy` run before building: that what
-// `deployment.jsonc` names actually exists in the account. `validateConfig` can only check shape;
-// an AUD tag from a different application, or a KV ID from a different account, passes it and then
-// deploys a Workshop nobody can sign in to, or one bound to the wrong data.
+// `deployment.jsonc` names actually exists in the account. Native mode also checks its Access
+// boundary; both modes check explicitly named storage and gateways.
 //
 // Optional by design. When the client has no credentials the checks are skipped with one line rather
 // than failing, so an offline check keeps working; when it does have them, a mismatch is an error.
@@ -21,7 +20,7 @@ import {
   type CfOrganization,
   type CloudflareClient,
 } from "./client.ts";
-import type { DeploymentConfig } from "./deployment-config.ts";
+import type { AccessDeploymentConfig, DeploymentConfig } from "./deployment-config.ts";
 import type { GatekeeperCatalog } from "./gatekeepers.ts";
 
 /** The outcome: what is wrong, or why nothing was checked. */
@@ -31,20 +30,22 @@ export type AccountCheck = { skipped: string } | { problems: string[] };
  * Checks `config` against the account it names. `origin` is the deployment's public origin
  * (`publicOrigin(config)`), passed in rather than recomputed so the two can never disagree.
  *
- * Every read it needs runs at once ({@link startReads}), and the results are judged one by one in a
- * fixed order: the organization, the Access applications, then the storage. So the problems, and the
- * read a signed-out or partly permitted token stops at, are the same whichever read finishes first.
+ * Every read it needs starts before any is awaited. Native Access mode judges the organization and
+ * Access applications before storage; Cybernest skips those Access reads and still checks storage.
+ * A signed-out or partly permitted token stops at the same read whichever finishes first.
  */
 export async function verifyAccount(
   client: CloudflareClient,
   config: DeploymentConfig,
   origin: string,
 ): Promise<AccountCheck> {
-  const reads = startReads(client, config);
+  const accessConfig = config.authenticationMode === "cybernest" ? undefined : config;
+  const accessReads = accessConfig ? startAccessReads(client, accessConfig) : undefined;
+  const resourceReads = startResourceReads(client, config);
   const problems: string[] = [];
   try {
-    await checkAccess(reads, config, origin, problems);
-    await checkStorage(reads, config, problems);
+    if (accessConfig && accessReads) await checkAccess(accessReads, accessConfig, origin, problems);
+    await checkStorage(resourceReads, config, problems);
     return { problems };
   } catch (error) {
     // Signed out, or `cf` missing or broken: not the deployment's fault either way. A token that
@@ -58,9 +59,12 @@ export async function verifyAccount(
 }
 
 /** The reads {@link verifyAccount} judges, started; a storage read is absent when nothing needs it. */
-interface AccountReads {
+interface AccessReads {
   organization: Promise<CfOrganization>;
   accessApps: Promise<CfAccessApp[]>;
+}
+
+interface ResourceReads {
   kvNamespaces?: Promise<CfKvNamespace[]>;
   buckets?: Promise<string[]>;
   gateways?: Promise<CfAiGateway[]>;
@@ -88,11 +92,17 @@ function gatewayToFind(config: DeploymentConfig): string | undefined {
     : undefined;
 }
 
-/** Starts every read `config` calls for, at once, in the order they are judged. */
-function startReads(client: CloudflareClient, config: DeploymentConfig): AccountReads {
+/** Starts the Access-specific reads only for native Access-mode deployments. */
+function startAccessReads(client: CloudflareClient, config: AccessDeploymentConfig): AccessReads {
   return {
     organization: started(client.getOrganization(config.accountId)),
     accessApps: started(client.listAccessApps(config.accountId)),
+  };
+}
+
+/** Starts the named resource reads for either mode. */
+function startResourceReads(client: CloudflareClient, config: DeploymentConfig): ResourceReads {
+  return {
     // Only explicit IDs: null asks wrangler to provision, which needs nothing to exist yet.
     ...(kvPaths(config).some(([, id]) => id) ? { kvNamespaces: started(client.listKvNamespaces(config.accountId)) } : {}),
     ...(config.resources.blueprintContentBucket ? { buckets: started(client.listR2Buckets(config.accountId)) } : {}),
@@ -108,8 +118,8 @@ function started<T>(promise: Promise<T>): Promise<T> {
 
 /** Pushes onto `problems` as it goes, so a later read that is not permitted keeps what was found. */
 async function checkAccess(
-  reads: AccountReads,
-  config: DeploymentConfig,
+  reads: AccessReads,
+  config: AccessDeploymentConfig,
   origin: string,
   problems: string[],
 ): Promise<void> {
@@ -152,7 +162,7 @@ async function checkAccess(
   }
 }
 
-async function checkStorage(reads: AccountReads, config: DeploymentConfig, problems: string[]): Promise<void> {
+async function checkStorage(reads: ResourceReads, config: DeploymentConfig, problems: string[]): Promise<void> {
   if (reads.kvNamespaces) {
     const ids = new Set((await reads.kvNamespaces).map((namespace) => namespace.id));
     for (const [path, id] of kvPaths(config)) {

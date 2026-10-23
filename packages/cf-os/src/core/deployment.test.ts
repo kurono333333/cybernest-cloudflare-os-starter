@@ -19,6 +19,7 @@ import {
   type WorkerId,
 } from "./deployment.ts";
 import type {
+  AccessDeploymentConfig,
   BaseConfigs,
   DeploymentConfig,
   GeneratedConfigs,
@@ -26,7 +27,7 @@ import type {
 } from "./deployment-config.ts";
 import { testCatalog, testCatalogWithGoogle } from "../test-support.ts";
 
-const validConfig: DeploymentConfig = {
+const validConfig: AccessDeploymentConfig = {
   accountId: "0123456789abcdef0123456789abcdef",
   publicBaseUrl: null,
   workers: {
@@ -120,6 +121,12 @@ test("rejects deployment placeholders", () => {
     /placeholder/i);
 });
 
+test("rejects an unsupported authentication mode", () => {
+  assert.throws(
+    () => validateConfig(variant((c) => { c.authenticationMode = "provider-login"; })),
+    /authenticationMode/i);
+});
+
 test("rejects destructive or malformed deployment values", () => {
   const duplicateWorkers = structuredClone(validConfig);
   duplicateWorkers.workers.context.name = duplicateWorkers.workers.workshop.name;
@@ -207,6 +214,7 @@ test("generates Access-mode Workshop, Context, and custom Gatekeeper configs", a
   const vars = generated.workshop.vars!;
 
   assert.equal(generated.workshop.name, "acme-cloudflare-os-backend");
+  assert.equal(vars.CYBERNEST_PRIVATE_MANAGER_RUNTIME, "false");
   assert.deepEqual(vars.ADMINS, ["admin@example.com"]);
   assert.equal(vars.CF_ACCESS_ISS, validConfig.access.issuer);
   assert.equal(vars.CF_ACCESS_AUD, validConfig.access.audience);
@@ -273,6 +281,38 @@ test("generates Access-mode Workshop, Context, and custom Gatekeeper configs", a
   });
   assert.equal(generated.workshop.services!.some(
     (service) => service.binding === "FRONTEND_ERROR_REPORTER"), false);
+});
+
+test("generates Cybernest private mode without Access or invented proof settings", async () => {
+  const config = variant((c) => {
+    c.authenticationMode = "cybernest";
+    delete c.access;
+  });
+  assert.equal(validateConfig(config), config);
+
+  const generated = generateConfigs(config, await baseConfigs(), catalog);
+  const vars = generated.workshop.vars!;
+  assert.equal(vars.CYBERNEST_PRIVATE_MANAGER_RUNTIME, "true");
+  for (const key of ["ADMINS", "CF_ACCESS_ISS", "CF_ACCESS_AUD"]) {
+    assert.equal(vars[key], undefined, `Cybernest must not emit ${key}`);
+  }
+  for (const key of [
+    "CYBERNEST_OS_PROOF_PUBLIC_JWK",
+    "CYBERNEST_OS_PROOF_ISSUER",
+    "CYBERNEST_OS_PROOF_AUDIENCE",
+    "CYBERNEST_OS_PROOF_ENVIRONMENT",
+    "CYBERNEST_OS_PROOF_DEPLOYMENT",
+    "CYBERNEST_OS_ALLOWED_ORIGINS",
+  ]) {
+    assert.equal(vars[key], undefined, `proof configuration owner must supply ${key}`);
+  }
+
+  const frontend = buildCommands(config, catalog).flat()
+    .find(({ args }) => args.includes("@gadgets/workshop-frontend"));
+  assert.deepEqual(frontend?.env, {
+    VITE_CYBERNEST_MODE: "true",
+    VITE_CF_ACCESS_MODE: "false",
+  });
 });
 
 test("gives the router the public route, the frontend, and every service binding", async () => {
@@ -669,7 +709,10 @@ test("rebuilds the Context configurator app rather than replaying it", () => {
 
 test("passes VITE_CF_ACCESS_MODE explicitly rather than inheriting it", () => {
   const withAccessMode = buildCommands(validConfig, catalog).flat().filter(({ env }) => env);
-  assert.deepEqual(withAccessMode.map(({ env }) => env), [{ VITE_CF_ACCESS_MODE: "true" }]);
+  assert.deepEqual(withAccessMode.map(({ env }) => env), [{
+    VITE_CYBERNEST_MODE: "false",
+    VITE_CF_ACCESS_MODE: "true",
+  }]);
   // It has to reach the frontend, which inlines it into the bundle, and nothing else.
   assert.match(withAccessMode[0].args.join(" "), /@gadgets\/workshop-frontend/);
 });

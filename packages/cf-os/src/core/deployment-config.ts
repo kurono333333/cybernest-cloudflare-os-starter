@@ -96,7 +96,7 @@ export interface DeploymentObservabilityConfig {
  * every field is still checked at runtime by `validateConfig` -- the type is what makes the
  * generation code readable, not a guarantee about what is on disk.
  */
-export interface DeploymentConfig {
+export interface DeploymentConfigBase {
   /** Cloudflare account owning every Worker and provisioned resource. 32 hex characters. */
   accountId: string;
   /**
@@ -129,7 +129,6 @@ export interface DeploymentConfig {
    * reads from the submodule, and `validateGatekeepers` checks the entries against it.
    */
   gatekeepers?: Record<string, GatekeeperEntry>;
-  access: AccessConfig;
   aiGateway: AiGatewayConfigInput;
   context: ContextConfig;
   /**
@@ -147,6 +146,22 @@ export interface DeploymentConfig {
   };
   observability: DeploymentObservabilityConfig;
 }
+
+/** Native deployments use Cloudflare Access when the mode is omitted. */
+export type AccessDeploymentConfig = DeploymentConfigBase & {
+  authenticationMode?: "cloudflare-access";
+  access: AccessConfig;
+};
+
+/** Cybernest owns its private connection proof outside the Workshop Access configuration. */
+export type CybernestDeploymentConfig = DeploymentConfigBase & {
+  authenticationMode: "cybernest";
+  /** Legacy values may remain in a hand-edited file but are not consumed in this mode. */
+  access?: AccessConfig;
+};
+
+export type AuthenticationMode = "cloudflare-access" | "cybernest";
+export type DeploymentConfig = AccessDeploymentConfig | CybernestDeploymentConfig;
 
 /** One optional Gatekeeper in `deployment.jsonc`'s `gatekeepers` block. */
 export interface GatekeeperEntry {

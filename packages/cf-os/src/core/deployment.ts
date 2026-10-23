@@ -109,9 +109,6 @@ const requiredPaths = [
   "workers.context.name",
   "workers.scheduler.name",
   "workers.websearch.name",
-  "access.issuer",
-  "access.audience",
-  "access.admins",
   "aiGateway.enabled",
   "errorReporting.enabled",
   "observability.enabled",
@@ -120,6 +117,8 @@ const requiredPaths = [
   "observability.traces.enabled",
   "observability.traces.headSamplingRate",
 ];
+
+const accessPaths = ["access.issuer", "access.audience", "access.admins"];
 
 // `aiGateway.accountId` is deliberately absent: null is its normal value, meaning "the gateway
 // lives in the deployment's own account".
@@ -248,9 +247,15 @@ export class PlaceholderError extends Error {}
  * path it concerns. A file that still holds template placeholders throws {@link PlaceholderError}.
  */
 export function validateConfig(config: DeploymentConfig): DeploymentConfig {
+  const mode: unknown = Reflect.get(config, "authenticationMode");
+  if (mode !== undefined && mode !== "cloudflare-access" && mode !== "cybernest") {
+    throw new Error('authenticationMode must be "cloudflare-access" or "cybernest".');
+  }
+  const usesAccess = mode !== "cybernest";
   const customGatekeeper = customGatekeeperEnabled(config);
   const activePaths = [
     ...requiredPaths,
+    ...(usesAccess ? accessPaths : []),
     ...(customGatekeeper ? customGatekeeperPaths : []),
     ...(config.aiGateway?.enabled ? aiGatewayPaths : []),
     ...(config.errorReporting?.enabled ? errorReportingPaths : []),
@@ -355,18 +360,20 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
       "deployment's public origin, which is what the hosted deploy does.");
   }
 
-  const issuer = new URL(config.access.issuer);
-  if (issuer.protocol !== "https:" ||
-      issuer.origin !== config.access.issuer.replace(/\/$/, "")) {
-    throw new Error("Cloudflare Access issuer must be an HTTPS origin only.");
-  }
-  if (!config.access.audience.trim() || config.access.audience !== config.access.audience.trim()) {
-    throw new Error("Cloudflare Access audience must not be blank or padded with whitespace.");
-  }
-  if (!Array.isArray(config.access.admins) ||
-      !config.access.admins.every((email) =>
-        typeof email === "string" && /^[^@\s]+@[^@\s]+$/.test(email))) {
-    throw new Error("Every Access administrator must be an email address.");
+  if (config.authenticationMode !== "cybernest") {
+    const issuer = new URL(config.access.issuer);
+    if (issuer.protocol !== "https:" ||
+        issuer.origin !== config.access.issuer.replace(/\/$/, "")) {
+      throw new Error("Cloudflare Access issuer must be an HTTPS origin only.");
+    }
+    if (!config.access.audience.trim() || config.access.audience !== config.access.audience.trim()) {
+      throw new Error("Cloudflare Access audience must not be blank or padded with whitespace.");
+    }
+    if (!Array.isArray(config.access.admins) ||
+        !config.access.admins.every((email) =>
+          typeof email === "string" && /^[^@\s]+@[^@\s]+$/.test(email))) {
+      throw new Error("Every Access administrator must be an email address.");
+    }
   }
 
   validateAiGateway(config);
@@ -599,9 +606,8 @@ function setCommon(
   config.workers_dev = route.workersDev;
   delete config.routes;
   if (route.customDomain) Object.assign(config, routeConfig(route));
-  // The router is the Access-protected origin, and a preview URL is an unauthenticated path around
-  // it. Off on every Worker: those behind the router have no business being publicly reachable
-  // either.
+  // A Preview URL is a separate public ingress outside the deployment's selected trust boundary.
+  // Off on every Worker: those behind the router have no business being publicly reachable either.
   config.preview_urls = false;
   config.observability = {
     ...config.observability,
@@ -659,10 +665,16 @@ export function generateConfigs(
   ];
 
   setCommon(workshop, config, config.workers.workshop.name);
+  const workshopModeVars = config.authenticationMode === "cybernest"
+    ? { CYBERNEST_PRIVATE_MANAGER_RUNTIME: "true" }
+    : {
+      ADMINS: config.access.admins,
+      CF_ACCESS_ISS: config.access.issuer.replace(/\/$/, ""),
+      CF_ACCESS_AUD: config.access.audience,
+      CYBERNEST_PRIVATE_MANAGER_RUNTIME: "false",
+    };
   workshop.vars = {
-    ADMINS: config.access.admins,
-    CF_ACCESS_ISS: config.access.issuer.replace(/\/$/, ""),
-    CF_ACCESS_AUD: config.access.audience,
+    ...workshopModeVars,
     // Upstream builds OAuth redirect URIs and other absolute links from this. The backend has no
     // public route of its own, so the router's origin is the only correct value.
     PUBLIC_BASE_URL: origin,
@@ -873,9 +885,12 @@ export function buildCommands(config: DeploymentConfig, catalog: GatekeeperCatal
     // `--no-cache` reaches that dependency too -- measured: both run with "cache disabled". Their
     // wrangler `build.command` then runs capnweb-validate at deploy time, as Web Search's does.
     ...gatekeeperSlugs(config).map((slug) => [{ args: submoduleBuild(offeredGatekeeper(catalog, slug).packageName) }]),
-    // Access mode is a build-time constant in the frontend bundle (`src/useAuth.ts`), so it is set
-    // here rather than inherited: a bundle built under a different value is wrong, not just stale.
-    [{ args: submoduleBuild("@gadgets/workshop-frontend"), env: { VITE_CF_ACCESS_MODE: "true" } }],
+    // Authentication mode is a build-time constant in the frontend bundle, so set both flags here
+    // rather than inheriting ambient values: a bundle built under another mode is wrong, not stale.
+    [{ args: submoduleBuild("@gadgets/workshop-frontend"), env: {
+      VITE_CYBERNEST_MODE: config.authenticationMode === "cybernest" ? "true" : "false",
+      VITE_CF_ACCESS_MODE: config.authenticationMode === "cybernest" ? "false" : "true",
+    } }],
     [{ args: submoduleBuild("@gadgets/router") }],
     [{ args: submoduleBuild("@gadgets/workshop-backend") }],
   ];

@@ -112,15 +112,22 @@ const FILLED = TEMPLATE
   .replace("<ORGANIZATION_DISPLAY_NAME>", "Acme")
   .replace("<ORGANIZATION_GUIDANCE>", "Be kind.");
 
-test("refuses an --account other than the file's, before reading the account or building", async (t) => {
+const CYBERNEST_FILLED = FILLED.replace(
+  '  "accountId":',
+  '  "authenticationMode": "cybernest",\n  "accountId":',
+);
+
+test("refuses an --account other than the file's in either mode, before reading or building", async (t) => {
   const root = installedProject(t);
-  writeFileSync(join(root, "deployment.jsonc"), FILLED);
   const cf = fakeCf({});
   const other = "fedcba9876543210fedcba9876543210";
-  for (const command of ["check", "deploy"]) {
-    const harness = testContext({ root, client: cfClient({ spawn: cf.spawn }), flags: { account: other } });
-    await assert.rejects(run({ command, values: {}, positionals: [] }, harness.ctx),
-      new RegExp(`--account ${other} is not deployment\\.jsonc's accountId \\(${FAKE_ACCOUNT}\\)`));
+  for (const [manifest, mode] of [[FILLED, "native"], [CYBERNEST_FILLED, "Cybernest"]]) {
+    writeFileSync(join(root, "deployment.jsonc"), manifest);
+    for (const command of ["check", "deploy"]) {
+      const harness = testContext({ root, client: cfClient({ spawn: cf.spawn }), flags: { account: other } });
+      await assert.rejects(run({ command, values: {}, positionals: [] }, harness.ctx),
+        new RegExp(`--account ${other} is not deployment\\.jsonc's accountId \\(${FAKE_ACCOUNT}\\)`), mode);
+    }
   }
   assert.deepEqual(cf.calls, []);
   // The same account, in another case, is the file's.

@@ -4,7 +4,7 @@ import { cfClient } from "../cf-client.ts";
 import { fakeCf, workerSecretsReply, type FakeReply } from "../fake-cf.ts";
 import { reversing, testCatalog, testCatalogWithGitlab } from "../test-support.ts";
 import { CfAuthError, CfUnavailableError, type CloudflareClient } from "./client.ts";
-import type { DeploymentConfig } from "./deployment-config.ts";
+import type { CybernestDeploymentConfig, DeploymentConfig } from "./deployment-config.ts";
 import type { GatekeeperCatalog } from "./gatekeepers.ts";
 import { memoryClient, type MemoryAccount } from "./memory-client.ts";
 import { gatekeeperSecretWarnings, startBounded, verifyAccount } from "./verify-account.ts";
@@ -42,6 +42,20 @@ async function problems(account: MemoryAccount, deployment = config, at = origin
 
 test("passes an account that has everything the config names", async () => {
   assert.deepEqual(await problems(matchingAccount()), []);
+});
+
+test("skips Access reads in Cybernest mode while checking named account resources", async () => {
+  const { access, ...baseConfig } = config;
+  void access;
+  const cybernest: CybernestDeploymentConfig = { ...baseConfig, authenticationMode: "cybernest" };
+  const client = memoryClient({
+    kvNamespaces: [{ id: "kv-context", title: "c" }, { id: "kv-blueprints", title: "b" }],
+    buckets: ["acme-content"],
+    gateways: [{ id: "acme-ai" }],
+  });
+
+  assert.deepEqual(await verifyAccount(client, cybernest as DeploymentConfig, origin), { problems: [] });
+  assert.deepEqual([...client.calls].sort(), ["listAiGateways", "listKvNamespaces", "listR2Buckets"]);
 });
 
 test("rejects an audience no application in the account has, and names cf-os access", async () => {

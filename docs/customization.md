@@ -32,7 +32,8 @@ The custom logo appears in the app chrome, sign-in screens, and browser tab on e
 | `workers.*.name` | Stable Worker service identities | Unique lowercase names; changing one creates a differently named Worker |
 | `workers.router.route` | The deployment's public address | `customDomain` for production or `workersDev: true` for evaluation |
 | `gatekeepers` | Optional upstream Gatekeepers, one Worker each | Slugs from upstream's catalog, each with a Worker name and optional vars; see [Optional Gatekeepers](#optional-gatekeepers) |
-| `access` | Cloudflare Access trust and administrator list | Access team issuer, application audience, and verified email list |
+| `authenticationMode` | Workshop authentication boundary | Omit for the native Cloudflare Access deployment; `cybernest` selects the private Manager runtime |
+| `access` | Native Cloudflare Access trust and administrator list | Required in the default mode; team issuer, application audience, and verified email list |
 | `aiGateway` | Deployment-managed model catalog | Enabled by default over the Workers AI binding; which providers to advertise, and which gateway |
 | `context` | Context sharing boundary, snapshot KV, and optional Artifacts repositories | `null` to scope data to the public origin, or a pinned stable label; automatic or existing KV; Git-backed collections disabled or enabled |
 | `customGatekeeper` | Whether the example integration deploys, and its identity and guidance | `enabled: false` to deploy none; organization-specific display text |
@@ -60,7 +61,7 @@ Context, Scheduler and Web Search are *ambient*: upstream's release marks all th
 
 Web Search does need the account to pay for searches, which the free Workers AI allowance does not cover: chats can work while every search fails. Before enabling it, either load [AI Gateway credits](https://developers.cloudflare.com/web-search/how-to-use/#prerequisites) on the account or store a Ceramic API key on the gateway it searches through, under the alias `default`, since upstream pins Ceramic as the provider and AI Gateway uses no other alias for it. With credits, each search spends them, and there is no per-user limit. With a key, Ceramic bills you instead, and a search no longer falls back to credits: a revoked or empty key fails every search. On a public server, set Web Search to disabled in `/admin` unless that is acceptable: in the default mode, optional, onboarding offers it switched on. See upstream's [Web Search guide](https://github.com/cloudflare/cloudflare-os/blob/main/packages/gatekeeper-websearch/README.md#deployment).
 
-Only the router takes a route; every other Worker is reachable only over service bindings, and the deploy turns off `workers.dev` and [Preview URLs](https://developers.cloudflare.com/workers/configuration/previews/) on all of them. That keeps the router the single Access-protected way in.
+Only the router takes a route; every other Worker is reachable only over service bindings, and the deploy turns off `workers.dev` and [Preview URLs](https://developers.cloudflare.com/workers/configuration/previews/) on all of them. Native mode protects that public origin with Access; Cybernest uses the separate Core proof and private Manager boundary described under [Sign-in methods](#sign-in-methods).
 
 For production, set a [Custom Domain](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/) on it:
 
@@ -121,7 +122,7 @@ Access mode is the default here because unauthenticated requests never reach app
 
 To run another method, drop those two variables and the build flag, then set upstream's `AUTH_GATEKEEPERS` allowlist for provider sign-in. `DISABLE_PASSWORD_AUTH=true` makes a deployment provider-only. Upstream ignores it unless at least one auth Gatekeeper is allowlisted, so a deployment cannot lock everyone out. The wrapper's validation assumes Access mode, so review the upstream Workshop backend and frontend documentation before changing it.
 
-The `admins` list gates `/admin` in every method.
+In the native Access deployment, `access.admins` is the Workshop's `/admin` allowlist. Cybernest's private Manager runtime has a separate trust boundary: Core-issued proof and ownership checks remain authoritative, and the Starter does not copy Access settings or this admin allowlist into that mode. It sets the private-runtime switch but does not derive proof values; missing proof configuration keeps the private `/api` connection at 503. The Core service binding, route, and proof configuration remain deployment-owner gates, so selecting Cybernest mode alone does not make this manifest deploy-ready.
 
 #### Cloudflare Access
 
