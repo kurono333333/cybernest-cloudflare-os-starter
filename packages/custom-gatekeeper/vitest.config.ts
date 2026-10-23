@@ -1,4 +1,4 @@
-import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
+import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import capnwebValidate from "capnweb-validate/vite";
 import { configDefaults, defineConfig } from "vitest/config";
 
@@ -8,7 +8,7 @@ export default defineConfig({
     cloudflareTest({
       main: "./__tests__/worker.ts",
       miniflare: {
-        compatibilityDate: "2026-08-04",
+        compatibilityDate: "2026-09-04",
         compatibilityFlags: ["allow_irrevocable_stub_storage", "nodejs_compat"],
         durableObjects: {
           KNOWLEDGE_ACCOUNT_ACCESS: { className: "KnowledgeAccountAccess", useSQLite: true },
@@ -24,6 +24,10 @@ export default defineConfig({
   ],
   test: {
     include: ["__tests__/*.test.ts"],
-    exclude: [...configDefaults.exclude, "__tests__/native-approval.test.ts"],
+    exclude: [
+      ...configDefaults.exclude,
+      "__tests__/native-approval.test.ts",
+      "__tests__/**/*.native.test.ts",
+    ],
   },
 });

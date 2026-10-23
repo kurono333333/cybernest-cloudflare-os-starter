@@ -1,10 +1,10 @@
 # Customizing Cloudflare OS
 
-This guide separates the supported private Cybernest wrapper controls from the Admin UI and sign-in controls owned by standalone upstream Cloudflare OS.
+This wrapper exposes controls at three depths. Start in the Admin UI, move to deployment configuration when the trust or infrastructure boundary changes, and write code only for capabilities that neither layer can express.
 
-> **Cybernest mode:** the deployment in this repository uses Core/Auth0 for sign-in, keeps Workshop private, and serves the Japanese Console at `/workspace`. The `/admin` branding and OS-native sign-in sections below describe standalone upstream Cloudflare OS; they are not the active Cybernest browser path.
+This Cybernest checkout retains its private Knowledge Gatekeeper in `packages/custom-gatekeeper`. Its current `deployment.jsonc` is intentionally preserved, but does not contain the router and Access fields required by this Starter. `pnpm cf-os check` therefore stops at local validation, before reading the Cloudflare account; this migration worktree is not ready to deploy.
 
-## Standalone upstream Admin UI
+## Admin UI
 
 Use `/admin` for runtime policy that should not require a deployment:
 
@@ -28,11 +28,14 @@ The custom logo appears in the app chrome, sign-in screens, and browser tab on e
 | Path | Controls | Choices |
 | --- | --- | --- |
 | `accountId` | Resource ownership | A 32-character [Cloudflare account ID](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/) |
+| `publicBaseUrl` | The deployment's public origin | `null` to derive it from the router's custom domain; on a `workers.dev` route, the router's own `https://<router-name>.<subdomain>.workers.dev` |
 | `workers.*.name` | Stable Worker service identities | Unique lowercase names; changing one creates a differently named Worker |
-| `workers.workshop.route` | Workshop exposure | `null` for the supported private Cybernest runtime |
-| `aiGateway` | Deployment-funded model catalog | Disabled, Workers AI direct, or provider traffic through AI Gateway |
-| `context` | Context sharing boundary and snapshot KV | A stable domain label; automatic or existing KV |
-| `customGatekeeper` | Example integration identity and guidance | Organization-specific display text |
+| `workers.router.route` | The deployment's public address | `customDomain` for production or `workersDev: true` for evaluation |
+| `gatekeepers` | Optional upstream Gatekeepers, one Worker each | Slugs from upstream's catalog, each with a Worker name and optional vars; see [Optional Gatekeepers](#optional-gatekeepers) |
+| `access` | Cloudflare Access trust and administrator list | Access team issuer, application audience, and verified email list |
+| `aiGateway` | Deployment-managed model catalog | Enabled by default over the Workers AI binding; which providers to advertise, and which gateway |
+| `context` | Context sharing boundary, snapshot KV, and optional Artifacts repositories | `null` to scope data to the public origin, or a pinned stable label; automatic or existing KV; Git-backed collections disabled or enabled |
+| `customGatekeeper` | Whether the example integration deploys, and its identity and guidance | `enabled: false` to deploy none; organization-specific display text |
 | `errorReporting` | Private explicit-issue destination | Console Reporter enabled state, environment, and release metadata |
 | `resources` | Blueprint/avatar KV and blueprint-content R2 | `null` to provision or explicit IDs/names to reuse |
 | `observability` | Worker telemetry | Structured logs, invocation logs, traces, and sampling; see the [observability guide](observability.md) |
@@ -41,32 +44,104 @@ Secrets are never valid values in this file. Install them interactively with Wra
 
 ### Workers and routing
 
-Keep the active Worker names unique. The Workshop runtime remains private; the existing Console owns `/workspace` and its nested SPA routes as same-origin static assets. Service bindings use the runtime Worker names, so update the pinned Workshop runtime and Console separately.
+The deployment is up to seven Workers of its own, plus one per [optional Gatekeeper](#optional-gatekeepers). Keep their names unique: service bindings use these names, so update and deploy them together.
 
-The Console has no direct native OS binding. It calls the Core gateway, which remains the only browser entry to `/manager/os` and the only place that can authorize the restricted Workspace API projection.
+| Worker | Role |
+| --- | --- |
+| `router` | Owns the public route and serves the frontend. Proxies `/api` and `/blueprint-screenshot` to the Workshop, and `/gatekeeper/<name>` to the Gatekeeper whose service binding matches. |
+| `workshop` | The Cloudflare OS backend, holding all user data in Durable Objects. |
+| `context` | The Context Gatekeeper. |
+| `scheduler` | The Scheduler Gatekeeper, which gives agents scheduled and recurring work. |
+| `websearch` | The Web Search Gatekeeper, which lets agents search the public web. |
+| `customGatekeeper` | This repository's example integration. Not deployed when `customGatekeeper.enabled` is `false`. |
+| `errorReporter` | The private explicit-issue destination. |
 
-Keep `workers.workshop.route` as `null` for Cybernest. Publishing Workshop on a Custom Domain or `workers.dev` creates a different browser and identity boundary and is not enabled by changing this value alone.
+Context, Scheduler and Web Search are *ambient*: upstream's release marks all three `PREINSTALL`, so the hosted flow installs them on every instance and this starter deploys them for the same reason. None takes configuration beyond its name. Web Search runs on its own Workers AI binding and searches through the Workshop's gateway, `aiGateway.name`, so its searches share that gateway's provider keys, limits and logs: the deploy sets it as the Worker's `CF_AI_GATEWAY`, as upstream's deploy service does. With `aiGateway.enabled: false`, or a gateway in another account, which the binding cannot reach, it searches through the account's `default` gateway instead, which Cloudflare creates on first use.
+
+Web Search does need the account to pay for searches, which the free Workers AI allowance does not cover: chats can work while every search fails. Before enabling it, either load [AI Gateway credits](https://developers.cloudflare.com/web-search/how-to-use/#prerequisites) on the account or store a Ceramic API key on the gateway it searches through, under the alias `default`, since upstream pins Ceramic as the provider and AI Gateway uses no other alias for it. With credits, each search spends them, and there is no per-user limit. With a key, Ceramic bills you instead, and a search no longer falls back to credits: a revoked or empty key fails every search. On a public server, set Web Search to disabled in `/admin` unless that is acceptable: in the default mode, optional, onboarding offers it switched on. See upstream's [Web Search guide](https://github.com/cloudflare/cloudflare-os/blob/main/packages/gatekeeper-websearch/README.md#deployment).
+
+Only the router takes a route; every other Worker is reachable only over service bindings, and the deploy turns off `workers.dev` and [Preview URLs](https://developers.cloudflare.com/workers/configuration/previews/) on all of them. That keeps the router the single Access-protected way in.
+
+For production, set a [Custom Domain](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/) on it:
+
+```jsonc
+"workers": { "router": { "name": "acme-os", "route": { "customDomain": "os.example.com" } } }
+```
+
+The hostname must belong to an active Cloudflare zone and cannot conflict with an existing CNAME. Wrangler creates the DNS record and certificate, and `publicBaseUrl` can stay `null` — the deploy derives the public origin from the domain. For evaluation, use the account's [`workers.dev`](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/) subdomain instead:
+
+```jsonc
+"publicBaseUrl": "https://acme-os.<subdomain>.workers.dev",
+"workers": { "router": { "name": "acme-os", "route": { "workersDev": true } } }
+```
+
+`publicBaseUrl` is required there, because nothing in `deployment.jsonc` knows your account's `workers.dev` subdomain. If using workers.dev that value must be `https://<router-name>.<subdomain>.workers.dev`. Two things read the origin — `PUBLIC_BASE_URL`, which upstream builds absolute links and OAuth redirect URIs from, and the Context sharing boundary under [Storage](#storage) — so a typo here would deploy successfully and then hide existing Context data and break every redirect.
+
+On a custom domain the hostname is yours and has nothing to do with any Worker name, so `pnpm cf-os check` compares `publicBaseUrl` against `customDomain` instead: leave it `null` and the deploy derives the origin from the domain, or set it to exactly `https://<customDomain>`.
+
+### Optional Gatekeepers
+
+Upstream ships more Gatekeepers than the ones this starter always deploys: GitHub, Google, Slack and others. `pnpm cf-os init` offers the ones the hosted deploy offers, each package once, from a catalog built from the pinned submodule; one the starter cannot deploy from a name alone (Email, or any with KV, R2, service or Artifacts bindings) is never offered, and selecting it fails `pnpm cf-os check` with the reason.
+
+Each one is an entry under `gatekeepers`, keyed by its slug:
+
+```jsonc
+"gatekeepers": {
+  "github": { "name": "acme-os-gk-github" },
+  "mcpportal": {
+    "name": "acme-os-gk-mcpportal",
+    "vars": { "MCP_PORTAL_URL": "https://portal.example.com/mcp" }
+  }
+}
+```
+
+- **The slug** is the hosted install slug (`gatekeeper-mcp-portal` is `mcpportal`). It names the `GATEKEEPER_<SLUG>` binding and the `/gatekeeper/<slug>` route.
+- **`name`** is its Worker's name, a permanent service identity like those under `workers`. `init` suggests `<router name>-gk-<slug>`, as the hosted flow names it.
+- **`vars`** are plain-text vars, merged over the package's own and replacing any set on the Worker another way; the deploy sets `BASE_URL`. One with a Workers AI binding of its own, such as Google's for reading Drive PDFs, also gets `CF_AI_GATEWAY`, set to `aiGateway.name` as for Web Search, unless `aiGateway.enabled` is `false` or the gateway is in another account; without it, those calls go through no gateway. The MCP portal needs `MCP_PORTAL_URL`: `init` asks for it, and `check` warns while it is unset.
+- **Secrets go to the Worker, never into this file.** Register `<public origin>/gatekeeper/<slug>/oauth` as the redirect URI of an OAuth app with the provider, then run `pnpm cf-os secrets <slug>`; `init` offers this when you deploy. By hand, after the first deploy:
+
+  ```sh
+  CLOUDFLARE_ACCOUNT_ID=your-account-id pnpm exec wrangler secret put CLIENT_ID --name acme-os-gk-github
+  ```
+
+  `check` warns while one is missing.
+- **Removing an entry unbinds it.** The next deploy drops its two bindings, so the Workshop stops offering it and users' connections to it disappear. Its Worker, and the Durable Objects holding its state, keep running unbound: the CLI never deletes a Worker. To delete it, `CLOUDFLARE_ACCOUNT_ID=your-account-id pnpm exec wrangler delete --name <its Worker name>`.
 
 ### Sign-in methods
 
-Upstream Cloudflare OS supports three native sign-in methods. This Cybernest deployment does not expose any of them: Core/Auth0 owns the browser entry and passes only an ownership-approved Manager to the private Workshop runtime.
+Cloudflare OS supports three ways to sign users in. This starter deploys Cloudflare Access.
 
-| Method | How it works | In this Cybernest release |
+| Method | How it works | In this starter |
 | --- | --- | --- |
-| Cloudflare Access | Access verifies identity before the request reaches the Worker, and the Workshop trusts the signed Access JWT. The password login and signup pages are disabled. | Not supported; standalone upstream mode only |
-| Built-in password accounts | Cloudflare OS serves its own username and password login plus signup. This is the upstream default. | Not supported; standalone upstream mode only |
-| Auth Gatekeepers | Gatekeepers that advertise `providesAuth` add "Continue with ..." buttons, alongside or instead of password login. | Not supported; standalone upstream mode only |
+| Cloudflare Access | Access verifies identity before the request reaches the Worker, and the Workshop trusts the signed Access JWT. The password login and signup pages are disabled. | Deployed by default |
+| Built-in password accounts | Cloudflare OS serves its own username and password login plus signup. This is the upstream default. | Requires deploy script changes |
+| Auth Gatekeepers | Gatekeepers that advertise `providesAuth` add "Continue with ..." buttons, alongside or instead of password login. | Requires deploy script changes |
 
-The private Workshop runtime is reached by Cybernest Core through a Service Binding. The Console is built and deployed separately from the pinned OS runtime and does not render OS login or signup pages.
+Access mode is the default here because unauthenticated requests never reach application code. `packages/cf-os/src/core/deployment.ts` implements it by setting `CF_ACCESS_ISS` and `CF_ACCESS_AUD` on the Workshop and building the frontend with `VITE_CF_ACCESS_MODE=true`.
 
-To use an OS-native sign-in method, treat it as a separate standalone release mode and follow the upstream Workshop backend and frontend documentation. Removing build variables or publishing the private Worker route alone does not produce a supported deployment.
+To run another method, drop those two variables and the build flag, then set upstream's `AUTH_GATEKEEPERS` allowlist for provider sign-in. `DISABLE_PASSWORD_AUTH=true` makes a deployment provider-only. Upstream ignores it unless at least one auth Gatekeeper is allowlisted, so a deployment cannot lock everyone out. The wrapper's validation assumes Access mode, so review the upstream Workshop backend and frontend documentation before changing it.
+
+The `admins` list gates `/admin` in every method.
+
+#### Cloudflare Access
+
+Create a [self-hosted Access application](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/) covering the router's hostname. Then configure:
+
+- `issuer`: the team origin, such as `https://acme.cloudflareaccess.com`, with no path.
+- `audience`: the application's [AUD tag](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/validating-json/#get-your-aud-tag).
+- `admins`: Access-verified email addresses allowed into `/admin`.
+
+Access policies decide who can sign in. The `admins` list decides which signed-in identities can change runtime policy. Keep both narrow.
 
 ### Storage
 
 Wrangler supports [automatic provisioning](https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning) for KV and R2. Leave these values as `null` for a new deployment:
 
 ```jsonc
-"context": { "sharingDomain": "production", "kvNamespaceId": null },
+"context": {
+  "sharingDomain": null,
+  "kvNamespaceId": null
+},
 "resources": {
   "blueprintsKvNamespaceId": null,
   "avatarsKvNamespaceId": null,
@@ -76,38 +151,69 @@ Wrangler supports [automatic provisioning](https://developers.cloudflare.com/wor
 
 Wrangler creates resources with the Worker name as a prefix and reconnects them on future deploys. To adopt existing data, replace the relevant `null` with a [KV namespace ID](https://developers.cloudflare.com/kv/reference/kv-commands/#kv-namespace) or [R2 bucket name](https://developers.cloudflare.com/r2/reference/wrangler-commands/#r2-bucket).
 
+`context.sharingDomain` is not storage but a data-isolation boundary: Context collections are visible only within it. `null` scopes them to the deployment's public origin, which is what the hosted deploy does. Changing the boundary hides existing collections even with the right KV bound, so pin it to a literal string when a hostname change must not move it:
+
+```jsonc
+"context": { "sharingDomain": "https://os.example.com" }
+```
+
+### Context Artifacts
+
+The Context Gatekeeper can use [Artifacts](https://developers.cloudflare.com/artifacts/) as Git-compatible storage for Context collections. This is disabled when `enabled` is omitted or false and requires Artifacts access on the deployment account. Enable it without specifying a namespace to use `gatekeeper-context-collections`:
+
+```jsonc
+"artifacts": { "enabled": true }
+```
+
+To isolate repositories under another stable namespace, add the optional property:
+
+```jsonc
+"artifacts": {
+  "enabled": true,
+  "namespace": "acme-context-collections"
+}
+```
+
+Artifacts creates the namespace implicitly when the first repository is created. Keep the selected namespace stable: existing Git-backed collections refer to repositories in it. Disabling the binding later stops repository refresh and token management but does not delete repositories; the last synchronized Context content remains readable. Write tokens grant repository mutation authority, so protect them like other credentials and revoke them when no longer needed.
+
 ### AI models
 
-AI is optional for deployment. The Workers AI binding remains available to Cloudflare OS platform features, but the current upstream model transport uses HTTPS. A deployment-funded model catalog therefore requires `CF_AI_GATEWAY_API_TOKEN` even for Workers AI.
-
-| Mode | Configuration | Result |
-| --- | --- | --- |
-| No platform model | `aiGateway.enabled: false` | Deploys without an AI secret; no funded model catalog is advertised |
-| Workers AI direct | Enable AI, include only `cloudflare`, set `workersAi.mode: "direct"` | Calls the Workers AI REST endpoint without Gateway model logs |
-| Workers AI through Gateway | Enable AI, include `cloudflare`, set `workersAi.mode: "gateway"` | Adds [AI Gateway observability](https://developers.cloudflare.com/ai-gateway/observability/) |
-| External providers | Add `anthropic`, `openai`, or `google` | Exposes supported models through [AI Gateway](https://developers.cloudflare.com/ai-gateway/) and its billing/key configuration |
-
-To fund Workers AI directly:
+Every provider, Workers AI included, is reached through [AI Gateway](https://developers.cloudflare.com/ai-gateway/). The transport is the Workshop's `WORKERS_AI` binding, which is pre-authenticated inside your own account — so the default configuration needs **no API token at all**:
 
 ```jsonc
 "aiGateway": {
   "enabled": true,
   "name": "default",
-  "accountId": "<CLOUDFLARE_ACCOUNT_ID>",
-  "providers": ["cloudflare"],
-  "workersAi": { "mode": "direct" }
+  "accountId": null,
+  "providers": ["cloudflare"]
 }
 ```
 
-To route it through AI Gateway, change `mode` to `gateway` and add the gateway name. Cloudflare can [create the `default` gateway on first use](https://developers.cloudflare.com/changelog/post/2026-03-02-default-gateway/). Add external providers only after selecting [Unified Billing or BYOK](https://developers.cloudflare.com/ai-gateway/get-started/#provider-authentication).
+Cloudflare can [create the `default` gateway on first use](https://developers.cloudflare.com/changelog/post/2026-03-02-default-gateway/). `accountId: null` means the gateway lives in the deployment's own account, which is what makes the binding transport usable.
 
-Create a narrowly scoped [API token](https://dash.cloudflare.com/profile/api-tokens) following the current [AI Gateway authentication guidance](https://developers.cloudflare.com/ai-gateway/configuration/authentication/), then install it without putting the value on the command line. When AI is enabled, the generated Wrangler config [declares this secret as required](https://developers.cloudflare.com/workers/configuration/secrets/#validate-secrets-before-deploy), so deployment fails clearly if it is missing.
+The binding stays bound whatever you configure here: as well as carrying gateway traffic, it is what the agent's `webFetch` tool runs document-to-Markdown conversion on.
+
+| Configuration | Result |
+| --- | --- |
+| `enabled: true`, `providers: ["cloudflare"]` | Workers AI models over the binding. No token, no keys of your own. The default. |
+| Add `anthropic` or `openai` | Their models appear too. Keys live on the gateway ([Unified Billing or BYOK](https://developers.cloudflare.com/ai-gateway/get-started/#provider-authentication)), not in this repository. Still no token. |
+| Add `google` | Needs `CF_AI_GATEWAY_API_TOKEN`. pi's Google adapter refuses a custom fetch, so Google inference cannot ride the binding. |
+| `accountId` set to another account | Needs `CF_AI_GATEWAY_API_TOKEN`. The binding only reaches gateways in the Worker's own account, so the generated config sets `CF_AI_GATEWAY_USE_BINDING: "false"` and the HTTPS transport takes over. |
+| `enabled: false` | No deployment-managed catalog. Each user supplies their own model API keys — and a Workshop [migrated from the hosted deploy](migrate-from-hosted.md) will show an empty model picker. |
+
+`pnpm cf-os check` reports which of the last two applies before it deploys anything.
+
+#### When a token is required
+
+Only the two rows above need one. Create a narrowly scoped [API token](https://dash.cloudflare.com/profile/api-tokens) following the current [AI Gateway authentication guidance](https://developers.cloudflare.com/ai-gateway/configuration/authentication/) — a Run + Read token; current guidance calls for Account permissions `AI Gateway - Read`, `AI Gateway - Edit`, and `Workers AI - Read`. Install it without putting the value on the command line:
 
 ```sh
-pnpm exec wrangler secret put CF_AI_GATEWAY_API_TOKEN --name your-workshop-worker
+CLOUDFLARE_ACCOUNT_ID=your-account-id pnpm exec wrangler secret put CF_AI_GATEWAY_API_TOKEN --name your-workshop-worker
 ```
 
-For Workers AI through the default gateway, current Cloudflare guidance calls for Account permissions `AI Gateway - Read`, `AI Gateway - Edit`, and `Workers AI - Read`. Recheck the linked guidance when enabling other providers.
+Note: Use the `accountId` from your own `deployment.jsonc`, i.e the account the Workshop deploys to.
+
+In exactly those cases the generated Wrangler config [declares the secret as required](https://developers.cloudflare.com/workers/configuration/secrets/#validate-secrets-before-deploy), so the deploy fails clearly if it is missing. On the default path it does not, so a deployment that needs no token is never blocked waiting for one.
 
 ### Observability
 
@@ -115,7 +221,7 @@ The starter enables structured custom logs and a private console-backed Error Re
 
 ## Custom Gatekeepers
 
-Keep deployment-owned Gatekeepers under `packages/`, outside the `cloudflare-os` submodule. `scripts/deploy.ts` binds this repository's example to the Workshop as `GATEKEEPER_CUSTOM` and Context as `GATEKEEPER_CONTEXT`.
+Keep deployment-owned Gatekeepers under `packages/`, outside the `cloudflare-os` submodule. `packages/cf-os/src/core/deployment.ts` binds this repository's example as `GATEKEEPER_CUSTOM` and Context as `GATEKEEPER_CONTEXT`, twice each: on the Workshop with the `GatekeeperVendor` entrypoint for RPC, and on the router with no entrypoint, where the binding name is what routes `/gatekeeper/custom` and `/gatekeeper/context` to it. A Gatekeeper that serves HTTP — an OAuth redirect, for instance — needs both.
 
 The minimal example flow is:
 
@@ -134,11 +240,16 @@ Prefer wrapper-owned Workers and [service bindings](https://developers.cloudflar
 
 ## Upgrade
 
+`npx cf-os@latest update` brings the project up to date with the starter: it merges the starter's `main` (fetched from its URL, so no remote is needed), checks the submodule out at the pin that merge brings, runs `pnpm install`, and writes `.cf-os/update.md`. The brief lists both commit ranges and any conflicts, which git leaves in place, and gives a coding agent the steps to finish and summarise the update, starting from [the operator skill's updating guide](../.agents/skills/cloudflare-os-operator/references/updating.md). The starter's pin has already been reviewed against the starter, so for that path the list below is a check on your own customisations. `--dry-run` lists what would be merged, and `git reset --keep <old HEAD>` (the brief names it) undoes it.
+
+Moving the submodule past the starter's pin is a review of its own. `npx cf-os@latest update --upstream` picks upstream's `main` as the target and stages it without committing; or check out the commit by hand. It first merges the starter's `main`, committed, as plain `update` does, so run that and commit it first to leave the staged change a gitlink-only review. Then:
+
 1. Record the current `cloudflare-os` gitlink for rollback.
 2. Update the submodule to the intended upstream commit.
-3. Review Workshop and Context Wrangler base-config changes and Gatekeeper contracts.
-4. Run `pnpm install`, `pnpm --dir cloudflare-os install`, and `pnpm check`.
-5. Build and deploy the private Workshop runtime, then deploy the Console static assets separately; verify `/workspace`, Core ownership, storage, configured AI, Context, custom observations, and the Error Reporter query surface.
-6. If needed, restore the previous gitlink and redeploy both OS Workers together, or use [Workers rollback](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/) when bindings remain compatible.
+3. Review the Wrangler base-config changes for the Workshop, router and the three ambient Gatekeepers (Context, Scheduler, Web Search), along with the Gatekeeper contracts. `pnpm lint` catches one class of drift for you: `packages/cf-os/src/core/deployment-config.ts` reuses upstream's `WranglerConfig`, so a changed key there is a type error, not a silently dropped one. A new upstream Gatekeeper arrives as [optional](#optional-gatekeepers); to deploy it everywhere, as the hosted topology does, it needs a Worker and bindings in `packages/cf-os/src/core/deployment.ts` and a row in the naming table in `core/naming.ts`.
+4. Compare three entries of `cloudflare-os/pnpm-workspace.yaml`'s `catalog:` with this repository's: `capnweb`, `typescript` and `@cloudflare/workers-types`. Only those three have to match. The packages here `link:` to the submodule's rather than sharing a workspace with them. So the submodule's dependencies come from its own lockfile, and this catalog does not govern them. Types still cross the link, though. Each install has its own `capnweb` copy whatever the version, and today only its types cross. Keeping the ranges in step keeps those types compatible, and keeps the two copies from diverging if runtime code ever crosses too.
+5. Run `pnpm install`, then `pnpm lint` and `pnpm cf-os check`. The root `postinstall` (`cf-os install`) reinstalls the submodule's workspace from its lockfile. `optimisticRepeatInstall: false` makes it run even when this repository's own lockfile has not changed, which is what a gitlink bump looks like from here. If the hook was skipped (`--ignore-scripts`), `pnpm cf-os install --check` and every build, test and deploy entry point stop and tell you to run `pnpm cf-os install`.
+6. Deploy and verify Access, administrator access, storage, configured AI, Context, Scheduler, Web Search, custom observations, a connection through each optional Gatekeeper, and the Error Reporter query surface.
+7. If needed, restore the previous gitlink and redeploy, or use [Workers rollback](https://developers.cloudflare.com/workers/versions-and-deployments/rollbacks/) when bindings remain compatible. Neither works across a Durable Object migration: once a pin that adds a `migrations` tag to a Worker's `wrangler.jsonc` has deployed, that Worker can only be repaired forward. Check for new tags in step 3, the Workshop's especially, before deploying.
 
-Do not update the submodule blindly. The deployment script derives from upstream configs so incompatible base changes remain visible during review and checks.
+Do not update the submodule blindly. The deploy derives from upstream configs so incompatible base changes remain visible during review and checks.
