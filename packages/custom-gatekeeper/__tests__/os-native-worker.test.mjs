@@ -430,6 +430,15 @@ const customScriptBuild = await build({
           await this.ctx.storage.delete("sourceReader");
         }
 
+        async removeBronzeWriterForTest(managerId: string): Promise<void> {
+          if (!this.ctx.id.equals(this.ctx.exports.KnowledgeAccountAccess.idFromName(managerId)))
+            throw new TypeError("BR04 test fixture is bound to another Manager.");
+          const writer = await this.ctx.storage.get("bronzeWriter");
+          if (writer === undefined)
+            throw new Error("BR04 test fixture could not find the current Bronze writer.");
+          await this.ctx.storage.delete("bronzeWriter");
+        }
+
         async armActivateBronzeActionAckLossForTest(localActionId: number): Promise<void> {
           if (!Number.isSafeInteger(localActionId) || localActionId < 0)
             throw new Error("BR01 test fixture requires a valid local action ID.");
@@ -615,6 +624,12 @@ const driverScript = await build({
       const BR03_REVISED_ARTICLE_BODY = "---\\ntype: article\\ntitle: Observation-backed procedure\\n---\\n# Observation-backed procedure\\n\\nThe shared Knowledge page now records the revised release checklist.\\n";
       const BR03_REJECTED_ARTICLE_BODY = "---\\ntype: article\\ntitle: Rejected observation proposal\\n---\\n# Rejected observation proposal\\n\\nThis body must never be stored.\\n";
 
+      function authenticatedApiFromProofResult(result, mode) {
+        if (mode === "legacy") return result;
+        if (mode === "envelope") return result.authenticatedApi;
+        throw new Error("The native test driver has an unknown OS proof result mode.");
+      }
+
       function hasVerifiedSourceFields(fields, expected) {
         const containsExpectedSource = (value) => {
           if (!value || typeof value !== "object") return false;
@@ -685,11 +700,13 @@ const driverScript = await build({
 
           let socketA;
           let bootstrapA;
+          let proofResultA;
           let authenticatedA;
           let workspaceA;
           let knowledgeSessionA;
           let socketB;
           let bootstrapB;
+          let proofResultB;
           let authenticatedB;
           let workspaceB;
           let knowledgeSessionB;
@@ -815,7 +832,8 @@ const driverScript = await build({
             socketB = responseB.webSocket;
             socketB.accept();
             bootstrapB = newWebSocketRpcSession(socketB);
-            authenticatedB = await bootstrapB.presentProof(input.foreignProof);
+            proofResultB = await bootstrapB.presentProof(input.foreignProof);
+            authenticatedB = authenticatedApiFromProofResult(proofResultB, env.TEST_OS_PROOF_RESULT_MODE);
             const whoamiB = await authenticatedB.whoami();
             const preflightBAfterProof = await env.MANAGER_KNOWLEDGE_BRIDGE.inspectManagerKnowledge(foreignManagerId);
             const installB = await env.CORE_OPERATOR.installKnowledgeGrant({
@@ -840,11 +858,12 @@ const driverScript = await build({
 
             knowledgeSessionB?.[Symbol.dispose]?.();
             workspaceB?.[Symbol.dispose]?.();
-            authenticatedB?.[Symbol.dispose]?.();
+            proofResultB?.[Symbol.dispose]?.();
             bootstrapB?.[Symbol.dispose]?.();
             socketB?.close();
             knowledgeSessionB = undefined;
             workspaceB = undefined;
+            proofResultB = undefined;
             authenticatedB = undefined;
             bootstrapB = undefined;
             socketB = undefined;
@@ -858,7 +877,8 @@ const driverScript = await build({
             socketA = responseA.webSocket;
             socketA.accept();
             bootstrapA = newWebSocketRpcSession(socketA);
-            authenticatedA = await bootstrapA.presentProof(input.proof);
+            proofResultA = await bootstrapA.presentProof(input.proof);
+            authenticatedA = authenticatedApiFromProofResult(proofResultA, env.TEST_OS_PROOF_RESULT_MODE);
             const whoamiA = await authenticatedA.whoami();
             const preflightAAfterProof = await env.MANAGER_KNOWLEDGE_BRIDGE.inspectManagerKnowledge(managerId);
 
@@ -957,12 +977,12 @@ const driverScript = await build({
           } finally {
             knowledgeSessionA?.[Symbol.dispose]?.();
             workspaceA?.[Symbol.dispose]?.();
-            authenticatedA?.[Symbol.dispose]?.();
+            proofResultA?.[Symbol.dispose]?.();
             bootstrapA?.[Symbol.dispose]?.();
             socketA?.close();
             knowledgeSessionB?.[Symbol.dispose]?.();
             workspaceB?.[Symbol.dispose]?.();
-            authenticatedB?.[Symbol.dispose]?.();
+            proofResultB?.[Symbol.dispose]?.();
             bootstrapB?.[Symbol.dispose]?.();
             socketB?.close();
           }
@@ -981,6 +1001,7 @@ const driverScript = await build({
           this.proofPresentations = 0;
           this.socket = undefined;
           this.bootstrap = undefined;
+          this.proofResult = undefined;
           this.authenticated = undefined;
           this.workspace = undefined;
           this.knowledgeGatekeeper = undefined;
@@ -1009,7 +1030,11 @@ const driverScript = await build({
               this.socket = ownerResponse.webSocket;
               this.socket.accept();
               this.bootstrap = newWebSocketRpcSession(this.socket);
-              this.authenticated = await this.bootstrap.presentProof(input.proof);
+              this.proofResult = await this.bootstrap.presentProof(input.proof);
+              this.authenticated = authenticatedApiFromProofResult(
+                this.proofResult,
+                this.env.TEST_OS_PROOF_RESULT_MODE,
+              );
               this.ownerIdentity = await this.authenticated.whoami();
               this.proofPresentations = 1;
               this.workspace = await this.authenticated.openGadget(input.workspaceId);
@@ -1427,7 +1452,7 @@ const driverScript = await build({
               this.knowledgeSession,
               this.knowledgeGatekeeper,
               this.workspace,
-              this.authenticated,
+              this.proofResult,
               this.bootstrap,
             ]) {
               try {
@@ -1449,6 +1474,7 @@ const driverScript = await build({
               this.proofPresentations = 0;
               this.socket = undefined;
               this.bootstrap = undefined;
+              this.proofResult = undefined;
               this.authenticated = undefined;
               this.workspace = undefined;
               this.knowledgeGatekeeper = undefined;
@@ -1600,6 +1626,9 @@ function createMiniflareOptions(
 ) {
   const localHyperdrive = workerHyperdriveUrl(connectionString);
   const customWorkerScript = workerScripts.custom ?? customScript;
+  const proofResultMode = workerScripts.workshop === br04V1WorkerScripts.workshop
+    ? "legacy"
+    : "envelope";
   const coreWorker = {
     ...common,
     name: "core",
@@ -1629,6 +1658,7 @@ function createMiniflareOptions(
         ...common,
         name: "driver",
         script: workerScripts.driver ?? driverScript.outputFiles[0].text,
+        bindings: { TEST_OS_PROOF_RESULT_MODE: proofResultMode },
         durableObjects: {
           BR01_OWNER_SESSION: {
             className: "BR01OwnerSession",
@@ -1705,6 +1735,24 @@ function createMiniflareOptions(
         },
         outboundService: (request) => accessFixture.fetch(request),
       },
+      ...(workerScripts.knowledgeLegacy === undefined
+        ? []
+        : [
+            {
+              ...common,
+              name: "knowledge-legacy",
+              script: workerScripts.knowledgeLegacy,
+              compatibilityDate: "2026-10-01",
+              compatibilityFlags: [...compatibilityFlags, "new_module_registry"],
+              bindings: { APP_ENV: "dev", APP_ORIGIN: "https://knowledge-legacy.d03.invalid" },
+              durableObjects: knowledgeDurableObjects,
+              r2Buckets: ["KNOWLEDGE_BRONZE_BUCKET"],
+              serviceBindings: {
+                KNOWLEDGE_AUTHORITY: service("core", "BR01ObservedKnowledgeAuthorityResolver"),
+              },
+              outboundService: (request) => accessFixture.fetch(request),
+            },
+          ]),
       coreWorker,
     ],
   });
@@ -1730,8 +1778,8 @@ async function doStorageState(managerId) {
   return storage.exec("SELECT * FROM knowledge_state");
 }
 
-async function knowledgeDatabaseSnapshot(targetMiniflare, managerId) {
-  const storage = await targetMiniflare.unsafeGetDurableObjectStorage("knowledge", "KnowledgeDO", {
+async function knowledgeDatabaseSnapshot(targetMiniflare, managerId, workerName = "knowledge") {
+  const storage = await targetMiniflare.unsafeGetDurableObjectStorage(workerName, "KnowledgeDO", {
     name: managerId,
   });
   const tables = await storage.exec(
@@ -2119,12 +2167,13 @@ async function startBR04Scenario({
         }
       }
     };
-    const restartWith = async (nextWorkerScripts) => {
+    const restartWith = async (nextWorkerScripts, additionalOptions = {}) => {
       await closeOwner();
       await nativeMiniflare.setOptions(
         createMiniflareOptions(nativePostgres.connectionString, accessFixture, {
           workerScripts: nextWorkerScripts,
           resourcePersistencePath,
+          ...additionalOptions,
         }),
       );
       await nativeMiniflare.ready;
@@ -2255,7 +2304,7 @@ async function createNativeArticleForPolicy(
   return { article, snapshot, staged: staged.value, approved: approved.value };
 }
 
-async function br04NoEffectSnapshot(scenario) {
+async function br04NoEffectSnapshot(scenario, { includeLegacyKnowledge = false } = {}) {
   const { identities, nativeMiniflare } = scenario;
   const managerId = identities.B.managerId;
   const actions = await postNative(nativeMiniflare, "/br01-action-count", { managerId });
@@ -2266,7 +2315,7 @@ async function br04NoEffectSnapshot(scenario) {
   assert.equal(stageCount.response.status, 200, JSON.stringify(stageCount.value));
   const bronzeBucket = await nativeMiniflare.getR2Bucket("KNOWLEDGE_BRONZE_BUCKET", "knowledge");
   const objects = await bronzeBucket.list({ limit: 32 });
-  return {
+  const snapshot = {
     actions: actions.value,
     nextActionId: actionSequence.value.nextId,
     stageCount: stageCount.value.count,
@@ -2276,6 +2325,25 @@ async function br04NoEffectSnapshot(scenario) {
       .map(({ key, size, etag }) => ({ key, size, etag }))
       .sort((a, b) => a.key.localeCompare(b.key)),
     objectsTruncated: objects.truncated,
+  };
+  if (!includeLegacyKnowledge) return snapshot;
+
+  const legacyBucket = await nativeMiniflare.getR2Bucket(
+    "KNOWLEDGE_BRONZE_BUCKET",
+    "knowledge-legacy",
+  );
+  const legacyObjects = await legacyBucket.list({ limit: 32 });
+  return {
+    ...snapshot,
+    legacyKnowledge: await knowledgeDatabaseSnapshot(
+      nativeMiniflare,
+      managerId,
+      "knowledge-legacy",
+    ),
+    legacyObjects: legacyObjects.objects
+      .map(({ key, size, etag }) => ({ key, size, etag }))
+      .sort((a, b) => a.key.localeCompare(b.key)),
+    legacyObjectsTruncated: legacyObjects.truncated,
   };
 }
 
@@ -2306,6 +2374,19 @@ function assertBr04NoKnowledgeEffects(before, after) {
     "A refused proposal/approval must leave private R2 unchanged.",
   );
   assert.equal(after.objectsTruncated, before.objectsTruncated);
+  if ("legacyKnowledge" in before) {
+    assert.deepEqual(
+      after.legacyKnowledge,
+      before.legacyKnowledge,
+      "A refused callback must leave the isolated legacy Knowledge SQLite state unchanged.",
+    );
+    assert.deepEqual(
+      after.legacyObjects,
+      before.legacyObjects,
+      "A refused callback must leave the legacy Worker’s R2 view unchanged.",
+    );
+    assert.equal(after.legacyObjectsTruncated, before.legacyObjectsTruncated);
+  }
 }
 
 function assertBr04SameReservationIdentity(before, after) {
@@ -5861,11 +5942,71 @@ test(
       assert.equal(proposal.response.status, 200, JSON.stringify(proposal.value));
       assert.equal(proposal.value.status, "pending_approval");
 
-      await scenario.restartWith({
-        ...br04CurrentWorkerScripts,
-        knowledge: oldKnowledgeBytes.toString("utf8"),
+      await scenario.restartWith(
+        {
+          ...br04CurrentWorkerScripts,
+          knowledgeLegacy: oldKnowledgeBytes.toString("utf8"),
+        },
+        {
+          coreServiceBindingOverrides: {
+            KNOWLEDGE_BRONZE_GRANT_ISSUER: service(
+              "knowledge-legacy",
+              "OwnedKnowledgeBronzeGrantIssuer",
+            ),
+          },
+        },
+      );
+      const accessNamespace = await nativeMiniflare.getDurableObjectNamespace(
+        "KnowledgeAccountAccess",
+        "custom",
+      );
+      const accessStub = accessNamespace.get(accessNamespace.idFromName(managerId));
+      await accessStub.removeBronzeWriterForTest(managerId);
+      const reinstallResponse = await postNative(nativeMiniflare, "/stopped", {
+        accessAssertion: await scenario.accessFixture.assertion(),
+        userId: identities.B.userId,
+        managerId,
+        foreignManagerId: identities.A.managerId,
       });
-      const beforeApproval = await br04NoEffectSnapshot(scenario);
+      assert.equal(reinstallResponse.response.status, 200, JSON.stringify(reinstallResponse.value));
+      const reinstalled = reinstallResponse.value.install;
+      assert.equal(
+        reinstalled.ok,
+        true,
+        `Core could not reinstall the legacy-bound Bronze writer: ${JSON.stringify({ ok: reinstalled.ok, code: reinstalled.code })}`,
+      );
+      assert.equal(reinstalled.value.managerId, managerId);
+      const bindings = await accessStub.inspectBronzeBindingsForTest(
+        managerId,
+        identities.A.managerId,
+      );
+      assert.equal(bindings.writerInstalled, true);
+      assert.equal(bindings.sourceReaderInstalled, true);
+      assert.equal(
+        bindings.writerContract,
+        "cybernest-knowledge-bronze-write-v2",
+        "Core must install a Manager-bound Bronze writer capability from the isolated legacy Worker.",
+      );
+      assert.equal(bindings.foreignWriterRejected, true);
+
+      const beforeApproval = await br04NoEffectSnapshot(scenario, {
+        includeLegacyKnowledge: true,
+      });
+      const legacyDatabaseText = JSON.stringify(beforeApproval.legacyKnowledge);
+      assert.equal(
+        legacyDatabaseText.includes(article.article_id),
+        false,
+        "The separate pre-SL02 namespace must not inherit the current article data.",
+      );
+      assert.ok(
+        typeof beforeApproval.reservation?.operationId === "string",
+        "The pending current OS action must retain its Account reservation before legacy approval.",
+      );
+      assert.equal(
+        legacyDatabaseText.includes(beforeApproval.reservation.operationId),
+        false,
+        "The separate pre-SL02 namespace must not inherit the current OS Action reservation.",
+      );
       const approval = await postNative(nativeMiniflare, "/br01-approve", {
         managerId,
         actionId: proposal.value.actionId,
@@ -5876,7 +6017,16 @@ test(
         "Knowledge Base invalid_input.",
         "The captured old Knowledge decoder must reject the unknown native policy writer verb.",
       );
-      assertKnowledgeAndR2Unchanged(beforeApproval, await br04NoEffectSnapshot(scenario));
+      const afterApproval = await br04NoEffectSnapshot(scenario, {
+        includeLegacyKnowledge: true,
+      });
+      assertBr04NoKnowledgeEffects(beforeApproval, afterApproval);
+      assertBr04SameReservationIdentity(beforeApproval.reservation, afterApproval.reservation);
+      assert.equal(
+        afterApproval.reservation.retainedBytesReserved,
+        beforeApproval.reservation.retainedBytesReserved,
+        "A refused callback must retain the current OS Action's reservation budget.",
+      );
       const action = await postNative(nativeMiniflare, "/br01-action-state", {
         managerId,
         actionId: proposal.value.actionId,

@@ -2097,10 +2097,10 @@ describe("D04 private Knowledge reader integration (test-first)", () => {
   });
 
   it.each([
-    ["missing expiry", { value: expectedRead }],
-    ["unsafe expiry", { value: expectedRead, expiresAt: Number.MAX_SAFE_INTEGER + 1 }],
-    ["overlong expiry", { value: expectedRead, expiresAt: Date.now() + 3_605_000 }],
-  ])("rejects a %s receipt before observation", async (_name, receipt) => {
+    ["missing expiry", () => ({ value: expectedRead })],
+    ["unsafe expiry", () => ({ value: expectedRead, expiresAt: Number.MAX_SAFE_INTEGER + 1 })],
+    ["overlong expiry", () => ({ value: expectedRead, expiresAt: Date.now() + 3_605_000 })],
+  ])("rejects a %s receipt before observation", async (_name, makeReceipt) => {
     const queue = new FakeQueue();
     const access: KnowledgeAccess = {
       assertBoundTo() {
@@ -2113,7 +2113,7 @@ describe("D04 private Knowledge reader integration (test-first)", () => {
         throw new Error("unused");
       },
       async read() {
-        return { ok: true, value: receipt };
+        return { ok: true, value: makeReceipt() };
       },
     };
 
