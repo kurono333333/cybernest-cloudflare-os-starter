@@ -4241,7 +4241,17 @@ test(
       });
       assert.equal(unknownStage.response.status, 200, JSON.stringify(unknownStage.value));
       const control = await nativeMiniflare.getBindings("driver");
-      await control.KNOWLEDGE_BR01_TEST_CONTROL.armFault("lose-put-and-reconciliation-get");
+      const r2CallCountSnapshot = async () => {
+        const result = await control.KNOWLEDGE_BR01_TEST_CONTROL.r2CallCounts();
+        try {
+          return JSON.parse(JSON.stringify(result));
+        } finally {
+          await result[Symbol.dispose]?.();
+        }
+      };
+      await control.KNOWLEDGE_BR01_TEST_CONTROL.armFault(
+        "lose-put-and-two-reconciliation-gets",
+      );
       const firstUnknownApproval = await br01Post("/br01-approve", {
         managerId: identities.B.managerId,
         actionId: unknownStage.value.actionId,
@@ -4274,10 +4284,12 @@ test(
         "The existing real-PUT/response-loss fixture must leave an active object_unknown operation.",
       );
 
+      await control.KNOWLEDGE_BR01_TEST_CONTROL.resetR2CallCounts();
       const reconciliationUnknownApproval = await br01Post("/br01-approve", {
         managerId: identities.B.managerId,
         actionId: unknownStage.value.actionId,
       });
+      assert.deepEqual(await r2CallCountSnapshot(), { get: 2, put: 1 });
       assert.equal(
         reconciliationUnknownApproval.response.status,
         500,
@@ -4295,7 +4307,7 @@ test(
           ["operation_id", "state"],
         ).rows.find((row) => row.operation_id === unknownStage.value.operationId)?.state,
         "object_unknown",
-        "The real reconciliation-GET response loss must leave the operation unknown before rejecting it.",
+        "Both reconciliation GET response losses must leave the operation unknown before rejecting it.",
       );
 
       await armBronzeActivateAckLoss(
@@ -4407,7 +4419,9 @@ test(
         "knowledge_article_revisions",
         ["operation_id", "article_id", "revision_id", "body_hash"],
       ).rows;
-      await control.KNOWLEDGE_BR01_TEST_CONTROL.armFault("lose-put-and-reconciliation-get");
+      await control.KNOWLEDGE_BR01_TEST_CONTROL.armFault(
+        "lose-put-and-two-reconciliation-gets",
+      );
       const expiredUnknownApproval = await br01Post("/br01-approve", {
         managerId: identities.B.managerId,
         actionId: expiredUnknownStage.value.actionId,
@@ -4429,10 +4443,12 @@ test(
         ]).rows.find((row) => row.operation_id === expiredUnknownStage.value.operationId)?.state,
         "object_unknown",
       );
+      await control.KNOWLEDGE_BR01_TEST_CONTROL.resetR2CallCounts();
       const reconciliationExpiredUnknownApproval = await br01Post("/br01-approve", {
         managerId: identities.B.managerId,
         actionId: expiredUnknownStage.value.actionId,
       });
+      assert.deepEqual(await r2CallCountSnapshot(), { get: 2, put: 1 });
       assert.equal(
         reconciliationExpiredUnknownApproval.response.status,
         500,
@@ -4453,7 +4469,7 @@ test(
           ["operation_id", "state"],
         ).rows.find((row) => row.operation_id === expiredUnknownStage.value.operationId)?.state,
         "object_unknown",
-        "The real reconciliation-GET response loss must leave the expired operation unknown before rejecting it.",
+        "Both reconciliation GET response losses must leave the expired operation unknown before rejecting it.",
       );
       const activeExpiredUnknownReservation = await bronzeActionReservation(
         nativeMiniflare,
