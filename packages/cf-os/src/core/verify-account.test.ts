@@ -55,7 +55,7 @@ test("skips Access reads in Cybernest mode while checking named account resource
   });
 
   assert.deepEqual(await verifyAccount(client, cybernest as DeploymentConfig, origin), { problems: [] });
-  assert.deepEqual([...client.calls].sort(), ["listAiGateways", "listKvNamespaces", "listR2Buckets"]);
+  assert.deepEqual([...client.calls].toSorted(), ["listAiGateways", "listKvNamespaces", "listR2Buckets"]);
 });
 
 test("rejects an audience no application in the account has, and names cf-os access", async () => {

@@ -243,8 +243,8 @@ async function loadBr04V1WorkerScripts() {
   const artifactManifest = JSON.parse(artifactManifestBytes.toString("utf8"));
   assert.equal(artifactManifest.formatVersion, manifest.workerArtifacts.formatVersion);
   assert.deepEqual(
-    Object.keys(artifactManifest.artifacts).sort(),
-    [...manifest.workerArtifacts.names].sort(),
+    Object.keys(artifactManifest.artifacts).toSorted(),
+    [...manifest.workerArtifacts.names].toSorted(),
   );
 
   const workerScripts = {};
@@ -323,7 +323,7 @@ async function bundle(entryPoint, resolveDir) {
   return result.outputFiles[0].text;
 }
 
-const workshopScript = await bundle(
+await bundle(
   join(backendRoot, ".wrangler/validate/src/server.ts"),
   backendRoot,
 );
@@ -1941,7 +1941,7 @@ function knowledgeWriteInvariantSnapshot(snapshot) {
     if (!table) return null;
     return table.rows
       .map((row) => Object.fromEntries(fields.map((field) => [field, row[field]])))
-      .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+      .toSorted((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
   };
   return {
     currentArticles: projectRows("knowledge_articles", [
@@ -2011,33 +2011,6 @@ function requireSilverNormalControl(snapshot) {
   const controlJson = table.rows[0]?.silver_normal_control_json;
   assert.equal(typeof controlJson, "string");
   return JSON.parse(controlJson);
-}
-
-function hasVerifiedSourceFields(fields, expected) {
-  const containsExpectedSource = (value) => {
-    if (!value || typeof value !== "object") return false;
-    if (Array.isArray(value)) return value.some(containsExpectedSource);
-    if (
-      value.kind === expected.kind &&
-      value.chatId === expected.chatId &&
-      value.sequence === expected.sequence &&
-      value.timestampMs === expected.timestampMs &&
-      value.author?.type === expected.author.type &&
-      value.author?.id === expected.author.id
-    )
-      return true;
-    return Object.values(value).some(containsExpectedSource);
-  };
-  return fields.some((field) => {
-    if (field.kind === "json") {
-      try {
-        return containsExpectedSource(JSON.parse(field.value));
-      } catch {
-        return false;
-      }
-    }
-    return false;
-  });
 }
 
 async function sha256Hex(bytes) {
@@ -2323,7 +2296,7 @@ async function br04NoEffectSnapshot(scenario, { includeLegacyKnowledge = false }
     knowledge: await knowledgeDatabaseSnapshot(nativeMiniflare, managerId),
     objects: objects.objects
       .map(({ key, size, etag }) => ({ key, size, etag }))
-      .sort((a, b) => a.key.localeCompare(b.key)),
+      .toSorted((a, b) => a.key.localeCompare(b.key)),
     objectsTruncated: objects.truncated,
   };
   if (!includeLegacyKnowledge) return snapshot;
@@ -2342,7 +2315,7 @@ async function br04NoEffectSnapshot(scenario, { includeLegacyKnowledge = false }
     ),
     legacyObjects: legacyObjects.objects
       .map(({ key, size, etag }) => ({ key, size, etag }))
-      .sort((a, b) => a.key.localeCompare(b.key)),
+      .toSorted((a, b) => a.key.localeCompare(b.key)),
     legacyObjectsTruncated: legacyObjects.truncated,
   };
 }
@@ -2628,7 +2601,7 @@ test(
     assert.equal(result.readsA.read.path, "concepts/shared.md");
     assert.equal(result.readsA.read.sourceMarkdown, d01Fixtures.A_SHARED_SOURCE);
     assert.deepEqual(result.readsA.read.metadata, d01Fixtures.A_SHARED_METADATA);
-    assert.deepEqual(Object.keys(result.readsA.articles).sort(), [
+    assert.deepEqual(Object.keys(result.readsA.articles).toSorted(), [
       "goldStatus",
       "kind",
       "path",
@@ -3187,10 +3160,10 @@ test(
         assert.deepEqual(
           objectsAfterStaleApproval.objects
             .map(({ key, size, etag }) => ({ key, size, etag }))
-            .sort((left, right) => left.key.localeCompare(right.key)),
+            .toSorted((left, right) => left.key.localeCompare(right.key)),
           objectsBeforeStaleApproval.objects
             .map(({ key, size, etag }) => ({ key, size, etag }))
-            .sort((left, right) => left.key.localeCompare(right.key)),
+            .toSorted((left, right) => left.key.localeCompare(right.key)),
           "A stale Core owner must not add, replace, or remove a Bronze object.",
         );
         assert.equal(
@@ -3273,7 +3246,7 @@ test(
           body: JSON.stringify({ managerId: identities.B.managerId, actionId: staged.actionId }),
         },
       );
-      const rejectAfterLostAck = await rejectAfterLostAckResponse.json();
+      await rejectAfterLostAckResponse.json();
       assert.equal(
         rejectAfterLostAckResponse.status,
         500,
@@ -4864,7 +4837,7 @@ test(
       )
         .rows.filter((row) => row.article_id === articleId)
         .map((row) => row.revision_id)
-        .sort();
+        .toSorted();
       const initialSnapshot = await br04NoEffectSnapshot(scenario);
       const readBeforeGateCheck = await postNative(nativeMiniflare, "/br04-read", { managerId });
       assert.equal(
@@ -4980,12 +4953,12 @@ test(
         ])
           .rows.filter((row) => row.article_id === articleId)
           .map((row) => row.revision_id)
-          .sort(),
+          .toSorted(),
         initialRevisionIds,
         "Policy metadata must not append an immutable article-body revision.",
       );
       const includeReceipt = JSON.parse(article.policy_receipt_json);
-      assert.deepEqual(Object.keys(includeReceipt).sort(), ["bindingHash", "result"]);
+      assert.deepEqual(Object.keys(includeReceipt).toSorted(), ["bindingHash", "result"]);
       assert.match(includeReceipt.bindingHash, /^[a-f0-9]{64}$/u);
       assert.deepEqual(includeReceipt.result, {
         status: "saved",
@@ -5031,7 +5004,7 @@ test(
         ])
           .rows.filter((row) => row.article_id === articleId)
           .map((row) => row.revision_id)
-          .sort(),
+          .toSorted(),
         initialRevisionIds,
       );
 
@@ -5261,7 +5234,7 @@ test(
       )
         .rows.filter((row) => row.article_id === articleId)
         .map((row) => row.revision_id)
-        .sort();
+        .toSorted();
       const readBefore = await postNative(nativeMiniflare, "/br04-read", { managerId });
       assert.equal(readBefore.response.status, 200, JSON.stringify(readBefore.value));
       await activateSilverManagementForTest(nativeMiniflare, managerId);
@@ -5375,7 +5348,7 @@ test(
         ])
           .rows.filter((row) => row.article_id === articleId)
           .map((row) => row.revision_id)
-          .sort(),
+          .toSorted(),
         initialRevisionIds,
       );
       assert.deepEqual(
@@ -5469,7 +5442,7 @@ test(
       const fencedSnapshot = await br04NoEffectSnapshot(scenario);
       assertSilverNormalFenceOnlyEffects(beforeDispatch, fencedSnapshot);
       const normalFence = requireSilverNormalControl(fencedSnapshot.knowledge);
-      assert.deepEqual(Object.keys(normalFence).sort(), [
+      assert.deepEqual(Object.keys(normalFence).toSorted(), [
         "articleId",
         "bindingHash",
         "operationDeadlineMs",
@@ -5550,7 +5523,7 @@ test(
       )
         .rows.filter((row) => row.article_id === targetArticle.article_id)
         .map((row) => row.revision_id)
-        .sort();
+        .toSorted();
       await activateSilverManagementForTest(nativeMiniflare, managerId);
 
       const includeProposal = await proposeNativePolicy(
@@ -5716,7 +5689,7 @@ test(
         ])
           .rows.filter((row) => row.article_id === targetArticle.article_id)
           .map((row) => row.revision_id)
-          .sort(),
+          .toSorted(),
         initialRevisionIds,
       );
       assert.deepEqual(
