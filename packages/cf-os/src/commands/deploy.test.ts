@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { cfClient } from "../cf-client.ts";
@@ -29,10 +29,15 @@ test("on an unconfigured file without a terminal, fails as before", async (t) =>
     /deployment\.jsonc: Replace deployment placeholder <CLOUDFLARE_ACCOUNT_ID>\./);
 });
 
-test("the current Cybernest manifest fails closed before account reads or generated configs", async (t) => {
+const LEGACY_CYBERNEST_WITHOUT_ROUTER = `{
+  "accountId": "${FAKE_ACCOUNT}",
+  "authenticationMode": "cybernest",
+  "workers": { "workshop": { "name": "legacy-workshop" } }
+}`;
+
+test("a legacy manifest without a Router fails closed before account reads or generated configs", async (t) => {
   const root = installedProject(t);
-  const repository = join(import.meta.dirname, "..", "..", "..", "..");
-  writeFileSync(join(root, "deployment.jsonc"), readFileSync(join(repository, "deployment.jsonc"), "utf8"));
+  writeFileSync(join(root, "deployment.jsonc"), LEGACY_CYBERNEST_WITHOUT_ROUTER);
   const cf = fakeCf({});
   const harness = testContext({ root, client: cfClient({ spawn: cf.spawn }) });
   const { deps, steps } = recordingDeploy({});

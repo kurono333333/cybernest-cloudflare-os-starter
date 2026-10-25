@@ -2482,8 +2482,10 @@ function sameKnowledgeSafeControlBinding(
   );
 }
 
-// Facet class props cannot contain capabilities on the deployed platform.
-// This namespace is Worker-private and never handed to an Agent or HTTP caller.
+/**
+ * Facet class props cannot contain capabilities on the deployed platform.
+ * This namespace is Worker-private and never handed to an Agent or HTTP caller.
+ */
 export class KnowledgeAccountAccess extends DurableObject<Cloudflare.Env> {
   async bind(managerId: string, capability: KnowledgeAccess): Promise<void> {
     if (

@@ -251,6 +251,12 @@ export function validateConfig(config: DeploymentConfig): DeploymentConfig {
   if (mode !== undefined && mode !== "cloudflare-access" && mode !== "cybernest") {
     throw new Error('authenticationMode must be "cloudflare-access" or "cybernest".');
   }
+  const webSearch: unknown = Reflect.get(config, "webSearch");
+  if (webSearch !== undefined &&
+      (webSearch === null || typeof webSearch !== "object" || Array.isArray(webSearch) ||
+       typeof Reflect.get(webSearch, "enabled") !== "boolean")) {
+    throw new Error("Web Search enabled must be a boolean.");
+  }
   const usesAccess = mode !== "cybernest";
   const customGatekeeper = customGatekeeperEnabled(config);
   const activePaths = [
@@ -649,6 +655,7 @@ export function generateConfigs(
     : undefined;
   const origin = publicOrigin(config);
   const optional = Object.entries(config.gatekeepers ?? {});
+  const webSearchEnabled = config.webSearch?.enabled !== false;
 
   setCommon(router, config, config.workers.router.name, config.workers.router.route);
   router.services = [
@@ -657,7 +664,9 @@ export function generateConfigs(
     // vendor-RPC bindings. The binding name is what picks the /gatekeeper/<name> path.
     { binding: "GATEKEEPER_CONTEXT", service: config.workers.context.name },
     { binding: "GATEKEEPER_SCHEDULER", service: config.workers.scheduler.name },
-    { binding: "GATEKEEPER_WEBSEARCH", service: config.workers.websearch.name },
+    ...(webSearchEnabled
+      ? [{ binding: "GATEKEEPER_WEBSEARCH", service: config.workers.websearch.name }]
+      : []),
     ...(customGatekeeper
       ? [{ binding: "GATEKEEPER_CUSTOM", service: config.workers.customGatekeeper!.name }]
       : []),
@@ -730,11 +739,11 @@ export function generateConfigs(
     },
     // No props either: searches are scoped to nobody, and the only state is the per-workspace
     // `WebSearchGatekeeper` facet, reached through `ctx.exports`.
-    {
+    ...(webSearchEnabled ? [{
       binding: "GATEKEEPER_WEBSEARCH",
       service: config.workers.websearch.name,
       entrypoint: "GatekeeperVendor",
-    },
+    }] : []),
     ...(customGatekeeper ? [{
       binding: "GATEKEEPER_CUSTOM",
       service: config.workers.customGatekeeper!.name,

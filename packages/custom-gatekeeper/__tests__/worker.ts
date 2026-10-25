@@ -5,7 +5,6 @@ import type {
   ApprovalQueue,
   Gatekeeper,
   GitCache,
-  ObservationAuthorizer,
   ObservationDescription,
 } from "@gadgets/workshop-shared/gatekeeper";
 import { CustomGatekeeper, KnowledgeSession } from "../src/custom.js";
@@ -1404,18 +1403,6 @@ export class InspectableCustomGatekeeper extends DurableObject {
       queue[Symbol.dispose]();
     }
     return { observations: target.snapshot().observations.length, error };
-  }
-}
-
-class TestObservationAuthorizer extends RpcTarget implements ObservationAuthorizer {
-  readonly observations: ObservationDescription[] = [];
-
-  async authorizeObservation(description: ObservationDescription): Promise<void> {
-    this.observations.push({ ...description });
-  }
-
-  async getGitCache(): Promise<never> {
-    throw new Error("Unexpected GitCache access in catalog fixture.");
   }
 }
 
@@ -3301,9 +3288,11 @@ const newNativeArticleFixtureState = (): NativeArticleFixtureState => ({
   articles: {},
 });
 
-// Native approval tests use a Durable Object capability so a persisted Access stub has a stable
-// DO owner and expected Core errors cross a normal RPC boundary instead of a WorkerEntrypoint
-// callback wrapper.
+/**
+ * Native approval tests use a Durable Object capability so a persisted Access stub has a stable
+ * DO owner and expected Core errors cross a normal RPC boundary instead of a WorkerEntrypoint
+ * callback wrapper.
+ */
 export class NativeArticleAccess extends DurableObject<Cloudflare.Env> {
   async #readState(): Promise<NativeArticleFixtureState> {
     return (
@@ -3533,8 +3522,10 @@ type NativeGoldCleanReplacementProposal = Readonly<{
   intent: NativeGoldPageActionBinding;
 }>;
 
-// Every operation opens and closes a real pinned Overseer owner session inside this Durable
-// Object event. That keeps the native notifyClosed callback alive until its completion is observed.
+/**
+ * Every operation opens and closes a real pinned Overseer owner session inside this Durable
+ * Object event. That keeps the native notifyClosed callback alive until its completion is observed.
+ */
 export class NativeApprovalOwner extends DurableObject<Cloudflare.Env> {
   #exports(): NativeOwnerExports {
     return this.ctx.exports as unknown as NativeOwnerExports;
