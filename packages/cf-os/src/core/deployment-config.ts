@@ -129,6 +129,8 @@ export interface DeploymentConfigBase {
    * reads from the submodule, and `validateGatekeepers` checks the entries against it.
    */
   gatekeepers?: Record<string, GatekeeperEntry>;
+  /** Whether Router and Workshop can reach the deployed Web Search Gatekeeper; absent means enabled. */
+  webSearch?: { enabled: boolean };
   aiGateway: AiGatewayConfigInput;
   context: ContextConfig;
   /**

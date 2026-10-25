@@ -2,70 +2,66 @@
   // Cloudflare account that owns every Worker and provisioned resource.
   // Find it: https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/
   "accountId": "d6726a38b563a01c6339a20854852086",
+  "authenticationMode": "cybernest",
+  "publicBaseUrl": "https://dev.dennoba.net",
 
   // Worker names are permanent service identities. Keep them unique within the account.
-  // Reference: docs/customization.md#workers-and-routing
+  // The Router owns the one public route; all other Workers stay private.
   "workers": {
+    "router": {
+      "name": "dev-dennoba-router",
+      "route": { "customDomain": "dev.dennoba.net" }
+    },
     "workshop": {
       "name": "dev-dennoba-os",
 
-      // Cybernest reaches Workshop only through Core's private Service Binding.
-      // null deliberately creates no public route or workers.dev endpoint.
+      // Preserved legacy field: current validateConfig accepts and ignores it.
       "route": null
     },
     "context": { "name": "dev-dennoba-context" },
+    "scheduler": { "name": "dev-dennoba-scheduler" },
+    "websearch": { "name": "dev-dennoba-websearch" },
     "customGatekeeper": { "name": "dev-dennoba-custom-gatekeeper" },
     "errorReporter": { "name": "dev-dennoba-error-reporter" }
   },
 
-  // Optional platform-funded model catalog. Leave disabled to deploy without AI setup.
-  // When enabled, replace every placeholder and install CF_AI_GATEWAY_API_TOKEN separately.
-  // Reference: docs/customization.md#ai-models
+  // Keep the private Worker installed, but with no Router or Workshop path to invoke search.
+  "webSearch": { "enabled": false },
+
+  // Optional platform-funded model catalog. AI stays disabled.
   "aiGateway": {
     "enabled": false,
     "name": "default",
     "accountId": "d6726a38b563a01c6339a20854852086",
-    "providers": ["cloudflare"],
-
-    // "direct" sends Workers AI to its REST endpoint. "gateway" adds AI Gateway logs.
-    "workersAi": { "mode": "direct" }
+    "providers": ["cloudflare"]
   },
 
   "context": {
-    // Isolates Context data shared by this Workshop deployment.
+    // Preserve the existing Context data-isolation label and KV namespace.
     "sharingDomain": "dev",
-
-    // null: Wrangler provisions and remembers a KV namespace on first deploy.
-    // string: bind an existing namespace by ID.
     "kvNamespaceId": "569dbfde72de46deaa3cf590e0956a19"
   },
 
-  // Displayed to agents when the example custom integration is enabled in /admin.
-  // Reference: docs/customization.md#custom-gatekeepers
+  // Preserve the existing custom integration configuration.
   "customGatekeeper": {
     "name": "Cybernest",
     "message": "Cybernest Manager context"
   },
 
-  // Explicit backend issue reports go to a private Worker that emits structured console errors.
-  // Set release to a commit/version when your deployment pipeline has one.
-  // Reference: docs/observability.md#quick-start
+  // Error Reporter stays disabled.
   "errorReporting": {
     "enabled": false,
     "environment": "dev",
     "release": null
   },
 
-  // null values use Wrangler automatic provisioning. Set IDs/names to reuse owned resources.
-  // https://developers.cloudflare.com/workers/wrangler/configuration/#automatic-provisioning
+  // Preserve the existing KV namespaces and R2 bucket.
   "resources": {
     "blueprintsKvNamespaceId": "630728db6242410f896ba9bc768dcbfe",
     "avatarsKvNamespaceId": "96787d4ed2bc4383a307ba06172a699c",
     "blueprintContentBucket": "dev-dennoba-os-blueprint-content"
   },
 
-  // Structured custom logs stay enabled. Invocation logs and traces are separate volume controls.
-  // https://developers.cloudflare.com/workers/observability/logs/workers-logs/
   "observability": {
     "enabled": true,
     "headSamplingRate": 1,

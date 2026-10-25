@@ -423,6 +423,25 @@ test("deploys the ambient Web Search Gatekeeper the hosted flow preinstalls", as
     ["build"]);
 });
 
+test("disables Web Search by removing both public service bindings", async () => {
+  const config = variant((c) => { c.webSearch = { enabled: false }; });
+  const generated = generateConfigs(config, await baseConfigs(), catalog);
+
+  assert.equal(generated.router.services!.some((service) => service.binding === "GATEKEEPER_WEBSEARCH"), false);
+  assert.equal(generated.workshop.services!.some((service) => service.binding === "GATEKEEPER_WEBSEARCH"), false);
+  assert.equal(generated.websearch.name, config.workers.websearch.name);
+  assert.equal(generated.websearch.workers_dev, false);
+  assert.equal(generated.websearch.routes, undefined);
+});
+
+test("rejects a malformed Web Search setting", () => {
+  for (const setting of [null, {}, "off", { enabled: "false" }]) {
+    assert.throws(
+      () => validateConfig(variant((c) => { c.webSearch = setting; })),
+      /Web Search enabled must be a boolean/i);
+  }
+});
+
 test("rejects a Web Search Worker name shared with another Worker", () => {
   assert.throws(
     () => validateConfig(variant((c) => { c.workers.websearch.name = c.workers.scheduler.name; })),
